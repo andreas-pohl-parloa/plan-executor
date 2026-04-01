@@ -1,0 +1,56 @@
+[package]
+name = "plan-executor"
+version = "0.1.0"
+edition = "2024"
+description = "Monitor and execute Claude plan files"
+default-run = "plan-executor"
+
+[[bin]]
+name = "plan-executor"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime (includes process feature for subprocess spawning)
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI parsing
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# File system watching (macOS FSEvents backend)
+notify = "8"
+
+# Glob pattern matching
+glob = "0.3"
+
+# macOS native notifications
+notify-rust = { version = "4", features = ["d"] }
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Home directory
+dirs = "6"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID for job IDs
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"
+dirs = "6"
