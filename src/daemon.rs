@@ -154,10 +154,17 @@ async fn handle_watch_event(
     path: PathBuf,
 ) {
     let Ok(status) = parse_plan_status(&path) else { return };
-    if status != PlanStatus::Ready { return }
-
     let path_str = path.to_string_lossy().to_string();
     let mut st = state.lock().await;
+
+    if status != PlanStatus::Ready {
+        // Plan is no longer READY — remove from pending if it was there.
+        if st.pending_plans.remove(&path_str).is_some() {
+            let event = st.snapshot_state();
+            let _ = st.event_tx.send(event);
+        }
+        return;
+    }
 
     // Skip if already pending or running
     if st.pending_plans.contains_key(&path_str) { return }
