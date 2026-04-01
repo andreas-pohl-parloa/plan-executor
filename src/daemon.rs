@@ -61,6 +61,11 @@ pub async fn run_daemon() -> Result<()> {
     let config = Config::load()?;
     let watch_dirs = config.expanded_watch_dirs();
 
+    // Write PID file on every start so restarts always reflect the current PID.
+    let pid_path = Config::base_dir().join("daemon.pid");
+    std::fs::create_dir_all(Config::base_dir())?;
+    std::fs::write(&pid_path, format!("{}\n", std::process::id()))?;
+
     // Ensure socket cleanup on start
     let sock_path = socket_path();
     if sock_path.exists() {
