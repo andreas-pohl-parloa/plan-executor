@@ -4,9 +4,21 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LABEL="com.plan-executor.daemon"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+GUI_TARGET="gui/$(id -u)"
 BASE_DIR="$HOME/.plan-executor"
 LOG_FILE="$BASE_DIR/daemon.log"
 BINARY="$HOME/.cargo/bin/plan-executor"
+
+# Restart a running launchd job without unload/load, which can disrupt the
+# calling terminal session. kickstart -k kills the old process and starts a
+# fresh one in-place; the plist registration is never touched.
+_restart_daemon() {
+    if launchctl list "$LABEL" &>/dev/null; then
+        launchctl kickstart -k "$GUI_TARGET/$LABEL" 2>/dev/null && return
+    fi
+    # Not yet registered — bootstrap it.
+    launchctl bootstrap "$GUI_TARGET" "$PLIST"
+}
 
 ACTION="${1:-install}"
 
@@ -69,12 +81,7 @@ EOCFG
 EOF
     echo "Wrote LaunchAgent: $PLIST"
 
-    if launchctl list "$LABEL" &>/dev/null; then
-        echo "Stopping existing daemon..."
-        launchctl unload "$PLIST" 2>/dev/null || true
-    fi
-
-    launchctl load -w "$PLIST"
+    _restart_daemon
 
     echo ""
     echo "Done. plan-executor daemon is running and will start automatically at login."
@@ -88,7 +95,9 @@ EOF
 # ── stop ──────────────────────────────────────────────────────────────────
 stop)
     if launchctl list "$LABEL" &>/dev/null; then
-        launchctl unload "$PLIST"
+        launchctl bootout "$GUI_TARGET/$LABEL" 2>/dev/null \
+            || launchctl unload "$PLIST" 2>/dev/null \
+            || true
         echo "Daemon stopped."
     else
         echo "Daemon is not running."
@@ -100,7 +109,8 @@ start)
     if launchctl list "$LABEL" &>/dev/null; then
         echo "Daemon is already running."
     else
-        launchctl load -w "$PLIST"
+        launchctl bootstrap "$GUI_TARGET" "$PLIST" \
+            || launchctl load -w "$PLIST"
         echo "Daemon started."
     fi
     ;;
@@ -109,7 +119,9 @@ start)
 uninstall)
     if launchctl list "$LABEL" &>/dev/null; then
         echo "Stopping daemon..."
-        launchctl unload "$PLIST" 2>/dev/null || true
+        launchctl bootout "$GUI_TARGET/$LABEL" 2>/dev/null \
+            || launchctl unload "$PLIST" 2>/dev/null \
+            || true
     fi
 
     if [[ -f "$PLIST" ]]; then
