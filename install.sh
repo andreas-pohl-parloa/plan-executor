@@ -117,7 +117,12 @@ EOF
     fi
 
     echo ""
-    echo "Done. plan-executor daemon is running and will start automatically at login."
+    echo "Done. Waiting 10s to time when WezTerm dies (debugging)..."
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        echo "  $i/10 — still alive at $(date +%T)"
+        sleep 1
+    done
+    echo "  survived 10s — WezTerm death is NOT during this script"
     echo ""
     echo "  Logs:      tail -f $LOG_FILE"
     echo "  Stop:      $0 stop"

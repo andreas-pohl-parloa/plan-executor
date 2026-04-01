@@ -58,13 +58,17 @@ impl DaemonState {
 
 /// Main daemon entry point
 pub async fn run_daemon() -> Result<()> {
+    tracing::info!("daemon starting (pid={})", std::process::id());
+
     let config = Config::load()?;
     let watch_dirs = config.expanded_watch_dirs();
+    tracing::info!("config loaded, watch_dirs={:?}", watch_dirs);
 
     // Write PID file on every start so restarts always reflect the current PID.
     let pid_path = Config::base_dir().join("daemon.pid");
     std::fs::create_dir_all(Config::base_dir())?;
     std::fs::write(&pid_path, format!("{}\n", std::process::id()))?;
+    tracing::info!("pid file written");
 
     // Ensure socket cleanup on start
     let sock_path = socket_path();
@@ -72,9 +76,11 @@ pub async fn run_daemon() -> Result<()> {
         std::fs::remove_file(&sock_path)?;
     }
     std::fs::create_dir_all(sock_path.parent().unwrap())?;
+    tracing::info!("socket path ready: {}", sock_path.display());
 
     let (event_tx, _) = broadcast::channel::<DaemonEvent>(256);
 
+    tracing::info!("loading job history");
     let state = Arc::new(Mutex::new(DaemonState {
         config: config.clone(),
         running_jobs: HashMap::new(),
@@ -88,13 +94,17 @@ pub async fn run_daemon() -> Result<()> {
         running_children: HashMap::new(),
         event_tx: event_tx.clone(),
     }));
+    tracing::info!("job history loaded");
 
     // Scan on startup
+    tracing::info!("scanning for ready plans");
     {
         let ready = find_ready_plans(&watch_dirs, &config.plan_patterns);
+        tracing::info!("found {} ready plan(s)", ready.len());
         let mut st = state.lock().await;
         for plan in ready {
             let path_str = plan.path.to_string_lossy().to_string();
+            tracing::info!("notifying: {}", path_str);
             let _ = notify_plan_ready(&path_str, config.auto_execute);
             st.pending_plans.insert(path_str.clone(), PendingInfo {
                 plan_path: path_str,
@@ -105,7 +115,9 @@ pub async fn run_daemon() -> Result<()> {
     }
 
     // Start watcher
+    tracing::info!("starting FSEvents watcher");
     let (watcher, mut watch_rx) = start_watcher(watch_dirs.clone())?;
+    tracing::info!("watcher started");
     let _watcher = watcher; // keep alive
 
     // Unix socket listener
