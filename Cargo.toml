@@ -41,6 +41,9 @@ crossterm = "0.28"
 thiserror = "2"
 anyhow = "1"
 
+# Stream-json rendering (git submodule at stream-json-view/)
+sjv = { path = "stream-json-view" }
+
 # Daemonize
 daemonize = "0.5"
 

@@ -125,9 +125,10 @@ pub fn spawn_execution(
                 }
             }
 
-            // Emit formatted display line
-            for display_line in crate::formatter::format_stream_line(&line) {
-                let _ = tx.send(ExecEvent::DisplayLine(display_line)).await;
+            // Emit formatted display line (no color — TUI applies its own styling)
+            let rendered = sjv::render_runtime_line(&line, false, false);
+            if !rendered.is_empty() {
+                let _ = tx.send(ExecEvent::DisplayLine(rendered)).await;
             }
             let _ = tx.send(ExecEvent::OutputLine(line)).await;
         }

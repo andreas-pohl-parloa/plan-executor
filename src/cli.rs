@@ -69,8 +69,7 @@ async fn execute_plan(plan_path: String) -> Result<()> {
     use crate::executor::{spawn_execution, ExecEvent};
     use crate::handoff::{self, AgentType};
     use crate::jobs::{JobMetadata, JobStatus};
-    use tokio::io::AsyncWriteExt;
-    use tokio::process::Command as TokioCommand;
+    let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
 
     let plan = PathBuf::from(&plan_path);
     if !plan.exists() {
@@ -96,23 +95,18 @@ async fn execute_plan(plan_path: String) -> Result<()> {
         .context("failed to spawn claude")?;
 
     'outer: loop {
-        // Spawn sjv for this claude turn; its stdout inherits our terminal.
-        let mut sjv = TokioCommand::new("sjv")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .context("failed to spawn sjv — is it installed? (cd ~/workspace/code/stream-json-view && cargo install --path .)")?;
-        let mut sjv_in = sjv.stdin.take().expect("sjv stdin");
-
-        // Drain events for this turn, buffering the handoff/finished exit reason.
         let mut handoff_event: Option<(String, std::path::PathBuf)> = None;
         let mut finished_event: Option<crate::jobs::JobMetadata> = None;
 
         while let Some(event) = exec_rx.recv().await {
             match event {
                 ExecEvent::OutputLine(line) => {
-                    let _ = sjv_in.write_all(format!("{}\n", line).as_bytes()).await;
+                    let rendered = sjv::render_runtime_line(&line, false, use_color);
+                    if !rendered.is_empty() {
+                        println!("{}", rendered);
+                    }
                 }
-                ExecEvent::DisplayLine(_) => {} // sjv handles rendering
+                ExecEvent::DisplayLine(_) => {} // rendered via OutputLine above
                 ExecEvent::HandoffRequired { session_id, state_file } => {
                     handoff_event = Some((session_id, state_file));
                     break;
@@ -123,10 +117,6 @@ async fn execute_plan(plan_path: String) -> Result<()> {
                 }
             }
         }
-
-        // Close sjv stdin and wait for it to finish rendering before we print anything.
-        drop(sjv_in);
-        let _ = sjv.wait().await;
 
         if let Some(finished) = finished_event {
             println!();

@@ -2,7 +2,6 @@ mod cli;
 mod config;
 mod daemon;
 mod executor;
-mod formatter;
 mod handoff;
 mod ipc;
 mod jobs;
