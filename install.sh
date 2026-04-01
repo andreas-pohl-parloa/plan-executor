@@ -8,21 +8,19 @@ BASE_DIR="$HOME/.plan-executor"
 LOG_FILE="$BASE_DIR/daemon.log"
 BINARY="$HOME/.cargo/bin/plan-executor"
 
-# ── 1. Build and install ───────────────────────────────────────────────────
+ACTION="${1:-install}"
 
-echo "Building and installing plan-executor..."
-cargo install --path "$SCRIPT_DIR"
-echo "Installed: $BINARY"
+case "$ACTION" in
 
-# ── 2. Create data directory ───────────────────────────────────────────────
+# ── install ────────────────────────────────────────────────────────────────
+install)
+    echo "Building and installing plan-executor..."
+    cargo install --path "$SCRIPT_DIR"
+    echo "Installed: $BINARY"
 
-mkdir -p "$BASE_DIR"
+    mkdir -p "$BASE_DIR" "$HOME/Library/LaunchAgents"
 
-# ── 3. Write LaunchAgent plist ─────────────────────────────────────────────
-
-mkdir -p "$HOME/Library/LaunchAgents"
-
-cat > "$PLIST" << EOF
+    cat > "$PLIST" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -52,23 +50,49 @@ cat > "$PLIST" << EOF
 </dict>
 </plist>
 EOF
+    echo "Wrote LaunchAgent: $PLIST"
 
-echo "Wrote LaunchAgent: $PLIST"
+    if launchctl list "$LABEL" &>/dev/null; then
+        echo "Stopping existing daemon..."
+        launchctl unload "$PLIST" 2>/dev/null || true
+    fi
 
-# ── 4. Load (or reload) the agent ─────────────────────────────────────────
+    launchctl load -w "$PLIST"
 
-# Unload first in case a previous version is running.
-if launchctl list "$LABEL" &>/dev/null; then
-    echo "Stopping existing daemon..."
-    launchctl unload "$PLIST" 2>/dev/null || true
-fi
+    echo ""
+    echo "Done. plan-executor daemon is running and will start automatically at login."
+    echo ""
+    echo "  Logs:      tail -f $LOG_FILE"
+    echo "  Stop:      launchctl unload $PLIST"
+    echo "  Start:     launchctl load -w $PLIST"
+    echo "  Uninstall: $0 uninstall"
+    ;;
 
-launchctl load -w "$PLIST"
+# ── uninstall ──────────────────────────────────────────────────────────────
+uninstall)
+    if launchctl list "$LABEL" &>/dev/null; then
+        echo "Stopping daemon..."
+        launchctl unload "$PLIST" 2>/dev/null || true
+    fi
 
-echo ""
-echo "Done. plan-executor daemon is running and will start automatically at login."
-echo ""
-echo "  Logs:      tail -f $LOG_FILE"
-echo "  Stop:      launchctl unload $PLIST"
-echo "  Start:     launchctl load -w $PLIST"
-echo "  Uninstall: launchctl unload $PLIST && rm $PLIST"
+    if [[ -f "$PLIST" ]]; then
+        rm "$PLIST"
+        echo "Removed: $PLIST"
+    fi
+
+    if [[ -f "$BINARY" ]]; then
+        rm "$BINARY"
+        echo "Removed: $BINARY"
+    fi
+
+    echo ""
+    echo "Done. Data directory $BASE_DIR was left intact."
+    echo "Remove it manually if no longer needed: rm -rf $BASE_DIR"
+    ;;
+
+*)
+    echo "Usage: $0 [install|uninstall]" >&2
+    exit 1
+    ;;
+
+esac
