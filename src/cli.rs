@@ -5,6 +5,9 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "plan-executor", about = "Monitor and execute Claude plan files")]
 pub struct Cli {
+    /// Path to config file. Default: ~/.plan-executor/config.json
+    #[arg(long, global = true, value_name = "FILE")]
+    pub config: Option<std::path::PathBuf>,
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -57,9 +60,12 @@ pub fn run() {
     tracing_subscriber::fmt::init();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
 
+    let config = crate::config::Config::load(cli.config.as_deref())
+        .expect("failed to load config");
+
     let result: Result<()> = match cli.command {
-        Commands::Daemon { .. } => rt.block_on(crate::daemon::run_daemon()),
-        Commands::Execute { plan } => rt.block_on(execute_plan(plan)),
+        Commands::Daemon { .. } => rt.block_on(crate::daemon::run_daemon(config)),
+        Commands::Execute { plan } => rt.block_on(execute_plan(plan, config)),
         Commands::Tui => rt.block_on(crate::tui::run_tui()),
         Commands::Status => rt.block_on(show_status()),
         Commands::Stop | Commands::Jobs | Commands::Ensure => unreachable!(),
@@ -71,7 +77,7 @@ pub fn run() {
     }
 }
 
-async fn execute_plan(plan_path: String) -> Result<()> {
+async fn execute_plan(plan_path: String, config: crate::config::Config) -> Result<()> {
     use crate::executor::{spawn_execution, ExecEvent};
     use crate::handoff::{self, AgentType};
     use crate::jobs::{JobMetadata, JobStatus};
@@ -97,8 +103,8 @@ async fn execute_plan(plan_path: String) -> Result<()> {
 
     let job = JobMetadata::new(plan.clone());
     let job_id = job.id.clone();
-    let (_, mut exec_rx) = spawn_execution(job, execution_root.clone())
-        .context("failed to spawn claude")?;
+    let (_, mut exec_rx) = spawn_execution(job, execution_root.clone(), &config.agents.main)
+        .context("failed to spawn main agent")?;
 
     'outer: loop {
         let mut handoff_event: Option<(String, std::path::PathBuf)> = None;
@@ -173,7 +179,12 @@ async fn execute_plan(plan_path: String) -> Result<()> {
                     println!("└──────────────────────────────────────────────────────────────");
                     println!();
 
-                    let results = handoff::dispatch_all(state.handoffs).await;
+                    let results = handoff::dispatch_all(
+                        state.handoffs,
+                        &config.agents.claude,
+                        &config.agents.codex,
+                        &config.agents.gemini,
+                    ).await;
 
                     for r in &results {
                         if r.success {
@@ -199,9 +210,10 @@ async fn execute_plan(plan_path: String) -> Result<()> {
                         execution_root.clone(),
                         Some(job_id.clone()),
                         Some(plan.clone()),
+                        &config.agents.main,
                     )
                     .await
-                    .context("failed to resume claude session")?;
+                    .context("failed to resume agent session")?;
                     exec_rx = new_rx;
                     continue 'outer;
         }
@@ -315,7 +327,8 @@ fn ensure_daemon() {
     // After daemonize() the child continues here; start the runtime and daemon.
     tracing_subscriber::fmt::init();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    if let Err(e) = rt.block_on(crate::daemon::run_daemon()) {
+    let config = crate::config::Config::load(None).expect("failed to load config");
+    if let Err(e) = rt.block_on(crate::daemon::run_daemon(config)) {
         tracing::error!("daemon error: {:#}", e);
         std::process::exit(1);
     }

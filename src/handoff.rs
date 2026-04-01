@@ -119,7 +119,7 @@ pub fn load_state(state_file: &Path) -> Result<HandoffState> {
 
 // ── Sub-agent dispatch ─────────────────────────────────────────────────────
 
-async fn dispatch_agent(handoff: Handoff) -> HandoffResult {
+async fn dispatch_agent(handoff: Handoff, cmd: String) -> HandoffResult {
     let path = handoff.prompt_file.to_string_lossy().into_owned();
 
     // Verify the prompt file exists before attempting to dispatch.
@@ -132,17 +132,13 @@ async fn dispatch_agent(handoff: Handoff) -> HandoffResult {
         };
     }
 
-    let output = match &handoff.agent_type {
-        AgentType::Claude => Command::new("claude")
-            .args(["--dangerously-skip-permissions", "-p", &path])
-            .output().await,
-        AgentType::Codex => Command::new("codex")
-            .args(["--dangerously-bypass-approvals-and-sandbox", "exec", &path])
-            .output().await,
-        AgentType::Gemini => Command::new("gemini")
-            .args(["--yolo", "-p", &path])
-            .output().await,
-    };
+    let (program, mut args) = crate::config::Config::parse_cmd(&cmd);
+    args.push(path.clone());
+
+    let output = Command::new(&program)
+        .args(&args)
+        .output()
+        .await;
 
     match output {
         Ok(out) => HandoffResult {
@@ -161,9 +157,21 @@ async fn dispatch_agent(handoff: Handoff) -> HandoffResult {
 }
 
 /// Dispatches all handoffs in a batch concurrently. Returns results sorted by index.
-pub async fn dispatch_all(handoffs: Vec<Handoff>) -> Vec<HandoffResult> {
+pub async fn dispatch_all(
+    handoffs: Vec<Handoff>,
+    claude_cmd: &str,
+    codex_cmd: &str,
+    gemini_cmd: &str,
+) -> Vec<HandoffResult> {
     let handles: Vec<_> = handoffs.into_iter()
-        .map(|h| tokio::spawn(dispatch_agent(h)))
+        .map(|h| {
+            let cmd = match h.agent_type {
+                AgentType::Claude => claude_cmd.to_string(),
+                AgentType::Codex  => codex_cmd.to_string(),
+                AgentType::Gemini => gemini_cmd.to_string(),
+            };
+            tokio::spawn(dispatch_agent(h, cmd))
+        })
         .collect();
     let mut results = Vec::new();
     for handle in handles {
@@ -197,20 +205,20 @@ pub async fn resume_execution(
     execution_root: PathBuf,
     original_job_id: Option<String>,
     original_plan_path: Option<PathBuf>,
+    main_cmd: &str,
 ) -> Result<(tokio::process::Child, mpsc::Receiver<ExecEvent>)> {
     use tokio::io::AsyncBufReadExt;
 
-    let mut child = Command::new("claude")
-        .args([
-            "--dangerously-skip-permissions",
-            "--verbose",
-            "--output-format",
-            "stream-json",
-            "--resume",
-            session_id,
-            "-p",
-            continuation,
-        ])
+    let (program, mut base_args) = crate::config::Config::parse_cmd(main_cmd);
+    base_args.extend_from_slice(&[
+        "--resume".to_string(),
+        session_id.to_string(),
+        "-p".to_string(),
+        continuation.to_string(),
+    ]);
+
+    let mut child = tokio::process::Command::new(&program)
+        .args(&base_args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()?;

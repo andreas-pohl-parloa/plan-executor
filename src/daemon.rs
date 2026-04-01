@@ -19,6 +19,7 @@ use crate::watcher::start_watcher;
 pub struct DaemonState {
     #[allow(dead_code)]
     pub config: Config,
+    pub agents: crate::config::AgentConfig,
     pub running_jobs: HashMap<String, JobMetadata>, // job_id -> metadata
     pub pending_plans: HashMap<String, PendingInfo>, // plan_path -> info
     pub history: Vec<JobMetadata>,
@@ -57,10 +58,9 @@ impl DaemonState {
 }
 
 /// Main daemon entry point
-pub async fn run_daemon() -> Result<()> {
+pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
     tracing::info!("daemon starting (pid={})", std::process::id());
 
-    let config = Config::load()?;
     let watch_dirs = config.expanded_watch_dirs();
     tracing::info!("config loaded, watch_dirs={:?}", watch_dirs);
 
@@ -83,6 +83,7 @@ pub async fn run_daemon() -> Result<()> {
     tracing::info!("loading job history");
     let state = Arc::new(Mutex::new(DaemonState {
         config: config.clone(),
+        agents: config.agents.clone(),
         running_jobs: HashMap::new(),
         pending_plans: HashMap::new(),
         history: JobMetadata::load_all()
@@ -206,13 +207,17 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
     let job = JobMetadata::new(plan.clone());
     let job_id = job.id.clone();
 
+    let main_cmd = {
+        let st = state.lock().await;
+        st.agents.main.clone()
+    };
     // Remove from pending before spawning to prevent re-trigger
     {
         let mut st = state.lock().await;
         st.pending_plans.remove(plan_path);
     }
 
-    let Ok((child, mut exec_rx)) = spawn_execution(job.clone(), execution_root.clone()) else {
+    let Ok((child, mut exec_rx)) = spawn_execution(job.clone(), execution_root.clone(), &main_cmd) else {
         // spawn failed — log and return; plan is already removed from pending
         tracing::error!("failed to spawn execution for plan: {}", plan_path);
         return;
@@ -279,7 +284,16 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                             });
                         }
 
-                        let results = handoff::dispatch_all(state_data.handoffs).await;
+                        let agents = {
+                            let st = state_clone.lock().await;
+                            st.agents.clone()
+                        };
+                        let results = handoff::dispatch_all(
+                            state_data.handoffs,
+                            &agents.claude,
+                            &agents.codex,
+                            &agents.gemini,
+                        ).await;
 
                         for r in &results {
                             if !r.success {
@@ -302,6 +316,7 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                             execution_root.clone(),
                             Some(job_id.clone()),
                             Some(plan.clone()),
+                            &agents.main,
                         ).await {
                             Ok((new_child, new_rx)) => {
                                 {

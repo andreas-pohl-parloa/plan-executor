@@ -44,21 +44,18 @@ struct UsageBlock {
 pub fn spawn_execution(
     mut job: JobMetadata,
     execution_root: PathBuf,
+    main_cmd: &str,
 ) -> Result<(Child, mpsc::Receiver<ExecEvent>)> {
     let plan_path = job.plan_path.to_string_lossy().to_string();
-    // Quote the plan path to handle paths with spaces
     let quoted_path = plan_path.replace('"', "\\\"");
     let cmd_arg = format!("/my:execute-plan-non-interactive \"{}\"", quoted_path);
 
-    let mut child = Command::new("claude")
-        .args([
-            "--dangerously-skip-permissions",
-            "--verbose",
-            "--output-format",
-            "stream-json",
-            "-p",
-            &cmd_arg,
-        ])
+    let (program, mut base_args) = crate::config::Config::parse_cmd(main_cmd);
+    base_args.push("-p".to_string());
+    base_args.push(cmd_arg);
+
+    let mut child = Command::new(&program)
+        .args(&base_args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()?;
