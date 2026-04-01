@@ -11,7 +11,12 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Start the background daemon (detaches from terminal)
-    Daemon,
+    Daemon {
+        /// Run in the foreground without daemonizing.
+        /// Use this when managed by launchd or another supervisor.
+        #[arg(long)]
+        foreground: bool,
+    },
     /// Attach TUI to running daemon
     Tui,
     /// Show daemon status
@@ -23,15 +28,17 @@ pub fn run() {
 
     // Daemonize before creating the Tokio runtime — forking after Tokio's
     // thread pool is initialized is undefined behavior.
-    if matches!(cli.command, Commands::Daemon) {
-        daemonize();
+    if let Commands::Daemon { foreground } = &cli.command {
+        if !foreground {
+            daemonize();
+        }
     }
 
     tracing_subscriber::fmt::init();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
 
     let result: Result<()> = match cli.command {
-        Commands::Daemon => rt.block_on(crate::daemon::run_daemon()),
+        Commands::Daemon { .. } => rt.block_on(crate::daemon::run_daemon()),
         Commands::Tui => rt.block_on(crate::tui::run_tui()),
         Commands::Status => rt.block_on(show_status()),
     };
@@ -53,7 +60,11 @@ fn daemonize() {
     let pid_path = base_dir.join("daemon.pid");
 
     // Print to terminal before the parent exits.
-    eprintln!("Starting daemon. PID file: {}  Logs: {}", pid_path.display(), log_path.display());
+    eprintln!(
+        "Starting daemon. PID file: {}  Logs: {}",
+        pid_path.display(),
+        log_path.display()
+    );
 
     let log_file = std::fs::OpenOptions::new()
         .create(true)
