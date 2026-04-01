@@ -136,12 +136,7 @@ async fn dispatch_agent(handoff: Handoff) -> HandoffResult {
 
     let output = match &handoff.agent_type {
         AgentType::Claude => Command::new("claude")
-            .args([
-                "--dangerously-skip-permissions",
-                "--verbose",
-                "--output-format", "stream-json",
-                "-p", &at_path,
-            ])
+            .args(["--dangerously-skip-permissions", "-p", &at_path])
             .output().await,
         AgentType::Codex => Command::new("codex")
             .args(["--dangerously-bypass-approvals-and-sandbox", "exec", &at_path])
