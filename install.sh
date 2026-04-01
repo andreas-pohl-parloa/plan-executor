@@ -22,14 +22,25 @@ LOG_FILE="$BASE_DIR/daemon.log"
 BINARY="$HOME/.cargo/bin/plan-executor"
 
 # Stop the daemon via its PID file only — no launchctl involved.
-# launchd's KeepAlive will restart it automatically once the new binary is in place.
+# Verifies the PID actually belongs to plan-executor before killing to avoid
+# hitting a recycled PID that was reassigned to an unrelated process (e.g. WezTerm).
 _stop_via_pid() {
     local pid
     pid=$(cat "$BASE_DIR/daemon.pid" 2>/dev/null | tr -d '[:space:]' || true)
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-        kill "$pid" 2>/dev/null || true
-        echo "Stopped daemon (pid=$pid) — launchd will restart it automatically."
+    if [[ -z "$pid" ]]; then return; fi
+    if ! kill -0 "$pid" 2>/dev/null; then return; fi
+
+    # Confirm the running process is actually plan-executor before killing.
+    local comm
+    comm=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+    if [[ "$comm" != *"plan-executor"* ]]; then
+        echo "PID $pid is not plan-executor (got: '$comm') — skipping kill, removing stale PID file."
+        rm -f "$BASE_DIR/daemon.pid"
+        return
     fi
+
+    kill "$pid" 2>/dev/null || true
+    echo "Stopped daemon (pid=$pid) — launchd will restart it automatically."
 }
 
 ACTION="${1:-install}"
