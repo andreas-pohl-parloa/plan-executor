@@ -5,6 +5,7 @@ use anyhow::Result;
 #[derive(Debug, Clone)]
 pub struct PlanFile {
     pub path: PathBuf,
+    #[allow(dead_code)]
     pub status: PlanStatus,
 }
 

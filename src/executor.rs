@@ -27,7 +27,6 @@ struct StreamEvent {
     model: Option<String>,
     session_id: Option<String>,
     // For "result" type
-    total_cost_usd: Option<f64>,
     duration_ms: Option<u64>,
     usage: Option<UsageBlock>,
 }

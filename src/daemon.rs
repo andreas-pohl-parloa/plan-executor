@@ -17,6 +17,7 @@ use crate::watcher::start_watcher;
 
 /// Shared daemon state
 pub struct DaemonState {
+    #[allow(dead_code)]
     pub config: Config,
     pub running_jobs: HashMap<String, JobMetadata>, // job_id -> metadata
     pub pending_plans: HashMap<String, PendingInfo>, // plan_path -> info
@@ -234,7 +235,7 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                         let state_data = match handoff::load_state(&state_file) {
                             Ok(s) => s,
                             Err(e) => {
-                                let mut st = state_clone.lock().await;
+                                let st = state_clone.lock().await;
                                 let _ = st.event_tx.send(DaemonEvent::JobOutput {
                                     job_id: job_id.clone(),
                                     line: format!("[plan-executor] failed to read state file: {}", e),
@@ -244,7 +245,7 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                         };
 
                         {
-                            let mut st = state_clone.lock().await;
+                            let st = state_clone.lock().await;
                             let _ = st.event_tx.send(DaemonEvent::JobOutput {
                                 job_id: job_id.clone(),
                                 line: format!(
@@ -258,7 +259,7 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
 
                         for r in &results {
                             if !r.success {
-                                let mut st = state_clone.lock().await;
+                                let st = state_clone.lock().await;
                                 let _ = st.event_tx.send(DaemonEvent::JobOutput {
                                     job_id: job_id.clone(),
                                     line: format!(
@@ -287,7 +288,7 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                                 continue 'outer;
                             }
                             Err(e) => {
-                                let mut st = state_clone.lock().await;
+                                let st = state_clone.lock().await;
                                 let _ = st.event_tx.send(DaemonEvent::JobOutput {
                                     job_id: job_id.clone(),
                                     line: format!("[plan-executor] failed to resume session: {}", e),

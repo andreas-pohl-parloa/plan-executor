@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use serde::Deserialize;
-use anyhow::Result;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelPricing {

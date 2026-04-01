@@ -58,6 +58,7 @@ use tokio::net::UnixStream;
 use anyhow::Result;
 
 /// Sends a message as a JSON line over a UnixStream.
+#[allow(dead_code)]
 pub async fn send_msg<T: Serialize>(stream: &mut UnixStream, msg: &T) -> Result<()> {
     let mut line = serde_json::to_string(msg)?;
     line.push('\n');
@@ -66,6 +67,7 @@ pub async fn send_msg<T: Serialize>(stream: &mut UnixStream, msg: &T) -> Result<
 }
 
 /// Reads one JSON line from a BufReader<UnixStream>.
+#[allow(dead_code)]
 pub async fn recv_msg<T: for<'de> Deserialize<'de>>(
     reader: &mut BufReader<UnixStream>,
 ) -> Result<T> {
