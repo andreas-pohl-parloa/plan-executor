@@ -29,6 +29,8 @@ pub enum Commands {
     Tui,
     /// Show daemon status
     Status,
+    /// List job history
+    Jobs,
 }
 
 pub fn run() {
@@ -37,6 +39,11 @@ pub fn run() {
     // Stop is synchronous — handle it before creating the async runtime.
     if matches!(cli.command, Commands::Stop) {
         stop_daemon();
+        return;
+    }
+
+    if matches!(cli.command, Commands::Jobs) {
+        list_jobs();
         return;
     }
 
@@ -57,6 +64,7 @@ pub fn run() {
         Commands::Tui => rt.block_on(crate::tui::run_tui()),
         Commands::Status => rt.block_on(show_status()),
         Commands::Stop => unreachable!(),
+        Commands::Jobs => unreachable!(),
     };
 
     if let Err(e) = result {
@@ -150,15 +158,15 @@ async fn execute_plan(plan_path: String) -> Result<()> {
                     for h in &state.handoffs {
                         let cmd = match h.agent_type {
                             AgentType::Claude => format!(
-                                "claude --dangerously-skip-permissions -p <{}>",
+                                "claude --dangerously-skip-permissions --verbose --output-format stream-json -p @{}",
                                 h.prompt_file.display()
                             ),
                             AgentType::Codex => format!(
-                                "codex --dangerously-bypass-approvals-and-sandbox exec <{}>",
+                                "codex --dangerously-bypass-approvals-and-sandbox exec @{}",
                                 h.prompt_file.display()
                             ),
                             AgentType::Gemini => format!(
-                                "gemini --yolo -p <{}>",
+                                "gemini --yolo -p @{}",
                                 h.prompt_file.display()
                             ),
                         };
@@ -217,6 +225,66 @@ fn find_repo_root(path: &Path) -> Option<PathBuf> {
             return Some(dir);
         }
         dir = dir.parent()?.to_path_buf();
+    }
+}
+
+fn list_jobs() {
+    use crate::jobs::{JobMetadata, JobStatus};
+
+    let jobs = JobMetadata::load_all();
+    if jobs.is_empty() {
+        println!("No jobs found.");
+        return;
+    }
+
+    let id_w = 8;
+    let plan_w = 34;
+    let status_w = 9;
+    let dur_w = 10;
+    let cost_w = 8;
+
+    println!(
+        "{:<id_w$}  {:<plan_w$}  {:<status_w$}  {:>dur_w$}  {:>cost_w$}",
+        "ID", "PLAN", "STATUS", "DURATION", "COST",
+        id_w = id_w, plan_w = plan_w, status_w = status_w,
+        dur_w = dur_w, cost_w = cost_w,
+    );
+    println!("{}", "─".repeat(id_w + 2 + plan_w + 2 + status_w + 2 + dur_w + 2 + cost_w));
+
+    for job in &jobs {
+        let id = &job.id[..job.id.len().min(6)];
+
+        let plan = job.plan_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?");
+        let plan_truncated = if plan.len() > plan_w {
+            format!("{}…", &plan[..plan_w - 1])
+        } else {
+            plan.to_string()
+        };
+
+        let status = match job.status {
+            JobStatus::Success => "success",
+            JobStatus::Failed  => "failed",
+            JobStatus::Killed  => "killed",
+            JobStatus::Running => "running",
+        };
+
+        let duration = job.duration_ms
+            .map(|ms| format!("{}s", ms / 1000))
+            .unwrap_or_else(|| "-".to_string());
+
+        let cost = job.cost_usd
+            .map(|c| format!("${:.4}", c))
+            .unwrap_or_else(|| "-".to_string());
+
+        println!(
+            "{:<id_w$}  {:<plan_w$}  {:<status_w$}  {:>dur_w$}  {:>cost_w$}",
+            id, plan_truncated, status, duration, cost,
+            id_w = id_w, plan_w = plan_w, status_w = status_w,
+            dur_w = dur_w, cost_w = cost_w,
+        );
     }
 }
 

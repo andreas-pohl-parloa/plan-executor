@@ -120,25 +120,34 @@ pub fn load_state(state_file: &Path) -> Result<HandoffState> {
 // ── Sub-agent dispatch ─────────────────────────────────────────────────────
 
 async fn dispatch_agent(handoff: Handoff) -> HandoffResult {
-    let prompt = match std::fs::read_to_string(&handoff.prompt_file) {
-        Ok(c) => c,
-        Err(e) => return HandoffResult {
+    let path = handoff.prompt_file.to_string_lossy().into_owned();
+
+    // Verify the prompt file exists before attempting to dispatch.
+    if !handoff.prompt_file.exists() {
+        return HandoffResult {
             index: handoff.index,
             stdout: String::new(),
-            stderr: format!("failed to read prompt file {:?}: {}", handoff.prompt_file, e),
+            stderr: format!("prompt file not found: {}", path),
             success: false,
-        },
-    };
+        };
+    }
+
+    let at_path = format!("@{}", path);
 
     let output = match &handoff.agent_type {
         AgentType::Claude => Command::new("claude")
-            .args(["--dangerously-skip-permissions", "-p", &prompt])
+            .args([
+                "--dangerously-skip-permissions",
+                "--verbose",
+                "--output-format", "stream-json",
+                "-p", &at_path,
+            ])
             .output().await,
         AgentType::Codex => Command::new("codex")
-            .args(["--dangerously-bypass-approvals-and-sandbox", "exec", &prompt])
+            .args(["--dangerously-bypass-approvals-and-sandbox", "exec", &at_path])
             .output().await,
         AgentType::Gemini => Command::new("gemini")
-            .args(["--yolo", "-p", &prompt])
+            .args(["--yolo", "-p", &at_path])
             .output().await,
     };
 
