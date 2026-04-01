@@ -25,6 +25,8 @@ pub enum Commands {
     },
     /// Stop the running daemon
     Stop,
+    /// Start the daemon if it is not already running (used by shell hook)
+    Ensure,
     /// Attach TUI to running daemon
     Tui,
     /// Show daemon status
@@ -36,15 +38,12 @@ pub enum Commands {
 pub fn run() {
     let cli = Cli::parse();
 
-    // Stop is synchronous — handle it before creating the async runtime.
-    if matches!(cli.command, Commands::Stop) {
-        stop_daemon();
-        return;
-    }
-
-    if matches!(cli.command, Commands::Jobs) {
-        list_jobs();
-        return;
+    // Synchronous commands — handle before creating the async runtime.
+    match &cli.command {
+        Commands::Stop => { stop_daemon(); return; }
+        Commands::Jobs => { list_jobs(); return; }
+        Commands::Ensure => { ensure_daemon(); return; }
+        _ => {}
     }
 
     // Daemonize before creating the Tokio runtime — forking after Tokio's
@@ -63,8 +62,7 @@ pub fn run() {
         Commands::Execute { plan } => rt.block_on(execute_plan(plan)),
         Commands::Tui => rt.block_on(crate::tui::run_tui()),
         Commands::Status => rt.block_on(show_status()),
-        Commands::Stop => unreachable!(),
-        Commands::Jobs => unreachable!(),
+        Commands::Stop | Commands::Jobs | Commands::Ensure => unreachable!(),
     };
 
     if let Err(e) = result {
@@ -303,6 +301,23 @@ fn list_jobs() {
             id_w = id_w, plan_w = plan_w, status_w = status_w,
             dur_w = dur_w, cost_w = cost_w,
         );
+    }
+}
+
+/// Start the daemon if it is not already running. Used by the shell hook.
+fn ensure_daemon() {
+    use crate::ipc::socket_path;
+    if socket_path().exists() {
+        return; // already running, nothing to do
+    }
+    // Daemonize and start — same path as `plan-executor daemon`
+    daemonize();
+    // After daemonize() the child continues here; start the runtime and daemon.
+    tracing_subscriber::fmt::init();
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    if let Err(e) = rt.block_on(crate::daemon::run_daemon()) {
+        tracing::error!("daemon error: {:#}", e);
+        std::process::exit(1);
     }
 }
 
