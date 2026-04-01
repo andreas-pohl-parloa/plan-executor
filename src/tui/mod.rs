@@ -129,6 +129,9 @@ async fn run_loop(
                             }
                         }
                     }
+                    KeyCode::Char('r') => {
+                        let _ = app.daemon_tx.send(TuiRequest::GetState).await;
+                    }
                     KeyCode::PageDown => {
                         app.output_scroll = app.output_scroll.saturating_add(10);
                     }

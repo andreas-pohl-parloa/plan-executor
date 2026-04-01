@@ -4,7 +4,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap},
 };
 use crate::tui::app::{App, Tab};
@@ -43,24 +43,41 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_list(frame: &mut Frame, app: &App, area: Rect) {
+    let gray = Style::default().fg(Color::DarkGray);
+
     let items: Vec<ListItem> = match app.current_tab {
         Tab::Running => {
-            // Show pending plans first, then running jobs
             let mut items: Vec<ListItem> = app.pending_plans.iter().map(|p| {
                 let filename = std::path::Path::new(&p.plan_path)
                     .file_name().and_then(|n| n.to_str()).unwrap_or(&p.plan_path);
                 let countdown = p.auto_execute_remaining_secs
                     .map(|s| format!(" [auto in {}s]", s))
                     .unwrap_or_else(|| " [press e to execute]".to_string());
-                ListItem::new(format!("* {}{}", filename, countdown))
-                    .style(Style::default().fg(Color::Yellow))
+                ListItem::new(Text::from(vec![
+                    Line::from(Span::styled(
+                        format!("* {}{}", filename, countdown),
+                        Style::default().fg(Color::Yellow),
+                    )),
+                    Line::from(Span::styled(
+                        format!("  {}", p.plan_path),
+                        gray,
+                    )),
+                ]))
             }).collect();
 
             items.extend(app.running_jobs.iter().map(|j| {
                 let filename = j.plan_path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
                 let elapsed = (Utc::now() - j.started_at).num_seconds();
-                ListItem::new(format!(">> {} ({}s)", filename, elapsed))
-                    .style(Style::default().fg(Color::Cyan))
+                ListItem::new(Text::from(vec![
+                    Line::from(Span::styled(
+                        format!(">> {} ({}s)", filename, elapsed),
+                        Style::default().fg(Color::Cyan),
+                    )),
+                    Line::from(Span::styled(
+                        format!("  {}", j.plan_path.display()),
+                        gray,
+                    )),
+                ]))
             }));
             items
         }
@@ -75,7 +92,13 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                 };
                 let cost = j.cost_usd.map(|c| format!(" ${:.4}", c)).unwrap_or_default();
                 let secs = j.duration_ms.map(|ms| format!(" {}s", ms / 1000)).unwrap_or_default();
-                ListItem::new(format!("{} {}{}{}", status_icon, filename, secs, cost))
+                ListItem::new(Text::from(vec![
+                    Line::from(format!("{} {}{}{}", status_icon, filename, secs, cost)),
+                    Line::from(Span::styled(
+                        format!("  {}", j.plan_path.display()),
+                        gray,
+                    )),
+                ]))
             }).collect()
         }
     };
