@@ -38,44 +38,83 @@ pub struct HandoffResult {
 }
 
 // ── State file deserialization ─────────────────────────────────────────────
+//
+// Two schemas are supported:
+//   Spec schema  — { "phase": "<string>", "handoffs": [{ "agentType", "promptFile", ... }] }
+//   Actual skill — { "current_phase": <int>, "expected_handoffs": [{ "prompt_file", ... }] }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct RawHandoff {
+    #[serde(default)]
     index: usize,
-    #[serde(rename = "agentType")]
+    /// camelCase from spec; absent in actual skill output (defaults to "claude")
+    #[serde(rename = "agentType", default)]
     agent_type: String,
-    #[serde(rename = "promptFile")]
+    /// snake_case (actual) or camelCase alias (spec)
+    #[serde(alias = "promptFile")]
     prompt_file: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct RawState {
+    /// Spec: string phase name
+    #[serde(default)]
     phase: String,
+    /// Actual skill: integer phase counter
+    #[serde(default)]
+    current_phase: u32,
+    /// Spec field name
+    #[serde(default)]
     handoffs: Vec<RawHandoff>,
+    /// Actual skill field name
+    #[serde(default)]
+    expected_handoffs: Vec<RawHandoff>,
 }
 
 /// Reads `.tmp-execute-plan-state.json` and returns parsed `HandoffState`.
+/// Relative `prompt_file` paths are resolved against the state file's directory.
 pub fn load_state(state_file: &Path) -> Result<HandoffState> {
     let content = std::fs::read_to_string(state_file)?;
     let raw: RawState = serde_json::from_str(&content)?;
-    let handoffs = raw
-        .handoffs
+
+    let base_dir = state_file.parent().unwrap_or(Path::new("."));
+
+    // Accept either field name; prefer the non-empty one.
+    let phase = if !raw.phase.is_empty() {
+        raw.phase.clone()
+    } else if raw.current_phase > 0 {
+        format!("phase-{}", raw.current_phase)
+    } else {
+        "unknown".to_string()
+    };
+
+    let raw_handoffs = if !raw.expected_handoffs.is_empty() {
+        raw.expected_handoffs
+    } else {
+        raw.handoffs
+    };
+
+    let handoffs = raw_handoffs
         .into_iter()
-        .map(|h| Handoff {
-            index: h.index,
-            agent_type: match h.agent_type.as_str() {
-                "claude" => AgentType::Claude,
+        .map(|h| {
+            let agent_type = match h.agent_type.as_str() {
                 "codex"  => AgentType::Codex,
                 "gemini" => AgentType::Gemini,
+                // "claude" or absent → Claude
                 other => {
-                    tracing::warn!("unknown agent-type '{}', defaulting to claude", other);
+                    if !other.is_empty() && other != "claude" {
+                        tracing::warn!("unknown agent-type '{}', defaulting to claude", other);
+                    }
                     AgentType::Claude
                 }
-            },
-            prompt_file: PathBuf::from(h.prompt_file),
+            };
+            let pf = PathBuf::from(&h.prompt_file);
+            let prompt_file = if pf.is_absolute() { pf } else { base_dir.join(pf) };
+            Handoff { index: h.index, agent_type, prompt_file }
         })
         .collect();
-    Ok(HandoffState { phase: raw.phase, handoffs })
+
+    Ok(HandoffState { phase, handoffs })
 }
 
 // ── Sub-agent dispatch ─────────────────────────────────────────────────────
