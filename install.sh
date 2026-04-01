@@ -9,15 +9,15 @@ BASE_DIR="$HOME/.plan-executor"
 LOG_FILE="$BASE_DIR/daemon.log"
 BINARY="$HOME/.cargo/bin/plan-executor"
 
-# Restart a running launchd job without unload/load, which can disrupt the
-# calling terminal session. kickstart -k kills the old process and starts a
-# fresh one in-place; the plist registration is never touched.
-_restart_daemon() {
-    if launchctl list "$LABEL" &>/dev/null; then
-        launchctl kickstart -k "$GUI_TARGET/$LABEL" 2>/dev/null && return
+# Stop the daemon via its PID file only — no launchctl involved.
+# launchd's KeepAlive will restart it automatically once the new binary is in place.
+_stop_via_pid() {
+    local pid
+    pid=$(cat "$BASE_DIR/daemon.pid" 2>/dev/null | tr -d '[:space:]' || true)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        echo "Stopped daemon (pid=$pid) — launchd will restart it automatically."
     fi
-    # Not yet registered — bootstrap it.
-    launchctl bootstrap "$GUI_TARGET" "$PLIST"
 }
 
 ACTION="${1:-install}"
@@ -26,6 +26,10 @@ case "$ACTION" in
 
 # ── install ────────────────────────────────────────────────────────────────
 install)
+    # Stop the running daemon before replacing the binary so the file isn't
+    # locked during install. launchd's KeepAlive brings it back on its own.
+    _stop_via_pid
+
     echo "Building and installing plan-executor..."
     cargo install --path "$SCRIPT_DIR"
     echo "Installed: $BINARY"
@@ -81,7 +85,13 @@ EOCFG
 EOF
     echo "Wrote LaunchAgent: $PLIST"
 
-    _restart_daemon
+    # Register with launchd only on first install. On subsequent installs the
+    # daemon is already registered and launchd restarts it automatically after
+    # the PID-based stop above.
+    if ! launchctl list "$LABEL" &>/dev/null; then
+        launchctl bootstrap "$GUI_TARGET" "$PLIST"
+        echo "Registered LaunchAgent."
+    fi
 
     echo ""
     echo "Done. plan-executor daemon is running and will start automatically at login."
