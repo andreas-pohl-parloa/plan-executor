@@ -1,5 +1,6 @@
+use std::path::{Path, PathBuf};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use anyhow::Result;
 
 #[derive(Parser)]
 #[command(name = "plan-executor", about = "Monitor and execute Claude plan files")]
@@ -16,6 +17,11 @@ pub enum Commands {
         /// Use this when managed by launchd or another supervisor.
         #[arg(long)]
         foreground: bool,
+    },
+    /// Execute a plan file directly, streaming output to the terminal
+    Execute {
+        /// Path to the plan file
+        plan: String,
     },
     /// Stop the running daemon
     Stop,
@@ -47,14 +53,152 @@ pub fn run() {
 
     let result: Result<()> = match cli.command {
         Commands::Daemon { .. } => rt.block_on(crate::daemon::run_daemon()),
+        Commands::Execute { plan } => rt.block_on(execute_plan(plan)),
         Commands::Tui => rt.block_on(crate::tui::run_tui()),
         Commands::Status => rt.block_on(show_status()),
         Commands::Stop => unreachable!(),
     };
 
     if let Err(e) = result {
-        tracing::error!("Error: {:#}", e);
+        eprintln!("Error: {:#}", e);
         std::process::exit(1);
+    }
+}
+
+async fn execute_plan(plan_path: String) -> Result<()> {
+    use crate::executor::{spawn_execution, ExecEvent};
+    use crate::handoff::{self, AgentType};
+    use crate::jobs::{JobMetadata, JobStatus};
+
+    let plan = PathBuf::from(&plan_path);
+    if !plan.exists() {
+        anyhow::bail!("Plan file not found: {}", plan_path);
+    }
+
+    let execution_root = find_repo_root(&plan)
+        .unwrap_or_else(|| plan.parent().unwrap_or(plan.as_path()).to_path_buf());
+
+    let quoted = plan_path.replace('"', "\\\"");
+    println!("╔══ plan-executor execute ═════════════════════════════════════");
+    println!("║  Plan:  {}", plan_path);
+    println!("║  Root:  {}", execution_root.display());
+    println!("║  Cmd:   claude --dangerously-skip-permissions --verbose \\");
+    println!("║           --output-format stream-json \\");
+    println!("║           -p \"/my:execute-plan-non-interactive \\\"{}\\\"\"", quoted);
+    println!("╚══════════════════════════════════════════════════════════════");
+    println!();
+
+    let job = JobMetadata::new(plan.clone());
+    let job_id = job.id.clone();
+    let (_, mut exec_rx) = spawn_execution(job, execution_root.clone())
+        .context("failed to spawn claude")?;
+
+    'outer: loop {
+        while let Some(event) = exec_rx.recv().await {
+            match event {
+                ExecEvent::OutputLine(_) => {} // suppress raw NDJSON
+                ExecEvent::DisplayLine(line) => {
+                    println!("{}", line);
+                }
+                ExecEvent::HandoffRequired { session_id, state_file } => {
+                    let state = handoff::load_state(&state_file)
+                        .context("failed to read handoff state file")?;
+
+                    println!();
+                    println!("┌── handoff: phase={} ──────────────────────────────────────────", state.phase);
+                    println!("│  Session: {}", session_id);
+                    println!("│  Dispatching {} sub-agent(s):", state.handoffs.len());
+                    for h in &state.handoffs {
+                        let cmd = match h.agent_type {
+                            AgentType::Claude => format!(
+                                "claude --dangerously-skip-permissions -p <{}>",
+                                h.prompt_file.display()
+                            ),
+                            AgentType::Codex => format!(
+                                "codex --dangerously-bypass-approvals-and-sandbox exec <{}>",
+                                h.prompt_file.display()
+                            ),
+                            AgentType::Gemini => format!(
+                                "gemini --yolo -p <{}>",
+                                h.prompt_file.display()
+                            ),
+                        };
+                        println!("│  [{}] {}", h.index, cmd);
+                    }
+                    println!("└──────────────────────────────────────────────────────────────");
+                    println!();
+
+                    let results = handoff::dispatch_all(state.handoffs).await;
+
+                    for r in &results {
+                        if r.success {
+                            println!("  [{}] ✓ done ({} chars)", r.index, r.stdout.len());
+                        } else {
+                            let first_err = r.stderr.lines().next().unwrap_or("(no stderr)");
+                            println!("  [{}] ✗ failed: {}", r.index, first_err);
+                        }
+                    }
+
+                    let continuation = handoff::build_continuation(&results);
+                    println!();
+                    println!("┌── resume ─────────────────────────────────────────────────────");
+                    println!("│  claude --dangerously-skip-permissions --verbose \\");
+                    println!("│    --output-format stream-json --resume {} \\", session_id);
+                    println!("│    -p <continuation>");
+                    println!("└───────────────────────────────────────────────────────────────");
+                    println!();
+
+                    let (_, new_rx) = handoff::resume_execution(
+                        &session_id,
+                        &continuation,
+                        execution_root.clone(),
+                        Some(job_id.clone()),
+                        Some(plan.clone()),
+                    )
+                    .await
+                    .context("failed to resume claude session")?;
+                    exec_rx = new_rx;
+                    continue 'outer;
+                }
+                ExecEvent::Finished(finished) => {
+                    println!();
+                    println!("╔══ done ═══════════════════════════════════════════════════════");
+                    match finished.status {
+                        JobStatus::Success => println!("║  Status:   success"),
+                        JobStatus::Failed  => println!("║  Status:   FAILED"),
+                        other              => println!("║  Status:   {:?}", other),
+                    }
+                    if let Some(ms) = finished.duration_ms {
+                        println!("║  Duration: {}s", ms / 1000);
+                    }
+                    if let Some(cost) = finished.cost_usd {
+                        println!("║  Cost:     ${:.4}", cost);
+                    }
+                    if let (Some(i), Some(o)) = (finished.input_tokens, finished.output_tokens) {
+                        println!("║  Tokens:   {} in / {} out", i, o);
+                    }
+                    println!("╚══════════════════════════════════════════════════════════════");
+                    break 'outer;
+                }
+            }
+        }
+        break;
+    }
+
+    Ok(())
+}
+
+fn find_repo_root(path: &Path) -> Option<PathBuf> {
+    let mut dir = if path.is_file() {
+        path.parent()?.to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir);
+        }
+        dir = dir.parent()?.to_path_buf();
     }
 }
 
