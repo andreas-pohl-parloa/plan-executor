@@ -2,15 +2,15 @@
 set -euo pipefail
 
 # ── Debug logging ──────────────────────────────────────────────────────────
-# Every command is traced with a timestamp to this file.
-# If WezTerm dies, open a new terminal and: cat /tmp/plan-executor-install.log
+# Traces every command with a timestamp. Safe: no process substitution,
+# no tee — stderr goes directly to the log file only.
+# To watch live in another pane: tail -f /tmp/plan-executor-install.log
 INSTALL_LOG="/tmp/plan-executor-install.log"
 : > "$INSTALL_LOG"
-echo "Logging all commands to $INSTALL_LOG"
-# Duplicate stderr to the log file (set -x traces go to stderr)
-exec 2> >(tee -a "$INSTALL_LOG" >&2)
+exec 2>>"$INSTALL_LOG"
 PS4='[$(date +%T.%3N)] + '
 set -x
+echo "=== install.sh started ===" >&2
 # ──────────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
