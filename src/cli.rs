@@ -69,6 +69,8 @@ async fn execute_plan(plan_path: String) -> Result<()> {
     use crate::executor::{spawn_execution, ExecEvent};
     use crate::handoff::{self, AgentType};
     use crate::jobs::{JobMetadata, JobStatus};
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command as TokioCommand;
 
     let plan = PathBuf::from(&plan_path);
     if !plan.exists() {
@@ -94,13 +96,60 @@ async fn execute_plan(plan_path: String) -> Result<()> {
         .context("failed to spawn claude")?;
 
     'outer: loop {
+        // Spawn sjv for this claude turn; its stdout inherits our terminal.
+        let mut sjv = TokioCommand::new("sjv")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .context("failed to spawn sjv — is it installed? (cd ~/workspace/code/stream-json-view && cargo install --path .)")?;
+        let mut sjv_in = sjv.stdin.take().expect("sjv stdin");
+
+        // Drain events for this turn, buffering the handoff/finished exit reason.
+        let mut handoff_event: Option<(String, std::path::PathBuf)> = None;
+        let mut finished_event: Option<crate::jobs::JobMetadata> = None;
+
         while let Some(event) = exec_rx.recv().await {
             match event {
-                ExecEvent::OutputLine(_) => {} // suppress raw NDJSON
-                ExecEvent::DisplayLine(line) => {
-                    println!("{}", line);
+                ExecEvent::OutputLine(line) => {
+                    let _ = sjv_in.write_all(format!("{}\n", line).as_bytes()).await;
                 }
+                ExecEvent::DisplayLine(_) => {} // sjv handles rendering
                 ExecEvent::HandoffRequired { session_id, state_file } => {
+                    handoff_event = Some((session_id, state_file));
+                    break;
+                }
+                ExecEvent::Finished(job) => {
+                    finished_event = Some(job);
+                    break;
+                }
+            }
+        }
+
+        // Close sjv stdin and wait for it to finish rendering before we print anything.
+        drop(sjv_in);
+        let _ = sjv.wait().await;
+
+        if let Some(finished) = finished_event {
+            println!();
+            println!("╔══ done ═══════════════════════════════════════════════════════");
+            match finished.status {
+                JobStatus::Success => println!("║  Status:   success"),
+                JobStatus::Failed  => println!("║  Status:   FAILED"),
+                other              => println!("║  Status:   {:?}", other),
+            }
+            if let Some(ms) = finished.duration_ms {
+                println!("║  Duration: {}s", ms / 1000);
+            }
+            if let Some(cost) = finished.cost_usd {
+                println!("║  Cost:     ${:.4}", cost);
+            }
+            if let (Some(i), Some(o)) = (finished.input_tokens, finished.output_tokens) {
+                println!("║  Tokens:   {} in / {} out", i, o);
+            }
+            println!("╚══════════════════════════════════════════════════════════════");
+            break 'outer;
+        }
+
+        if let Some((session_id, state_file)) = handoff_event {
                     let state = handoff::load_state(&state_file)
                         .context("failed to read handoff state file")?;
 
@@ -159,30 +208,9 @@ async fn execute_plan(plan_path: String) -> Result<()> {
                     .context("failed to resume claude session")?;
                     exec_rx = new_rx;
                     continue 'outer;
-                }
-                ExecEvent::Finished(finished) => {
-                    println!();
-                    println!("╔══ done ═══════════════════════════════════════════════════════");
-                    match finished.status {
-                        JobStatus::Success => println!("║  Status:   success"),
-                        JobStatus::Failed  => println!("║  Status:   FAILED"),
-                        other              => println!("║  Status:   {:?}", other),
-                    }
-                    if let Some(ms) = finished.duration_ms {
-                        println!("║  Duration: {}s", ms / 1000);
-                    }
-                    if let Some(cost) = finished.cost_usd {
-                        println!("║  Cost:     ${:.4}", cost);
-                    }
-                    if let (Some(i), Some(o)) = (finished.input_tokens, finished.output_tokens) {
-                        println!("║  Tokens:   {} in / {} out", i, o);
-                    }
-                    println!("╚══════════════════════════════════════════════════════════════");
-                    break 'outer;
-                }
-            }
         }
-        break;
+
+        break 'outer; // channel closed without Finished
     }
 
     Ok(())
