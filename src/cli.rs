@@ -211,7 +211,25 @@ async fn execute_plan(plan_path: String) -> Result<()> {
         break 'outer; // channel closed without Finished
     }
 
+    // If the job never emitted Finished (error / cancelled), mark it Failed on disk
+    // so it shows up in history rather than being filtered out as Running.
+    mark_job_failed_if_running(&job_id);
+
     Ok(())
+}
+
+fn mark_job_failed_if_running(job_id: &str) {
+    use crate::config::Config;
+    use crate::jobs::{JobMetadata, JobStatus};
+
+    let meta_path = Config::base_dir().join("jobs").join(job_id).join("metadata.json");
+    let Ok(content) = std::fs::read_to_string(&meta_path) else { return };
+    let Ok(mut meta) = serde_json::from_str::<JobMetadata>(&content) else { return };
+    if meta.status == JobStatus::Running {
+        meta.status = JobStatus::Failed;
+        meta.finished_at = Some(chrono::Utc::now());
+        let _ = meta.save();
+    }
 }
 
 fn find_repo_root(path: &Path) -> Option<PathBuf> {

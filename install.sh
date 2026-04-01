@@ -20,6 +20,23 @@ install)
 
     mkdir -p "$BASE_DIR" "$HOME/Library/LaunchAgents"
 
+    # Create a default config if none exists, seeded with the workspace parent
+    # of the repo being installed from so the daemon watches the right dirs.
+    CONFIG_FILE="$BASE_DIR/config.json"
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        WORKSPACE_DIR="$(dirname "$SCRIPT_DIR")"
+        cat > "$CONFIG_FILE" << EOCFG
+{
+  "watch_dirs": ["$WORKSPACE_DIR", "$HOME/tools"],
+  "plan_patterns": [".my/plans/*.md"],
+  "auto_execute": false
+}
+EOCFG
+        echo "Created default config: $CONFIG_FILE"
+        echo "  watch_dirs: $WORKSPACE_DIR, ~/tools"
+        echo "  Edit $CONFIG_FILE to add or remove watched directories."
+    fi
+
     cat > "$PLIST" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
