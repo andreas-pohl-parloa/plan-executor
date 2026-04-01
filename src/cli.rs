@@ -158,15 +158,15 @@ async fn execute_plan(plan_path: String) -> Result<()> {
                     for h in &state.handoffs {
                         let cmd = match h.agent_type {
                             AgentType::Claude => format!(
-                                "claude --dangerously-skip-permissions -p @{}",
+                                "claude --dangerously-skip-permissions -p {}",
                                 h.prompt_file.display()
                             ),
                             AgentType::Codex => format!(
-                                "codex --dangerously-bypass-approvals-and-sandbox exec @{}",
+                                "codex --dangerously-bypass-approvals-and-sandbox exec {}",
                                 h.prompt_file.display()
                             ),
                             AgentType::Gemini => format!(
-                                "gemini --yolo -p @{}",
+                                "gemini --yolo -p {}",
                                 h.prompt_file.display()
                             ),
                         };

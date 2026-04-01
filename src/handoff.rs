@@ -132,17 +132,15 @@ async fn dispatch_agent(handoff: Handoff) -> HandoffResult {
         };
     }
 
-    let at_path = format!("@{}", path);
-
     let output = match &handoff.agent_type {
         AgentType::Claude => Command::new("claude")
-            .args(["--dangerously-skip-permissions", "-p", &at_path])
+            .args(["--dangerously-skip-permissions", "-p", &path])
             .output().await,
         AgentType::Codex => Command::new("codex")
-            .args(["--dangerously-bypass-approvals-and-sandbox", "exec", &at_path])
+            .args(["--dangerously-bypass-approvals-and-sandbox", "exec", &path])
             .output().await,
         AgentType::Gemini => Command::new("gemini")
-            .args(["--yolo", "-p", &at_path])
+            .args(["--yolo", "-p", &path])
             .output().await,
     };
 
