@@ -63,9 +63,29 @@ EOF
     echo "Done. plan-executor daemon is running and will start automatically at login."
     echo ""
     echo "  Logs:      tail -f $LOG_FILE"
-    echo "  Stop:      launchctl unload $PLIST"
-    echo "  Start:     launchctl load -w $PLIST"
+    echo "  Stop:      $0 stop"
+    echo "  Start:     $0 start"
     echo "  Uninstall: $0 uninstall"
+    ;;
+
+# ── stop ──────────────────────────────────────────────────────────────────
+stop)
+    if launchctl list "$LABEL" &>/dev/null; then
+        launchctl unload "$PLIST"
+        echo "Daemon stopped."
+    else
+        echo "Daemon is not running."
+    fi
+    ;;
+
+# ── start ─────────────────────────────────────────────────────────────────
+start)
+    if launchctl list "$LABEL" &>/dev/null; then
+        echo "Daemon is already running."
+    else
+        launchctl load -w "$PLIST"
+        echo "Daemon started."
+    fi
     ;;
 
 # ── uninstall ──────────────────────────────────────────────────────────────
@@ -91,7 +111,7 @@ uninstall)
     ;;
 
 *)
-    echo "Usage: $0 [install|uninstall]" >&2
+    echo "Usage: $0 [install|start|stop|uninstall]" >&2
     exit 1
     ;;
 
