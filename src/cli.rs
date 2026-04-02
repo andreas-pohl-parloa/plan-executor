@@ -49,6 +49,13 @@ pub fn run() {
         _ => {}
     }
 
+    // Resolve --config to an absolute path NOW, before daemonize() changes
+    // the working directory to `/`. Relative paths become invalid after fork.
+    let config_path: Option<std::path::PathBuf> = cli.config.as_ref().map(|p| {
+        std::fs::canonicalize(p)
+            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(p))
+    });
+
     // Daemonize before creating the Tokio runtime — forking after Tokio's
     // thread pool is initialized is undefined behavior.
     if let Commands::Daemon { foreground } = &cli.command {
@@ -60,7 +67,7 @@ pub fn run() {
     tracing_subscriber::fmt::init();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
 
-    let config = crate::config::Config::load(cli.config.as_deref())
+    let config = crate::config::Config::load(config_path.as_deref())
         .expect("failed to load config");
 
     let result: Result<()> = match cli.command {
