@@ -37,7 +37,7 @@ _remove_legacy_launchd() {
         launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || \
             launchctl unload "$plist" 2>/dev/null || true
     fi
-    [[ -f "$plist" ]] && rm -f "$plist" && echo "Removed legacy plist."
+    if [[ -f "$plist" ]]; then rm -f "$plist" && echo "Removed legacy plist."; fi
 }
 
 _add_shell_hook() {
