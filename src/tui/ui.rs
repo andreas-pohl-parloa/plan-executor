@@ -43,41 +43,41 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_list(frame: &mut Frame, app: &App, area: Rect) {
-    let normal = Style::default().fg(Color::Gray);
-    let dim    = Style::default().fg(Color::DarkGray);
+    let sel      = app.selected;
+    let normal   = Style::default().fg(Color::Gray);
+    let selected = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let dim      = Style::default().fg(Color::DarkGray); // always gray, never overridden
 
     let items: Vec<ListItem> = match app.current_tab {
         Tab::Running => {
-            let mut items: Vec<ListItem> = app.pending_plans.iter().map(|p| {
+            let n_pending = app.pending_plans.len();
+            let mut items: Vec<ListItem> = app.pending_plans.iter().enumerate().map(|(i, p)| {
+                let title_style = if i == sel { selected } else { normal };
                 let filename = std::path::Path::new(&p.plan_path)
                     .file_name().and_then(|n| n.to_str()).unwrap_or(&p.plan_path);
                 let countdown = p.auto_execute_remaining_secs
                     .map(|s| format!(" [auto in {}s]", s))
                     .unwrap_or_else(|| " [press e to execute]".to_string());
                 ListItem::new(Text::from(vec![
-                    Line::from(Span::styled(
-                        format!("* {}{}", filename, countdown),
-                        normal,
-                    )),
+                    Line::from(Span::styled(format!("* {}{}", filename, countdown), title_style)),
                     Line::from(Span::styled(format!("  {}", p.plan_path), dim)),
                 ]))
             }).collect();
 
-            items.extend(app.running_jobs.iter().map(|j| {
+            items.extend(app.running_jobs.iter().enumerate().map(|(i, j)| {
+                let title_style = if i + n_pending == sel { selected } else { normal };
                 let filename = j.plan_path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
                 let elapsed = (Utc::now() - j.started_at).num_seconds();
                 ListItem::new(Text::from(vec![
-                    Line::from(Span::styled(
-                        format!(">> {} ({}s)", filename, elapsed),
-                        normal,
-                    )),
+                    Line::from(Span::styled(format!(">> {} ({}s)", filename, elapsed), title_style)),
                     Line::from(Span::styled(format!("  {}", j.plan_path.display()), dim)),
                 ]))
             }));
             items
         }
         Tab::History => {
-            app.history.iter().map(|j| {
+            app.history.iter().enumerate().map(|(i, j)| {
+                let title_style = if i == sel { selected } else { normal };
                 let filename = j.plan_path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
                 let status_icon = match j.status {
                     JobStatus::Success => "[OK]",
@@ -90,7 +90,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                 ListItem::new(Text::from(vec![
                     Line::from(Span::styled(
                         format!("{} {}{}{}", status_icon, filename, secs, cost),
-                        normal,
+                        title_style,
                     )),
                     Line::from(Span::styled(format!("  {}", j.plan_path.display()), dim)),
                 ]))
@@ -103,7 +103,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
             Tab::Running => "Running / Pending",
             Tab::History => "History",
         }))
-        .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+        .highlight_style(Style::default()); // no-op: selection colour applied per-span above
 
     let mut state = ListState::default();
     state.select(Some(app.selected));
