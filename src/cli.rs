@@ -91,7 +91,10 @@ async fn execute_plan(plan_path: String, config: crate::config::Config) -> Resul
     use crate::jobs::{JobMetadata, JobStatus};
     let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
 
-    let plan = PathBuf::from(&plan_path);
+    // Canonicalize to absolute path before find_repo_root so relative paths
+    // like "mock/plan/test-plan.md" resolve correctly.
+    let plan = std::fs::canonicalize(&plan_path)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(&plan_path));
     if !plan.exists() {
         anyhow::bail!("Plan file not found: {}", plan_path);
     }
@@ -99,12 +102,11 @@ async fn execute_plan(plan_path: String, config: crate::config::Config) -> Resul
     let execution_root = find_repo_root(&plan)
         .unwrap_or_else(|| plan.parent().unwrap_or(plan.as_path()).to_path_buf());
 
-    let quoted = plan_path.replace('"', "\\\"");
+    let quoted = plan.to_string_lossy().replace('"', "\\\"");
     println!("╔══ plan-executor execute ═════════════════════════════════════");
-    println!("║  Plan:  {}", plan_path);
+    println!("║  Plan:  {}", plan.display());
     println!("║  Root:  {}", execution_root.display());
-    println!("║  Cmd:   claude --dangerously-skip-permissions --verbose \\");
-    println!("║           --output-format stream-json \\");
+    println!("║  Cmd:   {} \\", config.agents.main);
     println!("║           -p \"/my:execute-plan-non-interactive \\\"{}\\\"\"", quoted);
     println!("╚══════════════════════════════════════════════════════════════");
     println!();
