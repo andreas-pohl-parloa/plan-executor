@@ -55,11 +55,20 @@ pub fn render(frame: &mut Frame, app: &App) {
     frame.render_widget(help, chunks[2]);
 }
 
+fn status_col(label: &str, style: Style) -> Span<'static> {
+    // Fixed 8-char status column, e.g. "READY   " or "RUNNING " or "PAUSED  "
+    Span::styled(format!("{:<8}", label), style)
+}
+
 fn render_list(frame: &mut Frame, app: &App, area: Rect) {
     let sel      = app.selected;
     let normal   = Style::default().fg(Color::Gray);
     let selected = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
-    let dim      = Style::default().fg(Color::DarkGray); // always gray, never overridden
+    let dim      = Style::default().fg(Color::DarkGray);
+
+    let st_ready   = Style::default().fg(Color::Green);
+    let st_running = Style::default().fg(Color::Cyan);
+    let st_paused  = Style::default().fg(Color::Yellow);
 
     let items: Vec<ListItem> = match app.current_tab {
         Tab::Running => {
@@ -69,11 +78,14 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                 let filename = std::path::Path::new(&p.plan_path)
                     .file_name().and_then(|n| n.to_str()).unwrap_or(&p.plan_path);
                 let countdown = p.auto_execute_remaining_secs
-                    .map(|s| format!(" [auto in {}s]", s))
+                    .map(|s| format!(" [auto {}s]", s))
                     .unwrap_or_default();
                 ListItem::new(Text::from(vec![
-                    Line::from(Span::styled(format!("* {}{}", filename, countdown), title_style)),
-                    Line::from(Span::styled(format!("  {}", project_label(&p.plan_path)), dim)),
+                    Line::from(vec![
+                        status_col("READY", st_ready),
+                        Span::styled(format!("{}{}", filename, countdown), title_style),
+                    ]),
+                    Line::from(Span::styled(format!("        {}", project_label(&p.plan_path)), dim)),
                 ]))
             }).collect();
 
@@ -81,10 +93,17 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                 let title_style = if i + n_pending == sel { selected } else { normal };
                 let filename = j.plan_path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
                 let elapsed = (Utc::now() - j.started_at).num_seconds();
-                let pause_flag = if app.is_paused(&j.id) { " [paused]" } else { "" };
+                let (status_label, st_style) = if app.is_paused(&j.id) {
+                    ("PAUSED", st_paused)
+                } else {
+                    ("RUNNING", st_running)
+                };
                 ListItem::new(Text::from(vec![
-                    Line::from(Span::styled(format!(">> {} ({}s){}", filename, elapsed, pause_flag), title_style)),
-                    Line::from(Span::styled(format!("  {}", project_label(&j.plan_path.to_string_lossy())), dim)),
+                    Line::from(vec![
+                        status_col(status_label, st_style),
+                        Span::styled(format!("{} ({}s)", filename, elapsed), title_style),
+                    ]),
+                    Line::from(Span::styled(format!("        {}", project_label(&j.plan_path.to_string_lossy())), dim)),
                 ]))
             }));
             items
@@ -93,20 +112,20 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
             app.history.iter().enumerate().map(|(i, j)| {
                 let title_style = if i == sel { selected } else { normal };
                 let filename = j.plan_path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                let status_icon = match j.status {
-                    JobStatus::Success => "[OK]",
-                    JobStatus::Failed => "[FAIL]",
-                    JobStatus::Killed => "[KILL]",
-                    JobStatus::Running => "[...]",
+                let (status_label, st_style) = match j.status {
+                    JobStatus::Success => ("OK",     Style::default().fg(Color::Green)),
+                    JobStatus::Failed  => ("FAILED", Style::default().fg(Color::Red)),
+                    JobStatus::Killed  => ("KILLED", Style::default().fg(Color::Red)),
+                    JobStatus::Running => ("RUN",    Style::default().fg(Color::Cyan)),
                 };
-                let cost = j.cost_usd.map(|c| format!(" ${:.4}", c)).unwrap_or_default();
-                let secs = j.duration_ms.map(|ms| format!(" {}s", ms / 1000)).unwrap_or_default();
+                let cost = j.cost_usd.map(|c| format!("  ${:.4}", c)).unwrap_or_default();
+                let secs = j.duration_ms.map(|ms| format!("  {}s", ms / 1000)).unwrap_or_default();
                 ListItem::new(Text::from(vec![
-                    Line::from(Span::styled(
-                        format!("{} {}{}{}", status_icon, filename, secs, cost),
-                        title_style,
-                    )),
-                    Line::from(Span::styled(format!("  {}", project_label(&j.plan_path.to_string_lossy())), dim)),
+                    Line::from(vec![
+                        status_col(status_label, st_style),
+                        Span::styled(format!("{}{}{}", filename, secs, cost), title_style),
+                    ]),
+                    Line::from(Span::styled(format!("        {}", project_label(&j.plan_path.to_string_lossy())), dim)),
                 ]))
             }).collect()
         }
