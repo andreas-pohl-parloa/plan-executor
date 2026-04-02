@@ -121,7 +121,7 @@ async fn run_loop(
                     KeyCode::Up | KeyCode::Char('k') => {
                         app.selected = app.selected.saturating_sub(1);
                     }
-                    KeyCode::Char('e') => {
+                    KeyCode::Enter | KeyCode::Char('e') => {
                         if let Some(pending) = app.pending_plans.get(app.selected) {
                             let _ = app.daemon_tx.send(TuiRequest::Execute {
                                 plan_path: pending.plan_path.clone(),
