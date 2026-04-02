@@ -98,8 +98,9 @@ install)
     echo "Done. Daemon is running. It will auto-start in new shell sessions."
     echo ""
     echo "  Logs:      tail -f $LOG_FILE"
-    echo "  Stop:      plan-executor stop"
-    echo "  Start:     plan-executor daemon"
+    echo "  Stop:      $0 stop"
+    echo "  Start:     $0 start"
+    echo "  Restart:   $0 restart"
     echo "  Uninstall: $0 uninstall"
     ;;
 
@@ -114,6 +115,13 @@ start)
     echo "Daemon started."
     ;;
 
+# ── restart ───────────────────────────────────────────────────────────────
+restart)
+    "$BINARY" stop 2>/dev/null || true
+    "$BINARY" daemon
+    echo "Daemon restarted."
+    ;;
+
 # ── uninstall ──────────────────────────────────────────────────────────────
 uninstall)
     "$BINARY" stop 2>/dev/null || true
@@ -126,7 +134,7 @@ uninstall)
     ;;
 
 *)
-    echo "Usage: $0 [install|start|stop|uninstall]" >&2
+    echo "Usage: $0 [install|start|stop|restart|uninstall]" >&2
     exit 1
     ;;
 
