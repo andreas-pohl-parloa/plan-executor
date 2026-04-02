@@ -140,7 +140,8 @@ async fn run_loop(
                     }
                     KeyCode::Char('x') => {
                         if app.current_tab == app::Tab::Running {
-                            if let Some(job) = app.running_jobs.get(app.selected) {
+                            let job_idx = app.selected.saturating_sub(app.pending_plans.len());
+                            if let Some(job) = app.running_jobs.get(job_idx) {
                                 let _ = app.daemon_tx.send(TuiRequest::KillJob {
                                     job_id: job.id.clone(),
                                 }).await;
@@ -149,7 +150,8 @@ async fn run_loop(
                     }
                     KeyCode::Char('p') => {
                         if app.current_tab == app::Tab::Running {
-                            if let Some(job) = app.running_jobs.get(app.selected) {
+                            let job_idx = app.selected.saturating_sub(app.pending_plans.len());
+                            if let Some(job) = app.running_jobs.get(job_idx) {
                                 let _ = app.daemon_tx.send(TuiRequest::PauseJob {
                                     job_id: job.id.clone(),
                                 }).await;
@@ -158,7 +160,8 @@ async fn run_loop(
                     }
                     KeyCode::Char('u') => {
                         if app.current_tab == app::Tab::Running {
-                            if let Some(job) = app.running_jobs.get(app.selected) {
+                            let job_idx = app.selected.saturating_sub(app.pending_plans.len());
+                            if let Some(job) = app.running_jobs.get(job_idx) {
                                 let _ = app.daemon_tx.send(TuiRequest::ResumeJob {
                                     job_id: job.id.clone(),
                                 }).await;
@@ -168,10 +171,10 @@ async fn run_loop(
                     KeyCode::Char('r') => {
                         let _ = app.daemon_tx.send(TuiRequest::GetState).await;
                     }
-                    KeyCode::PageDown => {
+                    KeyCode::PageUp => {
                         app.output_scroll = app.output_scroll.saturating_add(10);
                     }
-                    KeyCode::PageUp => {
+                    KeyCode::PageDown => {
                         app.output_scroll = app.output_scroll.saturating_sub(10);
                     }
                     _ => { dirty = false; } // no-op key: don't force a redraw

@@ -184,17 +184,46 @@ fn project_label(path: &str) -> String {
     p.file_name().and_then(|n| n.to_str()).unwrap_or(path).to_string()
 }
 
-fn render_output(frame: &mut Frame, app: &App, area: Rect) {
-    let output_text = if let Some(job) = app.selected_job() {
-        // Use display output (formatted) for the TUI output pane
-        let lines = app.job_display_output.get(&job.id).map(|v| v.as_slice()).unwrap_or(&[]);
-        let start = lines.len().saturating_sub(area.height as usize + app.output_scroll);
-        lines[start..].join("\n")
+fn colorize_line(line: &str) -> Line<'static> {
+    let owned = line.to_string();
+    let style = if owned.starts_with("[Session]") {
+        Style::default().fg(Color::DarkGray)
+    } else if owned.starts_with("[Tool:") {
+        Style::default().fg(Color::Cyan)
+    } else if owned.starts_with("[OK]") {
+        Style::default().fg(Color::Green)
+    } else if owned.starts_with("[FAIL]") {
+        Style::default().fg(Color::Red)
+    } else if owned.starts_with("[Claude]") {
+        Style::default().fg(Color::White)
+    } else if owned.contains(" running]") || owned.starts_with('[') && owned.contains("running") {
+        Style::default().fg(Color::Yellow)
+    } else if owned.starts_with("  ->") {
+        Style::default().fg(Color::DarkGray)
+    } else if owned.starts_with("[plan-executor]") {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM)
     } else {
-        "Select a job to view output".to_string()
+        Style::default().fg(Color::Gray)
+    };
+    Line::from(Span::styled(owned, style))
+}
+
+fn render_output(frame: &mut Frame, app: &App, area: Rect) {
+    // Subtract 2 for top/bottom borders so the tail is truly visible.
+    let visible = area.height.saturating_sub(2) as usize;
+
+    let content = if let Some(job) = app.selected_job() {
+        let lines = app.job_display_output.get(&job.id).map(|v| v.as_slice()).unwrap_or(&[]);
+        let start = lines.len().saturating_sub(visible + app.output_scroll);
+        Text::from(lines[start..].iter().map(|l| colorize_line(l)).collect::<Vec<_>>())
+    } else {
+        Text::from(Line::from(Span::styled(
+            "Select a job to view output",
+            Style::default().fg(Color::DarkGray),
+        )))
     };
 
-    let paragraph = Paragraph::new(output_text)
+    let paragraph = Paragraph::new(content)
         .block(Block::default().borders(Borders::ALL).title("Output"))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
