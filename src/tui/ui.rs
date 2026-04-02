@@ -61,7 +61,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                     .unwrap_or_else(|| " [press e to execute]".to_string());
                 ListItem::new(Text::from(vec![
                     Line::from(Span::styled(format!("* {}{}", filename, countdown), title_style)),
-                    Line::from(Span::styled(format!("  {}", repo_relative(&p.plan_path)), dim)),
+                    Line::from(Span::styled(format!("  {}", project_label(&p.plan_path)), dim)),
                 ]))
             }).collect();
 
@@ -71,7 +71,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                 let elapsed = (Utc::now() - j.started_at).num_seconds();
                 ListItem::new(Text::from(vec![
                     Line::from(Span::styled(format!(">> {} ({}s)", filename, elapsed), title_style)),
-                    Line::from(Span::styled(format!("  {}", repo_relative(&j.plan_path.to_string_lossy())), dim)),
+                    Line::from(Span::styled(format!("  {}", project_label(&j.plan_path.to_string_lossy())), dim)),
                 ]))
             }));
             items
@@ -93,7 +93,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                         format!("{} {}{}{}", status_icon, filename, secs, cost),
                         title_style,
                     )),
-                    Line::from(Span::styled(format!("  {}", repo_relative(&j.plan_path.to_string_lossy())), dim)),
+                    Line::from(Span::styled(format!("  {}", project_label(&j.plan_path.to_string_lossy())), dim)),
                 ]))
             }).collect()
         }
@@ -111,23 +111,45 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// Shortens an absolute plan path to `<repo-name>/<path-within-repo>`.
-/// Walks up from the file to find the nearest `.git` directory; falls back
-/// to the original string when no git root is found.
-fn repo_relative(path: &str) -> String {
+/// Returns `<repo-name>` for a plan path, or `<repo-name> [wt]` when the
+/// plan lives inside a git worktree. Falls back to the file name when no
+/// git root is found.
+fn project_label(path: &str) -> String {
     let p = Path::new(path);
     let mut dir = if p.is_file() { p.parent() } else { Some(p) };
     while let Some(d) = dir {
-        if d.join(".git").exists() {
-            let repo_name = d.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-            let relative   = p.strip_prefix(d)
-                .map(|r| r.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| path.to_string());
-            return format!("{}/{}", repo_name, relative);
+        let git = d.join(".git");
+        if git.is_dir() {
+            // Regular repo
+            return d.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
+        }
+        if git.is_file() {
+            // Worktree: .git is a file with `gitdir: /main/repo/.git/worktrees/…`
+            let main_name = std::fs::read_to_string(&git)
+                .ok()
+                .and_then(|s| {
+                    let gitdir = s.trim().strip_prefix("gitdir:")?.trim().to_string();
+                    // Walk the gitdir path backwards to find the component before ".git"
+                    let gp = Path::new(&gitdir).to_path_buf();
+                    let mut cur: &Path = &gp;
+                    loop {
+                        if cur.file_name().map(|n| n == ".git").unwrap_or(false) {
+                            return cur.parent()
+                                .and_then(|r| r.file_name())
+                                .and_then(|n| n.to_str())
+                                .map(String::from);
+                        }
+                        cur = cur.parent()?;
+                    }
+                })
+                .unwrap_or_else(|| {
+                    d.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string()
+                });
+            return format!("{} [wt]", main_name);
         }
         dir = d.parent();
     }
-    path.to_string()
+    p.file_name().and_then(|n| n.to_str()).unwrap_or(path).to_string()
 }
 
 fn render_output(frame: &mut Frame, app: &App, area: Rect) {
