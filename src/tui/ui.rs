@@ -43,7 +43,8 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_list(frame: &mut Frame, app: &App, area: Rect) {
-    let gray = Style::default().fg(Color::DarkGray);
+    let normal = Style::default().fg(Color::Gray);
+    let dim    = Style::default().fg(Color::DarkGray);
 
     let items: Vec<ListItem> = match app.current_tab {
         Tab::Running => {
@@ -56,12 +57,9 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                 ListItem::new(Text::from(vec![
                     Line::from(Span::styled(
                         format!("* {}{}", filename, countdown),
-                        Style::default().fg(Color::Yellow),
+                        normal,
                     )),
-                    Line::from(Span::styled(
-                        format!("  {}", p.plan_path),
-                        gray,
-                    )),
+                    Line::from(Span::styled(format!("  {}", p.plan_path), dim)),
                 ]))
             }).collect();
 
@@ -71,12 +69,9 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                 ListItem::new(Text::from(vec![
                     Line::from(Span::styled(
                         format!(">> {} ({}s)", filename, elapsed),
-                        Style::default().fg(Color::Cyan),
+                        normal,
                     )),
-                    Line::from(Span::styled(
-                        format!("  {}", j.plan_path.display()),
-                        gray,
-                    )),
+                    Line::from(Span::styled(format!("  {}", j.plan_path.display()), dim)),
                 ]))
             }));
             items
@@ -93,11 +88,11 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                 let cost = j.cost_usd.map(|c| format!(" ${:.4}", c)).unwrap_or_default();
                 let secs = j.duration_ms.map(|ms| format!(" {}s", ms / 1000)).unwrap_or_default();
                 ListItem::new(Text::from(vec![
-                    Line::from(format!("{} {}{}{}", status_icon, filename, secs, cost)),
                     Line::from(Span::styled(
-                        format!("  {}", j.plan_path.display()),
-                        gray,
+                        format!("{} {}{}{}", status_icon, filename, secs, cost),
+                        normal,
                     )),
+                    Line::from(Span::styled(format!("  {}", j.plan_path.display()), dim)),
                 ]))
             }).collect()
         }
@@ -108,7 +103,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
             Tab::Running => "Running / Pending",
             Tab::History => "History",
         }))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        .highlight_style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
 
     let mut state = ListState::default();
     state.select(Some(app.selected));
