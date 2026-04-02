@@ -3,9 +3,9 @@
   "plan_patterns": ["plan/*.md"],
   "auto_execute": false,
   "agents": {
-    "main": "./mock/main-agent-handoff.sh",
-    "claude": "./mock/sub-agent.sh",
-    "codex": "./mock/sub-agent.sh",
-    "gemini": "./mock/sub-agent.sh"
+    "main": "./main-agent-handoff.sh",
+    "claude": "./sub-agent.sh",
+    "codex": "./sub-agent.sh",
+    "gemini": "./sub-agent.sh"
   }
 }

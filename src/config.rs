@@ -101,7 +101,27 @@ impl Config {
             return Ok(cfg);
         }
         let content = std::fs::read_to_string(&p)?;
-        let config: Self = serde_json::from_str(&content)?;
+        let mut config: Self = serde_json::from_str(&content)?;
+
+        // Resolve relative agent command paths against the config file's directory
+        // so that `./main-agent.sh` works correctly after daemonize changes CWD to `/`.
+        if let Some(dir) = p.parent() {
+            let resolve = |cmd: &str| -> String {
+                let prog = cmd.split_whitespace().next().unwrap_or("");
+                if prog.starts_with("./") || prog.starts_with("../") {
+                    let abs = dir.join(prog);
+                    let rest = cmd[prog.len()..].to_string();
+                    format!("{}{}", abs.display(), rest)
+                } else {
+                    cmd.to_string()
+                }
+            };
+            config.agents.main   = resolve(&config.agents.main);
+            config.agents.claude = resolve(&config.agents.claude);
+            config.agents.codex  = resolve(&config.agents.codex);
+            config.agents.gemini = resolve(&config.agents.gemini);
+        }
+
         Ok(config)
     }
 
