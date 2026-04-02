@@ -352,6 +352,10 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                             }
                         }
 
+                        // Remove state file so resume_execution doesn't re-detect it
+                        // and loop forever with another HandoffRequired.
+                        let _ = std::fs::remove_file(&state_file);
+
                         let continuation = handoff::build_continuation(&results);
                         match handoff::resume_execution(
                             &session_id,

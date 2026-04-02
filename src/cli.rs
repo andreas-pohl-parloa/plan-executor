@@ -203,6 +203,10 @@ async fn execute_plan(plan_path: String, config: crate::config::Config) -> Resul
                         }
                     }
 
+                    // Remove state file before resuming so the resume turn
+                    // doesn't re-detect it and loop with another HandoffRequired.
+                    let _ = std::fs::remove_file(&state_file);
+
                     let continuation = handoff::build_continuation(&results);
                     println!();
                     println!("┌── resume ─────────────────────────────────────────────────────");
