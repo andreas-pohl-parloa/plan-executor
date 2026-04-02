@@ -41,9 +41,30 @@ pub fn parse_plan_status(path: &Path) -> Result<PlanStatus> {
     Ok(PlanStatus::Unknown("missing".to_string()))
 }
 
-/// Scans a directory for files matching a glob pattern.
-/// Returns all matching paths.
+// Directories that are never worth descending into when scanning for plans.
+const SKIP_DIRS: &[&str] = &[
+    "target", "node_modules", ".git", ".hg", ".svn",
+    "dist", "build", ".next", ".nuxt", "__pycache__",
+    ".tox", ".venv", "venv", ".cache",
+];
+
+/// Scans a directory for plan files matching a pattern.
+///
+/// When `pattern` starts with `**/` the function walks the directory tree
+/// using `walkdir`, skipping known heavy directories (`target/`, `node_modules/`,
+/// etc.) and collecting every `.my/plans/*.md`-like match efficiently.
+///
+/// For patterns without `**/` the existing `glob` behaviour is used (fast,
+/// non-recursive).
 pub fn scan_for_plans(base_dir: &Path, pattern: &str) -> Vec<PathBuf> {
+    if pattern.starts_with("**/") {
+        scan_recursive(base_dir, &pattern[3..])
+    } else {
+        scan_glob(base_dir, pattern)
+    }
+}
+
+fn scan_glob(base_dir: &Path, pattern: &str) -> Vec<PathBuf> {
     let full_pattern = base_dir.join(pattern);
     let pattern_str = full_pattern.to_string_lossy();
     match glob::glob(&pattern_str) {
@@ -53,6 +74,53 @@ pub fn scan_for_plans(base_dir: &Path, pattern: &str) -> Vec<PathBuf> {
             .collect(),
         Err(_) => vec![],
     }
+}
+
+/// Recursive scan using walkdir. Walks `base_dir`, skips SKIP_DIRS, and for
+/// every directory whose path ends with the prefix portion of `sub_pattern`
+/// (e.g. `.my/plans`) collects matching `*.md` files via glob.
+fn scan_recursive(base_dir: &Path, sub_pattern: &str) -> Vec<PathBuf> {
+    // Split sub_pattern into a directory prefix and a file glob.
+    // e.g. ".my/plans/*.md" → prefix=".my/plans", file_glob="*.md"
+    let (dir_prefix, file_glob) = match sub_pattern.rfind('/') {
+        Some(i) => (&sub_pattern[..i], &sub_pattern[i + 1..]),
+        None    => ("", sub_pattern),
+    };
+
+    let mut results = Vec::new();
+
+    for entry in walkdir::WalkDir::new(base_dir)
+        .follow_links(false)
+        .max_depth(5)   // plans live at depth ≤4 from watch_dir; 5 gives margin
+        .into_iter()
+        .filter_entry(|e| {
+            if !e.file_type().is_dir() {
+                return true;
+            }
+            let name = e.file_name().to_string_lossy();
+            !SKIP_DIRS.contains(&name.as_ref())
+        })
+        .flatten()
+    {
+        if !entry.file_type().is_dir() {
+            continue;
+        }
+        // Check if this directory ends with the expected prefix path
+        let path = entry.path();
+        let ends_with_prefix = if dir_prefix.is_empty() {
+            true
+        } else {
+            path.ends_with(dir_prefix)
+        };
+        if !ends_with_prefix {
+            continue;
+        }
+        // Collect matching files in this directory
+        for file in scan_glob(path, file_glob) {
+            results.push(file);
+        }
+    }
+    results
 }
 
 /// Scans all watch_dirs with all patterns and returns READY plan files.

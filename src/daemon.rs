@@ -97,22 +97,37 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
     }));
     tracing::info!("job history loaded");
 
-    // Scan on startup
-    tracing::info!("scanning for ready plans");
+    // Startup scan runs in the background so the daemon (socket + watcher)
+    // is available immediately. Plans are added to pending_plans when found.
     {
-        let ready = find_ready_plans(&watch_dirs, &config.plan_patterns);
-        tracing::info!("found {} ready plan(s)", ready.len());
-        let mut st = state.lock().await;
-        for plan in ready {
-            let path_str = plan.path.to_string_lossy().to_string();
-            tracing::info!("notifying: {}", path_str);
-            let _ = notify_plan_ready(&path_str, config.auto_execute);
-            st.pending_plans.insert(path_str.clone(), PendingInfo {
-                plan_path: path_str,
-                detected_at: Instant::now(),
-                auto_execute: config.auto_execute,
+        let state_clone = Arc::clone(&state);
+        let patterns = config.plan_patterns.clone();
+        let auto_execute = config.auto_execute;
+        let dirs = watch_dirs.clone();
+        tokio::task::spawn_blocking(move || {
+            tracing::info!("background scan: scanning for ready plans");
+            let ready = find_ready_plans(&dirs, &patterns);
+            tracing::info!("background scan: found {} ready plan(s)", ready.len());
+            // Use block_on to acquire the async mutex from the blocking thread
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                let mut st = state_clone.lock().await;
+                for plan in ready {
+                    let path_str = plan.path.to_string_lossy().to_string();
+                    if st.pending_plans.contains_key(&path_str) { continue; }
+                    if st.running_jobs.values().any(|j| j.plan_path == plan.path) { continue; }
+                    tracing::info!("background scan: queueing {}", path_str);
+                    let _ = notify_plan_ready(&path_str, auto_execute);
+                    st.pending_plans.insert(path_str.clone(), PendingInfo {
+                        plan_path: path_str,
+                        detected_at: Instant::now(),
+                        auto_execute,
+                    });
+                }
+                let event = st.snapshot_state();
+                let _ = st.event_tx.send(event);
             });
-        }
+        });
     }
 
     // Start watcher

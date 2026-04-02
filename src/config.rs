@@ -67,7 +67,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             watch_dirs: vec!["~/tools".to_string()],
-            plan_patterns: vec![".my/plans/*.md".to_string()],
+            plan_patterns: vec!["**/.my/plans/*.md".to_string()],
             auto_execute: false,
             agents: AgentConfig::default(),
         }
