@@ -14,8 +14,9 @@ use crate::jobs::JobStatus;
 const HELP: &str =
     " enter/e: execute  c: cancel  p: pause  u: unpause  x: kill  r: reload  tab: switch  q: quit";
 
-/// Renders the full TUI frame.
-pub fn render(frame: &mut Frame, app: &App) {
+/// Renders the full TUI frame. Takes `&mut App` so it can lazily load
+/// job output from disk when a history job is selected.
+pub fn render(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -47,6 +48,10 @@ pub fn render(frame: &mut Frame, app: &App) {
         .split(chunks[1]);
 
     render_list(frame, app, content_chunks[0]);
+    // Lazily load output from disk for the selected job before rendering.
+    if let Some(id) = app.selected_job().map(|j| j.id.clone()) {
+        app.ensure_output_loaded(&id);
+    }
     render_output(frame, app, content_chunks[1]);
 
     // Help bar
@@ -101,7 +106,8 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                 ListItem::new(Text::from(vec![
                     Line::from(vec![
                         status_col(status_label, st_style),
-                        Span::styled(format!("{} ({}s)", filename, elapsed), title_style),
+                        Span::styled(filename.to_string(), title_style),
+                        Span::styled(format!("  {}s", elapsed), dim),
                     ]),
                     Line::from(Span::styled(format!("        {}", project_label(&j.plan_path.to_string_lossy())), dim)),
                 ]))

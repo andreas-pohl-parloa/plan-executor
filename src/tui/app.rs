@@ -101,4 +101,25 @@ impl App {
             Tab::History => self.history.get(self.selected),
         }
     }
+
+    /// Ensures the output for a job is loaded into `job_display_output`.
+    /// For history jobs the live events are gone — load from the stored
+    /// `output.jsonl` file and format each line through sjv.
+    pub fn ensure_output_loaded(&mut self, job_id: &str) {
+        if self.job_display_output.contains_key(job_id) {
+            return;
+        }
+        let path = crate::config::Config::base_dir()
+            .join("jobs").join(job_id).join("output.jsonl");
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let lines: Vec<String> = content
+                .lines()
+                .filter_map(|raw| {
+                    let rendered = sjv::render_runtime_line(raw, false, false);
+                    if rendered.is_empty() { None } else { Some(rendered) }
+                })
+                .collect();
+            self.job_display_output.insert(job_id.to_string(), lines);
+        }
+    }
 }
