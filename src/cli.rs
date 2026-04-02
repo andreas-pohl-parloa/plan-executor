@@ -376,10 +376,20 @@ fn daemonize() {
     let log_path = base_dir.join("daemon.log");
     let pid_path = base_dir.join("daemon.pid");
 
-    // Kill any existing daemon that holds the PID file lock so we can take over.
-    if let Ok(s) = std::fs::read_to_string(&pid_path) {
-        if let Ok(pid) = s.trim().parse::<u32>() {
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+    // Kill ALL running plan-executor daemon processes, not just the one in
+    // the PID file (there may be leftover instances from previous runs).
+    let our_pid = std::process::id().to_string();
+    if let Ok(out) = std::process::Command::new("pgrep")
+        .args(["-f", "plan-executor.*daemon"])
+        .output()
+    {
+        let killed = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|p| p.trim() != our_pid)
+            .filter_map(|p| p.trim().parse::<libc::pid_t>().ok())
+            .inspect(|&pid| { unsafe { libc::kill(pid, libc::SIGTERM); } })
+            .count();
+        if killed > 0 {
             std::thread::sleep(std::time::Duration::from_millis(300));
         }
     }
