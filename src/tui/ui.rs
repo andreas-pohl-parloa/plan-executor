@@ -11,11 +11,18 @@ use ratatui::{
 use crate::tui::app::{App, Tab};
 use crate::jobs::JobStatus;
 
+const HELP: &str =
+    " e execute  c cancel  p pause  u unpause  x kill  r reload  tab switch  q quit";
+
 /// Renders the full TUI frame.
 pub fn render(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(3), // tab bar
+            Constraint::Min(0),    // content
+            Constraint::Length(1), // help bar
+        ])
         .split(frame.area());
 
     // Tab bar
@@ -41,6 +48,11 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     render_list(frame, app, content_chunks[0]);
     render_output(frame, app, content_chunks[1]);
+
+    // Help bar
+    let help = Paragraph::new(HELP)
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(help, chunks[2]);
 }
 
 fn render_list(frame: &mut Frame, app: &App, area: Rect) {
@@ -58,7 +70,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                     .file_name().and_then(|n| n.to_str()).unwrap_or(&p.plan_path);
                 let countdown = p.auto_execute_remaining_secs
                     .map(|s| format!(" [auto in {}s]", s))
-                    .unwrap_or_else(|| " [press e to execute]".to_string());
+                    .unwrap_or_default();
                 ListItem::new(Text::from(vec![
                     Line::from(Span::styled(format!("* {}{}", filename, countdown), title_style)),
                     Line::from(Span::styled(format!("  {}", project_label(&p.plan_path)), dim)),
