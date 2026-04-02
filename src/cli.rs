@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use libc;
 
 #[derive(Parser)]
 #[command(name = "plan-executor", about = "Monitor and execute Claude plan files")]
@@ -374,6 +375,14 @@ fn daemonize() {
 
     let log_path = base_dir.join("daemon.log");
     let pid_path = base_dir.join("daemon.pid");
+
+    // Kill any existing daemon that holds the PID file lock so we can take over.
+    if let Ok(s) = std::fs::read_to_string(&pid_path) {
+        if let Ok(pid) = s.trim().parse::<u32>() {
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    }
 
     eprintln!(
         "Starting daemon. PID file: {}  Logs: {}",
