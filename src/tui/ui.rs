@@ -123,6 +123,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
             items
         }
         Tab::History => {
+            let inner_w = area.width.saturating_sub(2 + 8) as usize;
             app.history.iter().enumerate().map(|(i, j)| {
                 let title_style = if i == sel { selected } else { normal };
                 let filename = j.plan_path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
@@ -132,14 +133,32 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                     JobStatus::Killed  => ("KILLED", Style::default().fg(Color::Red)),
                     JobStatus::Running => ("RUN",    Style::default().fg(Color::Cyan)),
                 };
-                let cost = j.cost_usd.map(|c| format!("  ${:.4}", c)).unwrap_or_default();
-                let secs = j.duration_ms.map(|ms| format!("  {}", format_elapsed((ms / 1000) as i64))).unwrap_or_default();
+                // Line 1: filename right-aligned with duration
+                let time_str = j.duration_ms
+                    .map(|ms| format_elapsed((ms / 1000) as i64))
+                    .unwrap_or_default();
+                let pad1 = inner_w.saturating_sub(filename.len() + time_str.len() + 1);
+                let spacer1 = " ".repeat(pad1.max(1));
+
+                // Line 2: project label right-aligned with cost
+                let proj = project_label(&j.plan_path.to_string_lossy());
+                let cost_str = j.cost_usd.map(|c| format!("${:.4}", c)).unwrap_or_default();
+                let indent = 8usize; // matches "        " prefix
+                let pad2 = inner_w.saturating_sub(indent + proj.len() + cost_str.len() + 1);
+                let spacer2 = " ".repeat(pad2.max(1));
+
                 ListItem::new(Text::from(vec![
                     Line::from(vec![
                         status_col(status_label, st_style),
-                        Span::styled(format!("{}{}{}", filename, secs, cost), title_style),
+                        Span::styled(filename.to_string(), title_style),
+                        Span::styled(spacer1, normal),
+                        Span::styled(time_str, dim),
                     ]),
-                    Line::from(Span::styled(format!("        {}", project_label(&j.plan_path.to_string_lossy())), dim)),
+                    Line::from(vec![
+                        Span::styled(format!("        {}", proj), dim),
+                        Span::styled(spacer2, normal),
+                        Span::styled(cost_str, dim),
+                    ]),
                 ]))
             }).collect()
         }
