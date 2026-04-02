@@ -12,7 +12,7 @@ use crate::tui::app::{App, Tab};
 use crate::jobs::JobStatus;
 
 const HELP: &str =
-    " e:execute  c:cancel  p:pause  u:unpause  x:kill  r:reload  tab:switch  q:quit";
+    " e: execute  c: cancel  p: pause  u: unpause  x: kill  r: reload  tab: switch  q: quit";
 
 /// Renders the full TUI frame.
 pub fn render(frame: &mut Frame, app: &App) {
