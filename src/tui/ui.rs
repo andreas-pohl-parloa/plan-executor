@@ -1,5 +1,6 @@
 //! TUI rendering logic.
 use chrono::Utc;
+use std::path::Path;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -60,7 +61,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                     .unwrap_or_else(|| " [press e to execute]".to_string());
                 ListItem::new(Text::from(vec![
                     Line::from(Span::styled(format!("* {}{}", filename, countdown), title_style)),
-                    Line::from(Span::styled(format!("  {}", p.plan_path), dim)),
+                    Line::from(Span::styled(format!("  {}", repo_relative(&p.plan_path)), dim)),
                 ]))
             }).collect();
 
@@ -70,7 +71,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                 let elapsed = (Utc::now() - j.started_at).num_seconds();
                 ListItem::new(Text::from(vec![
                     Line::from(Span::styled(format!(">> {} ({}s)", filename, elapsed), title_style)),
-                    Line::from(Span::styled(format!("  {}", j.plan_path.display()), dim)),
+                    Line::from(Span::styled(format!("  {}", repo_relative(&j.plan_path.to_string_lossy())), dim)),
                 ]))
             }));
             items
@@ -92,7 +93,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                         format!("{} {}{}{}", status_icon, filename, secs, cost),
                         title_style,
                     )),
-                    Line::from(Span::styled(format!("  {}", j.plan_path.display()), dim)),
+                    Line::from(Span::styled(format!("  {}", repo_relative(&j.plan_path.to_string_lossy())), dim)),
                 ]))
             }).collect()
         }
@@ -108,6 +109,25 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
     let mut state = ListState::default();
     state.select(Some(app.selected));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Shortens an absolute plan path to `<repo-name>/<path-within-repo>`.
+/// Walks up from the file to find the nearest `.git` directory; falls back
+/// to the original string when no git root is found.
+fn repo_relative(path: &str) -> String {
+    let p = Path::new(path);
+    let mut dir = if p.is_file() { p.parent() } else { Some(p) };
+    while let Some(d) = dir {
+        if d.join(".git").exists() {
+            let repo_name = d.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            let relative   = p.strip_prefix(d)
+                .map(|r| r.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| path.to_string());
+            return format!("{}/{}", repo_name, relative);
+        }
+        dir = d.parent();
+    }
+    path.to_string()
 }
 
 fn render_output(frame: &mut Frame, app: &App, area: Rect) {
