@@ -84,6 +84,8 @@ install)
     # Stop the running daemon (if any) via the binary itself.
     "$BINARY" stop 2>/dev/null || true
 
+    echo "Updating git submodules..."
+    git -C "$SCRIPT_DIR" submodule update --init --remote stream-json-view
     echo "Building and installing plan-executor..."
     cargo install --path "$SCRIPT_DIR"
     echo "Installed: $BINARY"
@@ -121,6 +123,8 @@ start)
 # ── restart ───────────────────────────────────────────────────────────────
 restart)
     "$BINARY" stop 2>/dev/null || true
+    echo "Updating git submodules..."
+    git -C "$SCRIPT_DIR" submodule update --init --remote stream-json-view
     echo "Building and installing plan-executor..."
     cargo install --path "$SCRIPT_DIR"
     echo "Installed: $BINARY"
