@@ -122,9 +122,10 @@ pub fn spawn_execution(
                 }
             }
 
-            // Emit one DisplayLine per visual line so colorize_line sees the
-            // correct prefix for each line (sjv may return multi-line strings).
-            let rendered = sjv::render_runtime_line(&line, false, false);
+            // Emit one DisplayLine per visual line (sjv may return multi-line
+            // strings). Use color=true so ANSI codes are embedded; the TUI
+            // parses them via ansi-to-tui.
+            let rendered = sjv::render_runtime_line(&line, false, true);
             for display_line in rendered.lines().filter(|l| !l.is_empty()) {
                 let _ = tx.send(ExecEvent::DisplayLine(display_line.to_string())).await;
             }

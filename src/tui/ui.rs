@@ -190,28 +190,43 @@ fn project_label(path: &str) -> String {
     p.file_name().and_then(|n| n.to_str()).unwrap_or(path).to_string()
 }
 
-fn colorize_line(line: &str) -> Line<'static> {
-    let owned = line.to_string();
-    let style = if owned.starts_with("[Session]") {
-        Style::default().fg(Color::DarkGray)
-    } else if owned.starts_with("[Tool:") {
-        Style::default().fg(Color::Cyan)
-    } else if owned.starts_with("[OK]") {
-        Style::default().fg(Color::Green)
-    } else if owned.starts_with("[FAIL]") {
-        Style::default().fg(Color::Red)
-    } else if owned.starts_with("[Claude]") {
-        Style::default().fg(Color::White)
-    } else if owned.contains(" running]") || owned.starts_with('[') && owned.contains("running") {
-        Style::default().fg(Color::Yellow)
-    } else if owned.starts_with("  ->") {
-        Style::default().fg(Color::DarkGray)
-    } else if owned.starts_with("[plan-executor]") {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
-    Line::from(Span::styled(owned, style))
+/// Convert a string containing sjv ANSI codes into a ratatui `Line`.
+/// sjv uses only: ESC[0m reset, ESC[1m bold, ESC[2m dim, ESC[3m italic,
+/// ESC[31m red, ESC[32m green, ESC[34m blue, ESC[36m cyan.
+fn ansi_line(s: &str) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut style = Style::default().fg(Color::Gray);
+    let mut seg_start = 0;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            if i > seg_start {
+                spans.push(Span::styled(s[seg_start..i].to_string(), style));
+            }
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j] != b'm' { j += 1; }
+            style = match s.get(i + 2..j).unwrap_or("") {
+                "0"  => Style::default().fg(Color::Gray),
+                "1"  => style.add_modifier(Modifier::BOLD),
+                "2"  => style.add_modifier(Modifier::DIM),
+                "3"  => style.add_modifier(Modifier::ITALIC),
+                "31" => Style::default().fg(Color::Red),
+                "32" => Style::default().fg(Color::Green),
+                "34" => Style::default().fg(Color::Blue),
+                "36" => Style::default().fg(Color::Cyan),
+                _    => style,
+            };
+            i = j + 1;
+            seg_start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if seg_start < s.len() {
+        spans.push(Span::styled(s[seg_start..].to_string(), style));
+    }
+    Line::from(spans)
 }
 
 fn render_output(frame: &mut Frame, app: &App, area: Rect) {
@@ -221,7 +236,7 @@ fn render_output(frame: &mut Frame, app: &App, area: Rect) {
     let content = if let Some(job) = app.selected_job() {
         let lines = app.job_display_output.get(&job.id).map(|v| v.as_slice()).unwrap_or(&[]);
         let start = lines.len().saturating_sub(visible + app.output_scroll);
-        Text::from(lines[start..].iter().map(|l| colorize_line(l)).collect::<Vec<_>>())
+        Text::from(lines[start..].iter().map(|l| ansi_line(l)).collect::<Vec<_>>())
     } else {
         Text::from(Line::from(Span::styled(
             "Select a job to view output",

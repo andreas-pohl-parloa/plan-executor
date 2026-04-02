@@ -117,7 +117,7 @@ impl App {
                 .flat_map(|raw| {
                     // sjv may return multi-line strings; split so each entry
                     // is one visual line and colorize_line sees the right prefix.
-                    let rendered = sjv::render_runtime_line(raw, false, false);
+                    let rendered = sjv::render_runtime_line(raw, false, true);
                     rendered.lines()
                         .filter(|l| !l.is_empty())
                         .map(String::from)
