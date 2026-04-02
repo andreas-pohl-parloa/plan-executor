@@ -1,6 +1,6 @@
 {
-  "watch_dirs": ["~/workspace/code"],
-  "plan_patterns": [".my/plans/*.md"],
+  "watch_dirs": ["~/workspace/code/plan-executor/mock"],
+  "plan_patterns": ["plan/*.md"],
   "auto_execute": false,
   "agents": {
     "main": "./mock/main-agent-handoff.sh",
