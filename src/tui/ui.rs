@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 use crate::tui::app::{App, Tab};
 use crate::jobs::JobStatus;
@@ -110,7 +110,9 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
         }))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
-    frame.render_widget(list, area);
+    let mut state = ListState::default();
+    state.select(Some(app.selected));
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn render_output(frame: &mut Frame, app: &App, area: Rect) {
