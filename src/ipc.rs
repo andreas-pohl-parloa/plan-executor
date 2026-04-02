@@ -19,6 +19,10 @@ pub enum TuiRequest {
     CancelPending { plan_path: String },
     /// Kill a running job
     KillJob { job_id: String },
+    /// Pause a running job — handoff sub-agents are held until ResumeJob
+    PauseJob { job_id: String },
+    /// Resume a previously paused job
+    ResumeJob { job_id: String },
     /// Request full state snapshot
     GetState,
 }
@@ -32,6 +36,9 @@ pub enum DaemonEvent {
         running_jobs: Vec<JobMetadata>,
         pending_plans: Vec<PendingPlan>,
         history: Vec<JobMetadata>,
+        /// IDs of jobs currently paused at a handoff
+        #[serde(default)]
+        paused_job_ids: Vec<String>,
     },
     /// A job's output line arrived
     JobOutput { job_id: String, line: String },

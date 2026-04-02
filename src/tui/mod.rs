@@ -140,6 +140,24 @@ async fn run_loop(
                             }
                         }
                     }
+                    KeyCode::Char('p') => {
+                        if app.current_tab == app::Tab::Running {
+                            if let Some(job) = app.running_jobs.get(app.selected) {
+                                let _ = app.daemon_tx.send(TuiRequest::PauseJob {
+                                    job_id: job.id.clone(),
+                                }).await;
+                            }
+                        }
+                    }
+                    KeyCode::Char('u') => {
+                        if app.current_tab == app::Tab::Running {
+                            if let Some(job) = app.running_jobs.get(app.selected) {
+                                let _ = app.daemon_tx.send(TuiRequest::ResumeJob {
+                                    job_id: job.id.clone(),
+                                }).await;
+                            }
+                        }
+                    }
                     KeyCode::Char('r') => {
                         let _ = app.daemon_tx.send(TuiRequest::GetState).await;
                     }

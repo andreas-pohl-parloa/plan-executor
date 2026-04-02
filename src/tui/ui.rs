@@ -69,8 +69,9 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                 let title_style = if i + n_pending == sel { selected } else { normal };
                 let filename = j.plan_path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
                 let elapsed = (Utc::now() - j.started_at).num_seconds();
+                let pause_flag = if app.is_paused(&j.id) { " [paused]" } else { "" };
                 ListItem::new(Text::from(vec![
-                    Line::from(Span::styled(format!(">> {} ({}s)", filename, elapsed), title_style)),
+                    Line::from(Span::styled(format!(">> {} ({}s){}", filename, elapsed, pause_flag), title_style)),
                     Line::from(Span::styled(format!("  {}", project_label(&j.plan_path.to_string_lossy())), dim)),
                 ]))
             }));

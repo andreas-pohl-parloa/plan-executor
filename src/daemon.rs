@@ -29,6 +29,8 @@ pub struct DaemonState {
     pub job_display_output: HashMap<String, VecDeque<String>>,
     /// Child process handles for running jobs (job_id -> child)
     pub running_children: HashMap<String, tokio::process::Child>,
+    /// Jobs currently paused at a handoff — sub-agents held until ResumeJob
+    pub paused_jobs: std::collections::HashSet<String>,
     /// broadcast channel for DaemonEvent to all TUI clients
     pub event_tx: broadcast::Sender<DaemonEvent>,
 }
@@ -53,6 +55,7 @@ impl DaemonState {
                 },
             }).collect(),
             history: self.history.clone(),
+            paused_job_ids: self.paused_jobs.iter().cloned().collect(),
         }
     }
 }
@@ -93,6 +96,7 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
         job_output: HashMap::new(),
         job_display_output: HashMap::new(),
         running_children: HashMap::new(),
+        paused_jobs: std::collections::HashSet::new(),
         event_tx: event_tx.clone(),
     }));
     tracing::info!("job history loaded");
@@ -288,6 +292,16 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                             }
                         };
 
+                        // If the job is paused, hold here until resumed.
+                        loop {
+                            let is_paused = {
+                                let st = state_clone.lock().await;
+                                st.paused_jobs.contains(&job_id)
+                            };
+                            if !is_paused { break; }
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        }
+
                         {
                             let st = state_clone.lock().await;
                             let _ = st.event_tx.send(DaemonEvent::JobOutput {
@@ -474,6 +488,20 @@ async fn handle_tui_request(
                 st.history.insert(0, job.clone());
                 let _ = st.event_tx.send(DaemonEvent::JobUpdated { job });
             }
+        }
+        TuiRequest::PauseJob { job_id } => {
+            let mut st = state.lock().await;
+            if st.running_jobs.contains_key(&job_id) {
+                st.paused_jobs.insert(job_id);
+                let event = st.snapshot_state();
+                let _ = st.event_tx.send(event);
+            }
+        }
+        TuiRequest::ResumeJob { job_id } => {
+            let mut st = state.lock().await;
+            st.paused_jobs.remove(&job_id);
+            let event = st.snapshot_state();
+            let _ = st.event_tx.send(event);
         }
         TuiRequest::GetState => {
             let st = state.lock().await;

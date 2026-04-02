@@ -28,6 +28,8 @@ pub struct App {
     pub output_scroll: usize,
     /// Sender to daemon
     pub daemon_tx: mpsc::Sender<TuiRequest>,
+    /// IDs of jobs currently paused at a handoff
+    pub paused_job_ids: std::collections::HashSet<String>,
     pub should_quit: bool,
 }
 
@@ -44,17 +46,23 @@ impl App {
             selected: 0,
             output_scroll: 0,
             daemon_tx,
+            paused_job_ids: Default::default(),
             should_quit: false,
         }
+    }
+
+    pub fn is_paused(&self, job_id: &str) -> bool {
+        self.paused_job_ids.contains(job_id)
     }
 
     /// Applies a daemon event to the application state.
     pub fn apply_event(&mut self, event: DaemonEvent) {
         match event {
-            DaemonEvent::State { running_jobs, pending_plans, history } => {
+            DaemonEvent::State { running_jobs, pending_plans, history, paused_job_ids } => {
                 self.running_jobs = running_jobs;
                 self.pending_plans = pending_plans;
                 self.history = history;
+                self.paused_job_ids = paused_job_ids.into_iter().collect();
             }
             DaemonEvent::JobOutput { job_id, line } => {
                 self.job_output.entry(job_id).or_default().push(line);
