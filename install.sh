@@ -88,6 +88,9 @@ install)
     cargo install --path "$SCRIPT_DIR"
     echo "Installed: $BINARY"
 
+    # Install notification icon
+    cp "$SCRIPT_DIR/assets/icon.png" "$BASE_DIR/icon.png"
+
     _ensure_config
     _add_shell_hook
 
@@ -121,6 +124,7 @@ restart)
     echo "Building and installing plan-executor..."
     cargo install --path "$SCRIPT_DIR"
     echo "Installed: $BINARY"
+    cp "$SCRIPT_DIR/assets/icon.png" "$BASE_DIR/icon.png"
     "$BINARY" daemon
     echo "Daemon restarted."
     ;;

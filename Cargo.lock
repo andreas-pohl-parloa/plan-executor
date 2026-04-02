@@ -1166,6 +1166,7 @@ dependencies = [
  "daemonize",
  "dirs",
  "glob",
+ "mac-notification-sys",
  "notify",
  "notify-rust",
  "ratatui",
