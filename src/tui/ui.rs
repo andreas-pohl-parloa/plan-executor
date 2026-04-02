@@ -103,7 +103,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
             Tab::Running => "Running / Pending",
             Tab::History => "History",
         }))
-        .highlight_style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
+        .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
 
     let mut state = ListState::default();
     state.select(Some(app.selected));
