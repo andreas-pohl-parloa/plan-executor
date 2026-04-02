@@ -40,7 +40,7 @@ fn send(title: &str, body: &str) -> Result<()> {
         let mut n = mac_notification_sys::Notification::default();
         n.title(title).message(body);
         if !icon_str.is_empty() {
-            n.app_icon(icon_str).content_image(icon_str);
+            n.app_icon(icon_str);
         }
         n.send()?;
         return Ok(());
