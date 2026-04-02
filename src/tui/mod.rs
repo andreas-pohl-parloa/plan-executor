@@ -123,9 +123,17 @@ async fn run_loop(
                     }
                     KeyCode::Enter | KeyCode::Char('e') => {
                         if let Some(pending) = app.pending_plans.get(app.selected) {
+                            // Execute a pending plan
                             let _ = app.daemon_tx.send(TuiRequest::Execute {
                                 plan_path: pending.plan_path.clone(),
                             }).await;
+                        } else if app.current_tab == app::Tab::History {
+                            // Restart a completed/failed job from history
+                            if let Some(job) = app.history.get(app.selected) {
+                                let _ = app.daemon_tx.send(TuiRequest::Execute {
+                                    plan_path: job.plan_path.to_string_lossy().to_string(),
+                                }).await;
+                            }
                         }
                     }
                     KeyCode::Char('c') => {

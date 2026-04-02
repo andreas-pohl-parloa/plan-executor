@@ -45,7 +45,7 @@ pub fn spawn_execution(
     mut job: JobMetadata,
     execution_root: PathBuf,
     main_cmd: &str,
-) -> Result<(Child, mpsc::Receiver<ExecEvent>)> {
+) -> Result<(Child, u32, mpsc::Receiver<ExecEvent>)> {
     let plan_path = job.plan_path.to_string_lossy().to_string();
     let quoted_path = plan_path.replace('"', "\\\"");
     let cmd_arg = format!("/my:execute-plan-non-interactive \"{}\"", quoted_path);
@@ -54,11 +54,17 @@ pub fn spawn_execution(
     base_args.push("-p".to_string());
     base_args.push(cmd_arg);
 
-    let mut child = Command::new(&program)
-        .args(&base_args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+    let mut child = {
+        let mut cmd = Command::new(&program);
+        cmd.args(&base_args)
+           .stdout(std::process::Stdio::piped())
+           .stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        cmd.process_group(0);
+        cmd.spawn()?
+    };
+
+    let pgid = child.id().unwrap_or(0);
 
     let stdout = child.stdout.take().expect("stdout must be piped");
     let (tx, rx) = mpsc::channel::<ExecEvent>(256);
@@ -70,6 +76,7 @@ pub fn spawn_execution(
 
     tokio::spawn(async move {
         let pricing = load_pricing();
+        let mut got_result = false;
         let mut reader = BufReader::new(stdout).lines();
         let mut output_file = tokio::fs::OpenOptions::new()
             .create(true)
@@ -96,6 +103,7 @@ pub fn spawn_execution(
                         }
                     }
                     "result" => {
+                        got_result = true;
                         if event.subtype.as_deref() != Some("success") {
                             job.status = JobStatus::Failed;
                         }
@@ -147,7 +155,10 @@ pub fn spawn_execution(
             }
         }
 
-        if job.status != JobStatus::Failed {
+        // No result event = process was killed or crashed before finishing
+        if !got_result {
+            job.status = JobStatus::Failed;
+        } else if job.status != JobStatus::Failed {
             job.status = JobStatus::Success;
         }
         job.finished_at = Some(chrono::Utc::now());
@@ -155,5 +166,5 @@ pub fn spawn_execution(
         let _ = tx.send(ExecEvent::Finished(job)).await;
     });
 
-    Ok((child, rx))
+    Ok((child, pgid, rx))
 }

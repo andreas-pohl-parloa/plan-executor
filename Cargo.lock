@@ -1166,6 +1166,7 @@ dependencies = [
  "daemonize",
  "dirs",
  "glob",
+ "libc",
  "mac-notification-sys",
  "notify",
  "notify-rust",

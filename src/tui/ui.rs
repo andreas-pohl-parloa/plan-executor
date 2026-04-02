@@ -101,7 +101,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                 let title_style = if i + n_pending == sel { selected } else { normal };
                 let filename = j.plan_path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
                 let elapsed = (Utc::now() - j.started_at).num_seconds();
-                let time_str = format!("{}s", elapsed);
+                let time_str = format_elapsed(elapsed);
                 let (status_label, st_style) = if app.is_paused(&j.id) {
                     ("PAUSED", st_paused)
                 } else {
@@ -133,7 +133,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                     JobStatus::Running => ("RUN",    Style::default().fg(Color::Cyan)),
                 };
                 let cost = j.cost_usd.map(|c| format!("  ${:.4}", c)).unwrap_or_default();
-                let secs = j.duration_ms.map(|ms| format!("  {}s", ms / 1000)).unwrap_or_default();
+                let secs = j.duration_ms.map(|ms| format!("  {}", format_elapsed((ms / 1000) as i64))).unwrap_or_default();
                 ListItem::new(Text::from(vec![
                     Line::from(vec![
                         status_col(status_label, st_style),
@@ -196,6 +196,17 @@ fn project_label(path: &str) -> String {
         dir = d.parent();
     }
     p.file_name().and_then(|n| n.to_str()).unwrap_or(path).to_string()
+}
+
+fn format_elapsed(secs: i64) -> String {
+    let s = secs.unsigned_abs();
+    if s < 60 {
+        format!("{}s", s)
+    } else if s < 3600 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{}h{:02}m{:02}s", s / 3600, (s % 3600) / 60, s % 60)
+    }
 }
 
 /// Convert a string containing sjv ANSI codes into a ratatui `Line`.

@@ -103,7 +103,7 @@ async fn execute_plan(plan_path: String, config: crate::config::Config) -> Resul
 
     let job = JobMetadata::new(plan.clone());
     let job_id = job.id.clone();
-    let (_, mut exec_rx) = spawn_execution(job, execution_root.clone(), &config.agents.main)
+    let (_, _pgid, mut exec_rx) = spawn_execution(job, execution_root.clone(), &config.agents.main)
         .context("failed to spawn main agent")?;
 
     'outer: loop {
@@ -179,7 +179,7 @@ async fn execute_plan(plan_path: String, config: crate::config::Config) -> Resul
                     println!("└──────────────────────────────────────────────────────────────");
                     println!();
 
-                    let results = handoff::dispatch_all(
+                    let (results, _sub_pgids) = handoff::dispatch_all(
                         state.handoffs,
                         &config.agents.claude,
                         &config.agents.codex,
@@ -204,7 +204,7 @@ async fn execute_plan(plan_path: String, config: crate::config::Config) -> Resul
                     println!("└───────────────────────────────────────────────────────────────");
                     println!();
 
-                    let (_, new_rx) = handoff::resume_execution(
+                    let (_, _, new_rx) = handoff::resume_execution(
                         &session_id,
                         &continuation,
                         execution_root.clone(),

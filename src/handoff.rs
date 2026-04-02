@@ -119,28 +119,47 @@ pub fn load_state(state_file: &Path) -> Result<HandoffState> {
 
 // ── Sub-agent dispatch ─────────────────────────────────────────────────────
 
-async fn dispatch_agent(handoff: Handoff, cmd: String) -> HandoffResult {
+async fn dispatch_agent(handoff: Handoff, cmd: String) -> (HandoffResult, u32) {
     let path = handoff.prompt_file.to_string_lossy().into_owned();
 
     // Verify the prompt file exists before attempting to dispatch.
     if !handoff.prompt_file.exists() {
-        return HandoffResult {
+        return (HandoffResult {
             index: handoff.index,
             stdout: String::new(),
             stderr: format!("prompt file not found: {}", path),
             success: false,
-        };
+        }, 0);
     }
 
     let (program, mut args) = crate::config::Config::parse_cmd(&cmd);
     args.push(path.clone());
 
-    let output = Command::new(&program)
-        .args(&args)
-        .output()
-        .await;
+    let child_result = {
+        let mut c = Command::new(&program);
+        c.args(&args);
+        #[cfg(unix)]
+        c.process_group(0);
+        c.stdout(std::process::Stdio::piped())
+         .stderr(std::process::Stdio::piped())
+         .spawn()
+    };
 
-    match output {
+    let child = match child_result {
+        Ok(c) => c,
+        Err(e) => return (HandoffResult {
+            index: handoff.index,
+            stdout: String::new(),
+            stderr: format!("failed to spawn agent: {}", e),
+            success: false,
+        }, 0),
+    };
+
+    let pgid = child.id().unwrap_or(0);
+
+    let output = child.wait_with_output().await;
+
+    let result = match output {
         Ok(out) => HandoffResult {
             index: handoff.index,
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -150,19 +169,20 @@ async fn dispatch_agent(handoff: Handoff, cmd: String) -> HandoffResult {
         Err(e) => HandoffResult {
             index: handoff.index,
             stdout: String::new(),
-            stderr: format!("failed to spawn agent: {}", e),
+            stderr: format!("failed waiting for agent: {}", e),
             success: false,
         },
-    }
+    };
+    (result, pgid)
 }
 
-/// Dispatches all handoffs in a batch concurrently. Returns results sorted by index.
+/// Dispatches all handoffs in a batch concurrently. Returns results sorted by index and PGIDs.
 pub async fn dispatch_all(
     handoffs: Vec<Handoff>,
     claude_cmd: &str,
     codex_cmd: &str,
     gemini_cmd: &str,
-) -> Vec<HandoffResult> {
+) -> (Vec<HandoffResult>, Vec<u32>) {
     let handles: Vec<_> = handoffs.into_iter()
         .map(|h| {
             let cmd = match h.agent_type {
@@ -174,11 +194,15 @@ pub async fn dispatch_all(
         })
         .collect();
     let mut results = Vec::new();
+    let mut pgids = Vec::new();
     for handle in handles {
-        if let Ok(r) = handle.await { results.push(r); }
+        if let Ok((r, pgid)) = handle.await {
+            results.push(r);
+            pgids.push(pgid);
+        }
     }
     results.sort_by_key(|r| r.index);
-    results
+    (results, pgids)
 }
 
 // ── Continuation builder ───────────────────────────────────────────────────
@@ -206,7 +230,7 @@ pub async fn resume_execution(
     original_job_id: Option<String>,
     original_plan_path: Option<PathBuf>,
     main_cmd: &str,
-) -> Result<(tokio::process::Child, mpsc::Receiver<ExecEvent>)> {
+) -> Result<(tokio::process::Child, u32, mpsc::Receiver<ExecEvent>)> {
     use tokio::io::AsyncBufReadExt;
 
     let (program, mut base_args) = crate::config::Config::parse_cmd(main_cmd);
@@ -217,11 +241,17 @@ pub async fn resume_execution(
         continuation.to_string(),
     ]);
 
-    let mut child = tokio::process::Command::new(&program)
-        .args(&base_args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+    let mut child = {
+        let mut cmd = tokio::process::Command::new(&program);
+        cmd.args(&base_args)
+           .stdout(std::process::Stdio::piped())
+           .stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        cmd.process_group(0);
+        cmd.spawn()?
+    };
+
+    let resume_pgid = child.id().unwrap_or(0);
 
     let stdout = child.stdout.take().expect("stdout must be piped");
     let (tx, rx) = mpsc::channel::<ExecEvent>(256);
@@ -297,6 +327,6 @@ pub async fn resume_execution(
         let _ = tx.send(ExecEvent::Finished(placeholder)).await;
     });
 
-    Ok((child, rx))
+    Ok((child, resume_pgid, rx))
 }
 

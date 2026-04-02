@@ -1,3 +1,4 @@
+use libc;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,6 +30,10 @@ pub struct DaemonState {
     pub job_display_output: HashMap<String, VecDeque<String>>,
     /// Child process handles for running jobs (job_id -> child)
     pub running_children: HashMap<String, tokio::process::Child>,
+    /// Process group IDs for main agent processes (job_id → PGID)
+    pub process_group_ids: HashMap<String, u32>,
+    /// Process group IDs for active handoff sub-agent processes (job_id → [PGID, ...])
+    pub sub_agent_pgids: HashMap<String, Vec<u32>>,
     /// Jobs currently paused at a handoff — sub-agents held until ResumeJob
     pub paused_jobs: std::collections::HashSet<String>,
     /// broadcast channel for DaemonEvent to all TUI clients
@@ -96,6 +101,8 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
         job_output: HashMap::new(),
         job_display_output: HashMap::new(),
         running_children: HashMap::new(),
+        process_group_ids: HashMap::new(),
+        sub_agent_pgids: HashMap::new(),
         paused_jobs: std::collections::HashSet::new(),
         event_tx: event_tx.clone(),
     }));
@@ -236,7 +243,7 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
         st.pending_plans.remove(plan_path);
     }
 
-    let Ok((child, mut exec_rx)) = spawn_execution(job.clone(), execution_root.clone(), &main_cmd) else {
+    let Ok((child, pgid, mut exec_rx)) = spawn_execution(job.clone(), execution_root.clone(), &main_cmd) else {
         // spawn failed — log and return; plan is already removed from pending
         tracing::error!("failed to spawn execution for plan: {}", plan_path);
         return;
@@ -248,6 +255,7 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
         st.job_output.insert(job_id.clone(), VecDeque::new());
         st.job_display_output.insert(job_id.clone(), VecDeque::new());
         st.running_children.insert(job_id.clone(), child);
+        st.process_group_ids.insert(job_id.clone(), pgid);
         let event = st.snapshot_state();
         let _ = st.event_tx.send(event);
     }
@@ -317,12 +325,18 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                             let st = state_clone.lock().await;
                             st.agents.clone()
                         };
-                        let results = handoff::dispatch_all(
+                        let (results, sub_pgids) = handoff::dispatch_all(
                             state_data.handoffs,
                             &agents.claude,
                             &agents.codex,
                             &agents.gemini,
                         ).await;
+
+                        // Store sub-agent PGIDs so KillJob can clean them up
+                        {
+                            let mut st = state_clone.lock().await;
+                            st.sub_agent_pgids.insert(job_id.clone(), sub_pgids);
+                        }
 
                         for r in &results {
                             if !r.success {
@@ -347,10 +361,11 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                             Some(plan.clone()),
                             &agents.main,
                         ).await {
-                            Ok((new_child, new_rx)) => {
+                            Ok((new_child, new_pgid, new_rx)) => {
                                 {
                                     let mut st = state_clone.lock().await;
                                     st.running_children.insert(job_id.clone(), new_child);
+                                    st.process_group_ids.insert(job_id.clone(), new_pgid);
                                 }
                                 exec_rx = new_rx;
                                 continue 'outer;
@@ -371,6 +386,8 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                         let mut st = state_clone.lock().await;
                         st.running_jobs.remove(&job_id);
                         st.running_children.remove(&job_id);
+                        st.process_group_ids.remove(&job_id);
+                        st.sub_agent_pgids.remove(&job_id);
                         st.job_output.remove(&job_id);
                         st.job_display_output.remove(&job_id);
                         st.history.insert(0, finished_job.clone());
@@ -393,6 +410,8 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                     let _ = job.save();
                     st.history.insert(0, job.clone());
                     st.running_children.remove(&job_id);
+                    st.process_group_ids.remove(&job_id);
+                    st.sub_agent_pgids.remove(&job_id);
                     st.job_output.remove(&job_id);
                     st.job_display_output.remove(&job_id);
                     let _ = st.event_tx.send(DaemonEvent::JobUpdated { job });
@@ -485,7 +504,24 @@ async fn handle_tui_request(
         }
         TuiRequest::KillJob { job_id } => {
             let mut st = state.lock().await;
-            // Send SIGKILL to child process
+
+            // Kill the main agent's process group
+            if let Some(pgid) = st.process_group_ids.remove(&job_id) {
+                if pgid > 0 {
+                    #[cfg(unix)]
+                    unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL); }
+                }
+            }
+            // Kill any active handoff sub-agent process groups
+            if let Some(pgids) = st.sub_agent_pgids.remove(&job_id) {
+                for pgid in pgids {
+                    if pgid > 0 {
+                        #[cfg(unix)]
+                        unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL); }
+                    }
+                }
+            }
+            // Belt-and-suspenders: kill the tracked child handle too
             if let Some(mut child) = st.running_children.remove(&job_id) {
                 let _ = child.kill().await;
             }
