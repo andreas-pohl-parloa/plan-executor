@@ -80,12 +80,26 @@ async fn run_loop(
     app: &mut App,
     event_rx: &mut mpsc::Receiver<DaemonEvent>,
 ) -> Result<()> {
-    loop {
-        terminal.draw(|f| ui::render(f, app))?;
+    let mut dirty = true; // draw immediately on first iteration
+    let mut last_tick = std::time::Instant::now();
 
-        // Non-blocking event poll (16ms = ~60fps)
-        if event::poll(Duration::from_millis(16))? {
+    loop {
+        // Redraw only when something changed, or once per second for elapsed
+        // time counters on running jobs.
+        let tick_due = last_tick.elapsed() >= Duration::from_secs(1);
+        if dirty || tick_due {
+            terminal.draw(|f| ui::render(f, app))?;
+            dirty = false;
+            if tick_due {
+                last_tick = std::time::Instant::now();
+            }
+        }
+
+        // Block up to 100ms waiting for a keyboard event. Returns immediately
+        // when a key is pressed, so interaction feels instant.
+        if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
+                dirty = true;
                 match key.code {
                     KeyCode::Char('q') => {
                         app.should_quit = true;
@@ -104,7 +118,6 @@ async fn run_loop(
                         app.selected = app.selected.saturating_sub(1);
                     }
                     KeyCode::Char('e') => {
-                        // Execute selected pending plan
                         if let Some(pending) = app.pending_plans.get(app.selected) {
                             let _ = app.daemon_tx.send(TuiRequest::Execute {
                                 plan_path: pending.plan_path.clone(),
@@ -112,7 +125,6 @@ async fn run_loop(
                         }
                     }
                     KeyCode::Char('c') => {
-                        // Cancel selected pending plan
                         if let Some(pending) = app.pending_plans.get(app.selected) {
                             let _ = app.daemon_tx.send(TuiRequest::CancelPending {
                                 plan_path: pending.plan_path.clone(),
@@ -120,7 +132,6 @@ async fn run_loop(
                         }
                     }
                     KeyCode::Char('x') => {
-                        // Kill selected running job
                         if app.current_tab == app::Tab::Running {
                             if let Some(job) = app.running_jobs.get(app.selected) {
                                 let _ = app.daemon_tx.send(TuiRequest::KillJob {
@@ -138,7 +149,7 @@ async fn run_loop(
                     KeyCode::PageUp => {
                         app.output_scroll = app.output_scroll.saturating_sub(10);
                     }
-                    _ => {}
+                    _ => { dirty = false; } // no-op key: don't force a redraw
                 }
             }
         }
@@ -146,6 +157,7 @@ async fn run_loop(
         // Drain daemon events (non-blocking)
         while let Ok(event) = event_rx.try_recv() {
             app.apply_event(event);
+            dirty = true;
         }
 
         if app.should_quit {
