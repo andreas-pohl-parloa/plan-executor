@@ -470,6 +470,14 @@ async fn handle_tui_request(
             trigger_execution(state, &plan_path).await;
         }
         TuiRequest::CancelPending { plan_path } => {
+            // Rewrite **Status:** READY → CANCELLED in the plan file so it
+            // is not re-detected by FSEvents after removal from pending_plans.
+            if let Ok(content) = std::fs::read_to_string(&plan_path) {
+                let updated = content.replacen("**Status:** READY", "**Status:** CANCELLED", 1);
+                if updated != content {
+                    let _ = std::fs::write(&plan_path, updated);
+                }
+            }
             let mut st = state.lock().await;
             st.pending_plans.remove(&plan_path);
             let event = st.snapshot_state();
