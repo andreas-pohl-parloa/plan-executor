@@ -172,7 +172,11 @@ async fn run_loop(
                         let _ = app.daemon_tx.send(TuiRequest::GetState).await;
                     }
                     KeyCode::PageUp => {
-                        app.output_scroll = app.output_scroll.saturating_add(10);
+                        let max_scroll = app.selected_job()
+                            .and_then(|j| app.job_display_output.get(&j.id))
+                            .map(|lines| lines.len().saturating_sub(1))
+                            .unwrap_or(0);
+                        app.output_scroll = (app.output_scroll + 10).min(max_scroll);
                     }
                     KeyCode::PageDown => {
                         app.output_scroll = app.output_scroll.saturating_sub(10);
