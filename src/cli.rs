@@ -397,8 +397,9 @@ fn daemonize() {
         .expect("failed to open daemon log file");
     let log_stderr = log_file.try_clone().expect("failed to clone log file handle");
 
+    // No .pid_file() — we write the PID ourselves in run_daemon() after fork.
+    // Using pid_file() here creates a lock that conflicts when restarting.
     daemonize::Daemonize::new()
-        .pid_file(&pid_path)
         .stdout(log_file)
         .stderr(log_stderr)
         .start()
