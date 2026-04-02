@@ -99,6 +99,7 @@ pub fn spawn_execution(
                             job.model = Some(model);
                         }
                         if let Some(sid) = event.session_id {
+                            tracing::debug!("executor: captured session_id={}", sid);
                             job.session_id = Some(sid);
                         }
                     }
@@ -142,6 +143,8 @@ pub fn spawn_execution(
 
         // stdout closed — check for handoff pause before declaring finished
         let state_file = execution_root.join(".tmp-execute-plan-state.json");
+        tracing::debug!("executor: stdout EOF — state_file_exists={} session_id={:?}",
+            state_file.exists(), job.session_id);
         if state_file.exists() {
             if let Some(sid) = job.session_id.clone() {
                 // Note: intentionally not saving here — the daemon handles state persistence
