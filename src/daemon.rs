@@ -311,14 +311,14 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                         }
 
                         {
-                            let st = state_clone.lock().await;
-                            let _ = st.event_tx.send(DaemonEvent::JobOutput {
-                                job_id: job_id.clone(),
-                                line: format!(
-                                    "[plan-executor] dispatching {} sub-agent(s) (phase: {})",
-                                    state_data.handoffs.len(), state_data.phase
-                                ),
-                            });
+                            let line = format!(
+                                "[plan-executor] dispatching {} sub-agent(s) (phase: {})",
+                                state_data.handoffs.len(), state_data.phase
+                            );
+                            let mut st = state_clone.lock().await;
+                            st.job_display_output.entry(job_id.clone()).or_default().push_back(line.clone());
+                            let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: job_id.clone(), line: line.clone() });
+                            let _ = st.event_tx.send(DaemonEvent::JobOutput { job_id: job_id.clone(), line });
                         }
 
                         let agents = {
@@ -339,22 +339,29 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                         }
 
                         for r in &results {
-                            if !r.success {
-                                let st = state_clone.lock().await;
-                                let _ = st.event_tx.send(DaemonEvent::JobOutput {
-                                    job_id: job_id.clone(),
-                                    line: format!(
-                                        "[plan-executor] sub-agent {} failed: {}",
-                                        r.index,
-                                        r.stderr.lines().next().unwrap_or("(no stderr)")
-                                    ),
-                                });
-                            }
+                            let line = if r.success {
+                                format!("[plan-executor] sub-agent {} done ({} chars)", r.index, r.stdout.len())
+                            } else {
+                                format!("[plan-executor] sub-agent {} failed: {}", r.index,
+                                    r.stderr.lines().next().unwrap_or("(no stderr)"))
+                            };
+                            let mut st = state_clone.lock().await;
+                            st.job_display_output.entry(job_id.clone()).or_default().push_back(line.clone());
+                            let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: job_id.clone(), line: line.clone() });
+                            let _ = st.event_tx.send(DaemonEvent::JobOutput { job_id: job_id.clone(), line });
                         }
 
                         // Remove state file so resume_execution doesn't re-detect it
                         // and loop forever with another HandoffRequired.
                         let _ = std::fs::remove_file(&state_file);
+
+                        {
+                            let line = format!("[plan-executor] resuming session {}", &session_id[..session_id.len().min(16)]);
+                            let mut st = state_clone.lock().await;
+                            st.job_display_output.entry(job_id.clone()).or_default().push_back(line.clone());
+                            let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: job_id.clone(), line: line.clone() });
+                            let _ = st.event_tx.send(DaemonEvent::JobOutput { job_id: job_id.clone(), line });
+                        }
 
                         let continuation = handoff::build_continuation(&results);
                         match handoff::resume_execution(
