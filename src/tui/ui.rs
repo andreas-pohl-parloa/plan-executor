@@ -94,20 +94,28 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                 ]))
             }).collect();
 
+            // Inner width = list area minus borders (2) and status col (8)
+            let inner_w = area.width.saturating_sub(2 + 8) as usize;
+
             items.extend(app.running_jobs.iter().enumerate().map(|(i, j)| {
                 let title_style = if i + n_pending == sel { selected } else { normal };
                 let filename = j.plan_path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
                 let elapsed = (Utc::now() - j.started_at).num_seconds();
+                let time_str = format!("{}s", elapsed);
                 let (status_label, st_style) = if app.is_paused(&j.id) {
                     ("PAUSED", st_paused)
                 } else {
                     ("RUNNING", st_running)
                 };
+                // Pad filename so time_str lands at the right edge of inner_w
+                let pad = inner_w.saturating_sub(filename.len() + time_str.len() + 1);
+                let spacer = " ".repeat(pad.max(1));
                 ListItem::new(Text::from(vec![
                     Line::from(vec![
                         status_col(status_label, st_style),
                         Span::styled(filename.to_string(), title_style),
-                        Span::styled(format!("  {}s", elapsed), dim),
+                        Span::styled(spacer, normal),
+                        Span::styled(time_str, dim),
                     ]),
                     Line::from(Span::styled(format!("        {}", project_label(&j.plan_path.to_string_lossy())), dim)),
                 ]))
