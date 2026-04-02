@@ -118,6 +118,9 @@ start)
 # ── restart ───────────────────────────────────────────────────────────────
 restart)
     "$BINARY" stop 2>/dev/null || true
+    echo "Building and installing plan-executor..."
+    cargo install --path "$SCRIPT_DIR"
+    echo "Installed: $BINARY"
     "$BINARY" daemon
     echo "Daemon restarted."
     ;;
