@@ -129,6 +129,9 @@ async fn run_loop(
                             let _ = app.daemon_tx.send(TuiRequest::CancelPending {
                                 plan_path: pending.plan_path.clone(),
                             }).await;
+                            // Move to previous item so the next plan is selected
+                            // after the list shrinks.
+                            app.selected = app.selected.saturating_sub(1);
                         }
                     }
                     KeyCode::Char('x') => {

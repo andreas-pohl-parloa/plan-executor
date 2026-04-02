@@ -63,6 +63,14 @@ impl App {
                 self.pending_plans = pending_plans;
                 self.history = history;
                 self.paused_job_ids = paused_job_ids.into_iter().collect();
+                // Clamp selection so it never points past the end of the list.
+                let list_len = match self.current_tab {
+                    Tab::Running => self.pending_plans.len() + self.running_jobs.len(),
+                    Tab::History => self.history.len(),
+                };
+                if list_len > 0 {
+                    self.selected = self.selected.min(list_len - 1);
+                }
             }
             DaemonEvent::JobOutput { job_id, line } => {
                 self.job_output.entry(job_id).or_default().push(line);
