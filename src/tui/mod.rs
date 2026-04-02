@@ -112,7 +112,11 @@ async fn run_loop(
                         app.selected = 0;
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        app.selected = app.selected.saturating_add(1);
+                        let max = match app.current_tab {
+                            app::Tab::Running => app.pending_plans.len() + app.running_jobs.len(),
+                            app::Tab::History => app.history.len(),
+                        }.saturating_sub(1);
+                        app.selected = (app.selected + 1).min(max);
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
                         app.selected = app.selected.saturating_sub(1);
