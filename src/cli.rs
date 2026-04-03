@@ -43,6 +43,14 @@ pub enum Commands {
     Pause { job_id: String },
     /// Resume a paused job
     Unpause { job_id: String },
+    /// Show output of a job; use -f to follow a running job
+    Output {
+        /// Job ID prefix (from `plan-executor jobs`)
+        job_id: String,
+        /// Follow live output of a running job
+        #[arg(short = 'f', long)]
+        follow: bool,
+    },
 }
 
 pub fn run() {
@@ -85,6 +93,7 @@ pub fn run() {
         Commands::Execute { plan } => rt.block_on(execute_plan(plan, config)),
         Commands::Tui => rt.block_on(crate::tui::run_tui()),
         Commands::Status => rt.block_on(show_status()),
+        Commands::Output { job_id, follow } => rt.block_on(output_job(job_id, follow)),
         Commands::Stop | Commands::Jobs | Commands::Ensure
         | Commands::Kill { .. } | Commands::Pause { .. } | Commands::Unpause { .. } => unreachable!(),
     };
@@ -93,6 +102,83 @@ pub fn run() {
         eprintln!("Error: {:#}", e);
         std::process::exit(1);
     }
+}
+
+async fn output_job(job_id_prefix: String, follow: bool) -> Result<()> {
+    use crate::config::Config;
+    use crate::ipc::{DaemonEvent, TuiRequest};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    if !crate::ipc::socket_path().exists() {
+        anyhow::bail!("Daemon not running. Start with: plan-executor daemon");
+    }
+
+    // Resolve job ID prefix → full ID via daemon state.
+    let stream = UnixStream::connect(crate::ipc::socket_path()).await?;
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half).lines();
+
+    let gs = serde_json::to_string(&TuiRequest::GetState)?;
+    write_half.write_all(format!("{}\n", gs).as_bytes()).await?;
+
+    let state_line = reader.next_line().await?.unwrap_or_default();
+    let (job_id, is_running) = if let Ok(DaemonEvent::State { running_jobs, history, .. }) =
+        serde_json::from_str::<DaemonEvent>(&state_line)
+    {
+        let running_match = running_jobs.iter().find(|j| j.id.starts_with(&job_id_prefix));
+        let history_match = history.iter().find(|j| j.id.starts_with(&job_id_prefix));
+        match (running_match, history_match) {
+            (Some(j), _) => (j.id.clone(), true),
+            (_, Some(j)) => (j.id.clone(), false),
+            _ => anyhow::bail!("No job matching '{}'", job_id_prefix),
+        }
+    } else {
+        anyhow::bail!("Unexpected response from daemon");
+    };
+
+    // Print stored output from output.jsonl.
+    let output_path = Config::base_dir().join("jobs").join(&job_id).join("output.jsonl");
+    if output_path.exists() {
+        let content = std::fs::read_to_string(&output_path)?;
+        for raw in content.lines() {
+            let rendered = sjv::render_runtime_line(raw, false, true);
+            for line in rendered.lines().filter(|l| !l.is_empty()) {
+                println!("{}", line);
+            }
+        }
+    }
+
+    if !follow || !is_running {
+        return Ok(());
+    }
+
+    // Follow mode: stream live JobDisplayLine events for this job.
+    eprintln!("[following {} — Ctrl+C to stop]", &job_id[..job_id.len().min(8)]);
+    loop {
+        match reader.next_line().await? {
+            Some(line) => {
+                if let Ok(DaemonEvent::JobDisplayLine { job_id: jid, line: text }) =
+                    serde_json::from_str::<DaemonEvent>(&line)
+                {
+                    if jid == job_id {
+                        println!("{}", text);
+                    }
+                } else if let Ok(DaemonEvent::JobUpdated { job }) =
+                    serde_json::from_str::<DaemonEvent>(&line)
+                {
+                    if job.id == job_id
+                        && job.status != crate::jobs::JobStatus::Running
+                    {
+                        eprintln!("[job finished: {:?}]", job.status);
+                        break;
+                    }
+                }
+            }
+            None => break,
+        }
+    }
+    Ok(())
 }
 
 async fn execute_plan(plan_path: String, config: crate::config::Config) -> Result<()> {
