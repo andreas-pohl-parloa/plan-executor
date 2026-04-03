@@ -1,4 +1,3 @@
-//! Terminal user interface for monitoring the plan-executor daemon.
 pub mod app;
 pub mod ui;
 
@@ -17,45 +16,15 @@ use anyhow::Result;
 use app::App;
 use crate::ipc::{socket_path, DaemonEvent, TuiRequest};
 
-/// Connects to the daemon and runs the interactive TUI.
-///
-/// # Errors
-///
-/// Returns an error if the daemon socket is unreachable or terminal setup fails.
 pub async fn run_tui() -> Result<()> {
-    // Connect to daemon
-    let stream = UnixStream::connect(socket_path()).await
-        .map_err(|_| anyhow::anyhow!("Daemon not running. Start with: plan-executor daemon"))?;
-    let (read_half, mut write_half) = tokio::io::split(stream);
-    let mut reader = BufReader::new(read_half).lines();
-
-    // Channel: daemon events -> app
+    // These channels outlive individual connections — reconnects are transparent.
     let (event_tx, mut event_rx) = mpsc::channel::<DaemonEvent>(64);
+    let (req_tx, req_rx)         = mpsc::channel::<TuiRequest>(64);
 
-    // Spawn daemon reader task
-    tokio::spawn(async move {
-        while let Ok(Some(line)) = reader.next_line().await {
-            if let Ok(event) = serde_json::from_str::<DaemonEvent>(&line) {
-                let _ = event_tx.send(event).await;
-            }
-        }
-    });
-
-    // Channel: TUI requests -> daemon
-    let (req_tx, mut req_rx) = mpsc::channel::<TuiRequest>(64);
-
-    // Spawn daemon writer task
-    tokio::spawn(async move {
-        while let Some(req) = req_rx.recv().await {
-            if let Ok(json) = serde_json::to_string(&req) {
-                let _ = write_half.write_all(format!("{}\n", json).as_bytes()).await;
-            }
-        }
-    });
+    // Spawn the reconnecting background task.
+    tokio::spawn(connector(event_tx, req_rx));
 
     let mut app = App::new(req_tx.clone());
-
-    // Request initial state
     let _ = req_tx.send(TuiRequest::GetState).await;
 
     // Setup terminal
@@ -75,17 +44,75 @@ pub async fn run_tui() -> Result<()> {
     result
 }
 
+/// Maintains a persistent connection to the daemon, reconnecting automatically
+/// when it drops. Bridges the long-lived event/request channels to the socket.
+async fn connector(
+    event_tx: mpsc::Sender<DaemonEvent>,
+    mut req_rx: mpsc::Receiver<TuiRequest>,
+) {
+    loop {
+        match UnixStream::connect(socket_path()).await {
+            Ok(stream) => {
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = BufReader::new(read_half).lines();
+
+                // Immediately request a full state refresh on (re)connect.
+                let gs = serde_json::to_string(&TuiRequest::GetState).unwrap_or_default();
+                if write_half.write_all(format!("{}\n", gs).as_bytes()).await.is_err() {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+
+                // Drive reads and writes concurrently until the connection drops.
+                loop {
+                    tokio::select! {
+                        line = reader.next_line() => {
+                            match line {
+                                Ok(Some(l)) => {
+                                    if let Ok(ev) = serde_json::from_str::<DaemonEvent>(&l) {
+                                        if event_tx.send(ev).await.is_err() {
+                                            return; // TUI closed
+                                        }
+                                    }
+                                }
+                                _ => break, // EOF or error — daemon restarted
+                            }
+                        }
+                        req = req_rx.recv() => {
+                            match req {
+                                Some(r) => {
+                                    if let Ok(json) = serde_json::to_string(&r) {
+                                        if write_half.write_all(format!("{}\n", json).as_bytes()).await.is_err() {
+                                            break; // write failed, reconnect
+                                        }
+                                    }
+                                }
+                                None => return, // req channel closed (TUI quit)
+                            }
+                        }
+                    }
+                }
+
+                // Brief pause before reconnecting.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(_) => {
+                // Daemon not yet running — retry every second.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
 async fn run_loop(
     terminal: &mut ratatui::Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
     event_rx: &mut mpsc::Receiver<DaemonEvent>,
 ) -> Result<()> {
-    let mut dirty = true; // draw immediately on first iteration
+    let mut dirty = true;
     let mut last_tick = std::time::Instant::now();
 
     loop {
-        // Redraw only when something changed, or once per second for elapsed
-        // time counters on running jobs.
         let tick_due = last_tick.elapsed() >= Duration::from_secs(1);
         if dirty || tick_due {
             terminal.draw(|f| ui::render(f, app))?;
@@ -95,8 +122,6 @@ async fn run_loop(
             }
         }
 
-        // Block up to 100ms waiting for a keyboard event. Returns immediately
-        // when a key is pressed, so interaction feels instant.
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 dirty = true;
@@ -123,12 +148,10 @@ async fn run_loop(
                     }
                     KeyCode::Enter | KeyCode::Char('e') => {
                         if let Some(pending) = app.pending_plans.get(app.selected) {
-                            // Execute a pending plan
                             let _ = app.daemon_tx.send(TuiRequest::Execute {
                                 plan_path: pending.plan_path.clone(),
                             }).await;
                         } else if app.current_tab == app::Tab::History {
-                            // Restart a completed/failed job from history
                             if let Some(job) = app.history.get(app.selected) {
                                 let _ = app.daemon_tx.send(TuiRequest::Execute {
                                     plan_path: job.plan_path.to_string_lossy().to_string(),
@@ -141,8 +164,6 @@ async fn run_loop(
                             let _ = app.daemon_tx.send(TuiRequest::CancelPending {
                                 plan_path: pending.plan_path.clone(),
                             }).await;
-                            // Move to previous item so the next plan is selected
-                            // after the list shrinks.
                             app.selected = app.selected.saturating_sub(1);
                         }
                     }
@@ -189,12 +210,11 @@ async fn run_loop(
                     KeyCode::PageDown => {
                         app.output_scroll = app.output_scroll.saturating_sub(10);
                     }
-                    _ => { dirty = false; } // no-op key: don't force a redraw
+                    _ => { dirty = false; }
                 }
             }
         }
 
-        // Drain daemon events (non-blocking)
         while let Ok(event) = event_rx.try_recv() {
             app.apply_event(event);
             dirty = true;
