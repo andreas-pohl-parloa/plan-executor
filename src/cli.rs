@@ -137,15 +137,12 @@ async fn output_job(job_id_prefix: String, follow: bool) -> Result<()> {
         anyhow::bail!("Unexpected response from daemon");
     };
 
-    // Print stored output from output.jsonl.
-    let output_path = Config::base_dir().join("jobs").join(&job_id).join("output.jsonl");
-    if output_path.exists() {
-        let content = std::fs::read_to_string(&output_path)?;
-        for raw in content.lines() {
-            let rendered = sjv::render_runtime_line(raw, false, true);
-            for line in rendered.lines().filter(|l| !l.is_empty()) {
-                println!("{}", line);
-            }
+    // Print stored display output from display.log (pre-rendered, includes [plan-executor] lines).
+    let display_path = Config::base_dir().join("jobs").join(&job_id).join("display.log");
+    if display_path.exists() {
+        let content = std::fs::read_to_string(&display_path)?;
+        for line in content.lines() {
+            println!("{}", line);
         }
     }
 

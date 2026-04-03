@@ -69,9 +69,10 @@ pub fn spawn_execution(
     let stdout = child.stdout.take().expect("stdout must be piped");
     let (tx, rx) = mpsc::channel::<ExecEvent>(256);
 
-    // Prepare output file
+    // Prepare output files
     std::fs::create_dir_all(job.job_dir())?;
-    let output_path = job.output_path();
+    let output_path  = job.output_path();
+    let display_path = job.display_path();
     job.save()?;
 
     tokio::spawn(async move {
@@ -79,11 +80,9 @@ pub fn spawn_execution(
         let mut got_result = false;
         let mut reader = BufReader::new(stdout).lines();
         let mut output_file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&output_path)
-            .await
-            .ok();
+            .create(true).append(true).open(&output_path).await.ok();
+        let mut display_file = tokio::fs::OpenOptions::new()
+            .create(true).append(true).open(&display_path).await.ok();
 
         while let Ok(Some(line)) = reader.next_line().await {
             // Write to output file
@@ -136,6 +135,9 @@ pub fn spawn_execution(
             // parses them via ansi-to-tui.
             let rendered = sjv::render_runtime_line(&line, false, true);
             for display_line in rendered.lines().filter(|l| !l.is_empty()) {
+                if let Some(ref mut f) = display_file {
+                    let _ = f.write_all(format!("{}\n", display_line).as_bytes()).await;
+                }
                 let _ = tx.send(ExecEvent::DisplayLine(display_line.to_string())).await;
             }
             let _ = tx.send(ExecEvent::OutputLine(line)).await;

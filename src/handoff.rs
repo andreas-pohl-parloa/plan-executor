@@ -270,10 +270,17 @@ pub async fn resume_execution(
         let mut resumed_cost: Option<f64> = None;
         let mut resumed_failed = false;
 
-        // Open the output file for appending (same file as the initial turn).
+        // Open the output and display files for appending.
         let mut out_file = if let Some(ref path) = output_path {
             tokio::fs::OpenOptions::new()
                 .create(true).append(true).open(path).await.ok()
+        } else {
+            None
+        };
+        let mut disp_file = if let Some(ref path) = output_path {
+            let dp = path.parent().unwrap_or(path).join("display.log");
+            tokio::fs::OpenOptions::new()
+                .create(true).append(true).open(dp).await.ok()
         } else {
             None
         };
@@ -286,6 +293,9 @@ pub async fn resume_execution(
             // Emit sjv-rendered display line (same as initial turn).
             let rendered = sjv::render_runtime_line(&line, false, true);
             for display_line in rendered.lines().filter(|l| !l.is_empty()) {
+                if let Some(ref mut f) = disp_file {
+                    let _ = f.write_all(format!("{}\n", display_line).as_bytes()).await;
+                }
                 let _ = tx.send(ExecEvent::DisplayLine(display_line.to_string())).await;
             }
             let _ = tx.send(ExecEvent::OutputLine(line.clone())).await;

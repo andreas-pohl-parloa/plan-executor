@@ -46,6 +46,16 @@ pub struct PendingInfo {
     pub auto_execute: bool,
 }
 
+/// Write a display line to the job's display.log so `plan-executor output` sees it.
+fn append_display(job_id: &str, line: &str) {
+    use std::io::Write;
+    let path = crate::config::Config::base_dir()
+        .join("jobs").join(job_id).join("display.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(format!("{}\n", line).as_bytes());
+    }
+}
+
 impl DaemonState {
     pub fn snapshot_state(&self) -> DaemonEvent {
         DaemonEvent::State {
@@ -294,7 +304,7 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                                 let st = state_clone.lock().await;
                                 let _ = st.event_tx.send(DaemonEvent::JobOutput {
                                     job_id: job_id.clone(),
-                                    line: format!("[plan-executor] failed to read state file: {}", e),
+                                    line: format!("⏺ [plan-executor] failed to read state file: {}", e),
                                 });
                                 break 'outer;
                             }
@@ -312,9 +322,10 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
 
                         {
                             let line = format!(
-                                "[plan-executor] dispatching {} sub-agent(s) (phase: {})",
+                                "⏺ [plan-executor] dispatching {} sub-agent(s) (phase: {})",
                                 state_data.handoffs.len(), state_data.phase
                             );
+                            append_display(&job_id, &line);
                             let mut st = state_clone.lock().await;
                             st.job_display_output.entry(job_id.clone()).or_default().push_back(line.clone());
                             let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: job_id.clone(), line: line.clone() });
@@ -340,11 +351,12 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
 
                         for r in &results {
                             let line = if r.success {
-                                format!("[plan-executor] sub-agent {} done ({} chars)", r.index, r.stdout.len())
+                                format!("⏺ [plan-executor] sub-agent {} done ({} chars)", r.index, r.stdout.len())
                             } else {
-                                format!("[plan-executor] sub-agent {} failed: {}", r.index,
+                                format!("⏺ [plan-executor] sub-agent {} failed: {}", r.index,
                                     r.stderr.lines().next().unwrap_or("(no stderr)"))
                             };
+                            append_display(&job_id, &line);
                             let mut st = state_clone.lock().await;
                             st.job_display_output.entry(job_id.clone()).or_default().push_back(line.clone());
                             let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: job_id.clone(), line: line.clone() });
@@ -356,7 +368,8 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                         let _ = std::fs::remove_file(&state_file);
 
                         {
-                            let line = format!("[plan-executor] resuming session {}", &session_id[..session_id.len().min(16)]);
+                            let line = format!("⏺ [plan-executor] resuming session {}", &session_id[..session_id.len().min(16)]);
+                            append_display(&job_id, &line);
                             let mut st = state_clone.lock().await;
                             st.job_display_output.entry(job_id.clone()).or_default().push_back(line.clone());
                             let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: job_id.clone(), line: line.clone() });
@@ -385,7 +398,7 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                                 let st = state_clone.lock().await;
                                 let _ = st.event_tx.send(DaemonEvent::JobOutput {
                                     job_id: job_id.clone(),
-                                    line: format!("[plan-executor] failed to resume session: {}", e),
+                                    line: format!("⏺ [plan-executor] failed to resume session: {}", e),
                                 });
                                 break 'outer;
                             }
