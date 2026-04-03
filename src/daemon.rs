@@ -391,7 +391,7 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                             }
                         }
                     }
-                    ExecEvent::Finished(mut finished_job) => {
+                    ExecEvent::Finished(finished_job) => {
                         // Persist final status to disk so daemon restarts don't
                         // lose the job (resume_execution creates a placeholder
                         // that was never saved).
