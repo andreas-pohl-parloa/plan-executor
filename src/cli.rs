@@ -22,9 +22,9 @@ pub enum Commands {
         #[arg(long)]
         foreground: bool,
     },
-    /// Execute a plan file directly, streaming output to the terminal
+    /// Execute a plan file or re-execute a job by ID prefix
     Execute {
-        /// Path to the plan file
+        /// Plan file path or job ID prefix (from `plan-executor jobs`)
         plan: String,
     },
     /// Stop the running daemon
@@ -96,17 +96,51 @@ pub fn run() {
 }
 
 async fn execute_plan(plan_path: String, config: crate::config::Config) -> Result<()> {
-    // Canonicalize early so both paths get an absolute path.
-    let plan = std::fs::canonicalize(&plan_path)
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(&plan_path));
-    if !plan.exists() {
-        anyhow::bail!("Plan file not found: {}", plan_path);
-    }
-
     if !crate::ipc::socket_path().exists() {
         anyhow::bail!("Daemon not running. Start with: plan-executor daemon");
     }
+
+    // If the argument looks like a job ID prefix, resolve it to a plan path.
+    let resolved_path = resolve_plan_path(&plan_path);
+
+    // Canonicalize to absolute path.
+    let plan = std::fs::canonicalize(&resolved_path)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(&resolved_path));
+    if !plan.exists() {
+        anyhow::bail!("Plan file not found: {}", resolved_path);
+    }
+
     execute_via_daemon(plan, config).await
+}
+
+/// If `arg` matches a job ID prefix in the daemon state or on disk, returns
+/// the plan path for that job. Otherwise returns `arg` unchanged.
+fn resolve_plan_path(arg: &str) -> String {
+    use crate::ipc::{DaemonEvent, TuiRequest};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    // Try daemon state first (covers running + recent history).
+    if let Ok(mut s) = UnixStream::connect(crate::ipc::socket_path()) {
+        let gs = serde_json::to_string(&TuiRequest::GetState).unwrap_or_default();
+        let _ = s.write_all(format!("{}\n", gs).as_bytes());
+        let mut reader = BufReader::new(s);
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        if let Ok(DaemonEvent::State { running_jobs, history, .. }) = serde_json::from_str(&line) {
+            let hit = running_jobs.into_iter().chain(history)
+                .find(|j| j.id.starts_with(arg));
+            if let Some(job) = hit {
+                return job.plan_path.to_string_lossy().into_owned();
+            }
+        }
+    }
+    // Fall back to on-disk history.
+    let jobs = crate::jobs::JobMetadata::load_all();
+    if let Some(job) = jobs.into_iter().find(|j| j.id.starts_with(arg)) {
+        return job.plan_path.to_string_lossy().into_owned();
+    }
+    arg.to_string()
 }
 
 /// Sends Execute to the daemon and streams JobDisplayLine events to the terminal.
