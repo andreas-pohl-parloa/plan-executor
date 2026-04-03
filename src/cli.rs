@@ -107,9 +107,6 @@ async fn execute_via_daemon(plan: PathBuf, config: crate::config::Config) -> Res
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
-    let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
-    let quoted = plan.to_string_lossy().replace('"', "\\\"");
-
     println!("╔══ plan-executor execute (via daemon) ════════════════════════");
     println!("║  Plan:  {}", plan.display());
     println!("║  Cmd:   {}", config.agents.main);
