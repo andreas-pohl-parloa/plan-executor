@@ -272,6 +272,7 @@ pub async fn resume_execution(
         let mut resumed_input_tokens: Option<u64> = None;
         let mut resumed_output_tokens: Option<u64> = None;
         let mut resumed_failed = false;
+        let mut got_result = false;
 
         // Open the output and display files for appending.
         let mut out_file = if let Some(ref path) = output_path {
@@ -314,6 +315,7 @@ pub async fn resume_execution(
                         }
                     }
                     Some("result") => {
+                        got_result = true;
                         if let Some(c) = ev.get("total_cost_usd").and_then(|c| c.as_f64()) {
                             resumed_cost = Some(c);
                         }
@@ -367,6 +369,10 @@ pub async fn resume_execution(
         placeholder.duration_ms = resumed_duration_ms;
         placeholder.input_tokens = resumed_input_tokens;
         placeholder.output_tokens = resumed_output_tokens;
+        // No result event = process crashed or was killed before finishing.
+        if !got_result {
+            resumed_failed = true;
+        }
         placeholder.status = if resumed_failed { JobStatus::Failed } else { JobStatus::Success };
         placeholder.finished_at = Some(chrono::Utc::now());
         let _ = tx.send(ExecEvent::Finished(placeholder)).await;
