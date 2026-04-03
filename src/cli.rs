@@ -251,9 +251,31 @@ fn daemon_job_request(action: &str, job_id_prefix: &str) {
 }
 
 fn list_jobs() {
+    use crate::ipc::{DaemonEvent, TuiRequest};
     use crate::jobs::{JobMetadata, JobStatus};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
 
-    let jobs = JobMetadata::load_all();
+    // Prefer daemon state (includes running jobs not yet on disk).
+    let jobs: Vec<JobMetadata> = if crate::ipc::socket_path().exists() {
+        if let Ok(mut s) = UnixStream::connect(crate::ipc::socket_path()) {
+            let gs = serde_json::to_string(&TuiRequest::GetState).unwrap_or_default();
+            let _ = s.write_all(format!("{}\n", gs).as_bytes());
+            let mut reader = BufReader::new(s);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            if let Ok(DaemonEvent::State { running_jobs, history, .. }) = serde_json::from_str(&line) {
+                running_jobs.into_iter().chain(history).collect()
+            } else {
+                JobMetadata::load_all()
+            }
+        } else {
+            JobMetadata::load_all()
+        }
+    } else {
+        JobMetadata::load_all()
+    };
+
     if jobs.is_empty() {
         println!("No jobs found.");
         return;
