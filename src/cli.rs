@@ -395,14 +395,15 @@ fn list_jobs() {
     let mut line = String::new();
     let _ = reader.read_line(&mut line);
 
-    let jobs: Vec<JobMetadata> = if let Ok(DaemonEvent::State { running_jobs, history, .. }) = serde_json::from_str(&line) {
-        running_jobs.into_iter().chain(history).collect()
+    let (jobs, pending) = if let Ok(DaemonEvent::State { running_jobs, history, pending_plans, .. }) = serde_json::from_str::<DaemonEvent>(&line) {
+        let jobs: Vec<JobMetadata> = running_jobs.into_iter().chain(history).collect();
+        (jobs, pending_plans)
     } else {
         eprintln!("Unexpected response from daemon.");
         std::process::exit(1);
     };
 
-    if jobs.is_empty() {
+    if jobs.is_empty() && pending.is_empty() {
         println!("No jobs found.");
         return;
     }
@@ -420,6 +421,23 @@ fn list_jobs() {
         dur_w = dur_w, cost_w = cost_w,
     );
     println!("{}", "─".repeat(id_w + 2 + plan_w + 2 + status_w + 2 + dur_w + 2 + cost_w));
+
+    // Show pending (READY) plans first.
+    for p in &pending {
+        let plan = std::path::Path::new(&p.plan_path)
+            .file_name().and_then(|n| n.to_str()).unwrap_or(&p.plan_path);
+        let plan_truncated = if plan.len() > plan_w {
+            format!("{}…", &plan[..plan_w - 1])
+        } else {
+            plan.to_string()
+        };
+        println!(
+            "{:<id_w$}  {:<plan_w$}  {:<status_w$}  {:>dur_w$}  {:>cost_w$}",
+            "-", plan_truncated, "ready", "-", "-",
+            id_w = id_w, plan_w = plan_w, status_w = status_w,
+            dur_w = dur_w, cost_w = cost_w,
+        );
+    }
 
     for job in &jobs {
         let id = &job.id[..job.id.len().min(6)];
