@@ -113,14 +113,14 @@ async fn execute_plan(plan_path: String, config: crate::config::Config) -> Resul
     execute_via_daemon(plan, config).await
 }
 
-/// If `arg` matches a job ID prefix in the daemon state or on disk, returns
-/// the plan path for that job. Otherwise returns `arg` unchanged.
+/// If `arg` matches a job ID prefix in daemon state, returns the plan path.
+/// Otherwise returns `arg` unchanged (treat as plan file path).
+/// Never reads from disk.
 fn resolve_plan_path(arg: &str) -> String {
     use crate::ipc::{DaemonEvent, TuiRequest};
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
-    // Try daemon state first (covers running + recent history).
     if let Ok(mut s) = UnixStream::connect(crate::ipc::socket_path()) {
         let gs = serde_json::to_string(&TuiRequest::GetState).unwrap_or_default();
         let _ = s.write_all(format!("{}\n", gs).as_bytes());
@@ -128,17 +128,12 @@ fn resolve_plan_path(arg: &str) -> String {
         let mut line = String::new();
         let _ = reader.read_line(&mut line);
         if let Ok(DaemonEvent::State { running_jobs, history, .. }) = serde_json::from_str(&line) {
-            let hit = running_jobs.into_iter().chain(history)
-                .find(|j| j.id.starts_with(arg));
-            if let Some(job) = hit {
+            if let Some(job) = running_jobs.into_iter().chain(history)
+                .find(|j| j.id.starts_with(arg))
+            {
                 return job.plan_path.to_string_lossy().into_owned();
             }
         }
-    }
-    // Fall back to on-disk history.
-    let jobs = crate::jobs::JobMetadata::load_all();
-    if let Some(job) = jobs.into_iter().find(|j| j.id.starts_with(arg)) {
-        return job.plan_path.to_string_lossy().into_owned();
     }
     arg.to_string()
 }
@@ -290,24 +285,26 @@ fn list_jobs() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
-    // Prefer daemon state (includes running jobs not yet on disk).
-    let jobs: Vec<JobMetadata> = if crate::ipc::socket_path().exists() {
-        if let Ok(mut s) = UnixStream::connect(crate::ipc::socket_path()) {
-            let gs = serde_json::to_string(&TuiRequest::GetState).unwrap_or_default();
-            let _ = s.write_all(format!("{}\n", gs).as_bytes());
-            let mut reader = BufReader::new(s);
-            let mut line = String::new();
-            let _ = reader.read_line(&mut line);
-            if let Ok(DaemonEvent::State { running_jobs, history, .. }) = serde_json::from_str(&line) {
-                running_jobs.into_iter().chain(history).collect()
-            } else {
-                JobMetadata::load_all()
-            }
-        } else {
-            JobMetadata::load_all()
-        }
+    if !crate::ipc::socket_path().exists() {
+        eprintln!("Daemon not running. Start with: plan-executor daemon");
+        std::process::exit(1);
+    }
+
+    let mut s = match UnixStream::connect(crate::ipc::socket_path()) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("Cannot connect to daemon: {}", e); std::process::exit(1); }
+    };
+    let gs = serde_json::to_string(&TuiRequest::GetState).unwrap_or_default();
+    let _ = s.write_all(format!("{}\n", gs).as_bytes());
+    let mut reader = BufReader::new(s);
+    let mut line = String::new();
+    let _ = reader.read_line(&mut line);
+
+    let jobs: Vec<JobMetadata> = if let Ok(DaemonEvent::State { running_jobs, history, .. }) = serde_json::from_str(&line) {
+        running_jobs.into_iter().chain(history).collect()
     } else {
-        JobMetadata::load_all()
+        eprintln!("Unexpected response from daemon.");
+        std::process::exit(1);
     };
 
     if jobs.is_empty() {
