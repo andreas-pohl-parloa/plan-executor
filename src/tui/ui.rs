@@ -232,9 +232,15 @@ fn format_elapsed(secs: i64) -> String {
 /// sjv uses only: ESC[0m reset, ESC[1m bold, ESC[2m dim, ESC[3m italic,
 /// ESC[31m red, ESC[32m green, ESC[34m blue, ESC[36m cyan.
 fn ansi_line(s: &str) -> Line<'static> {
-    // Colour plan-executor status lines and ⏺ bullet prefix green.
-    if s.starts_with("[plan-executor]") || s.starts_with("⏺") {
-        return Line::from(Span::styled(s.to_string(), Style::default().fg(Color::Green)));
+    // Colour the "[plan-executor]" and "⏺" prefix green, rest of line normal.
+    let green = Style::default().fg(Color::Green);
+    for prefix in &["[plan-executor]", "⏺"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            return Line::from(vec![
+                Span::styled(prefix.to_string(), green),
+                Span::styled(rest.to_string(), Style::default().fg(Color::Gray)),
+            ]);
+        }
     }
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut style = Style::default().fg(Color::Gray);
