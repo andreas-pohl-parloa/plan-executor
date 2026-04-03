@@ -250,34 +250,6 @@ fn daemon_job_request(action: &str, job_id_prefix: &str) {
     println!("{} job {}.", action, &job_id[..job_id.len().min(8)]);
 }
 
-fn mark_job_failed_if_running(job_id: &str) {
-    use crate::config::Config;
-    use crate::jobs::{JobMetadata, JobStatus};
-
-    let meta_path = Config::base_dir().join("jobs").join(job_id).join("metadata.json");
-    let Ok(content) = std::fs::read_to_string(&meta_path) else { return };
-    let Ok(mut meta) = serde_json::from_str::<JobMetadata>(&content) else { return };
-    if meta.status == JobStatus::Running {
-        meta.status = JobStatus::Failed;
-        meta.finished_at = Some(chrono::Utc::now());
-        let _ = meta.save();
-    }
-}
-
-fn find_repo_root(path: &Path) -> Option<PathBuf> {
-    let mut dir = if path.is_file() {
-        path.parent()?.to_path_buf()
-    } else {
-        path.to_path_buf()
-    };
-    loop {
-        if dir.join(".git").exists() {
-            return Some(dir);
-        }
-        dir = dir.parent()?.to_path_buf();
-    }
-}
-
 fn list_jobs() {
     use crate::jobs::{JobMetadata, JobStatus};
 
