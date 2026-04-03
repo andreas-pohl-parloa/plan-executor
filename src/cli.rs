@@ -127,7 +127,16 @@ fn resolve_plan_path(arg: &str) -> String {
         let mut reader = BufReader::new(s);
         let mut line = String::new();
         let _ = reader.read_line(&mut line);
-        if let Ok(DaemonEvent::State { running_jobs, history, .. }) = serde_json::from_str(&line) {
+        if let Ok(DaemonEvent::State { running_jobs, history, pending_plans, .. }) = serde_json::from_str(&line) {
+            // 1. Match pending plan by filename or full path prefix
+            if let Some(p) = pending_plans.iter().find(|p| {
+                let fname = std::path::Path::new(&p.plan_path)
+                    .file_name().and_then(|n| n.to_str()).unwrap_or("");
+                fname.starts_with(arg) || p.plan_path.starts_with(arg)
+            }) {
+                return p.plan_path.clone();
+            }
+            // 2. Match job ID prefix (history or running)
             if let Some(job) = running_jobs.into_iter().chain(history)
                 .find(|j| j.id.starts_with(arg))
             {
