@@ -231,7 +231,13 @@ pub async fn resume_execution(
     original_plan_path: Option<PathBuf>,
     main_cmd: &str,
 ) -> Result<(tokio::process::Child, u32, mpsc::Receiver<ExecEvent>)> {
-    use tokio::io::AsyncBufReadExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    // Derive the output file path from the original job id so resume lines
+    // are appended to the same file the initial turn wrote to.
+    let output_path = original_job_id.as_deref().map(|id| {
+        crate::config::Config::base_dir().join("jobs").join(id).join("output.jsonl")
+    });
 
     let (program, mut base_args) = crate::config::Config::parse_cmd(main_cmd);
     base_args.extend_from_slice(&[
@@ -264,7 +270,24 @@ pub async fn resume_execution(
         let mut resumed_cost: Option<f64> = None;
         let mut resumed_failed = false;
 
+        // Open the output file for appending (same file as the initial turn).
+        let mut out_file = if let Some(ref path) = output_path {
+            tokio::fs::OpenOptions::new()
+                .create(true).append(true).open(path).await.ok()
+        } else {
+            None
+        };
+
         while let Ok(Some(line)) = reader.next_line().await {
+            // Append raw line to output file (same as initial turn).
+            if let Some(ref mut f) = out_file {
+                let _ = f.write_all(format!("{}\n", line).as_bytes()).await;
+            }
+            // Emit sjv-rendered display line (same as initial turn).
+            let rendered = sjv::render_runtime_line(&line, false, true);
+            for display_line in rendered.lines().filter(|l| !l.is_empty()) {
+                let _ = tx.send(ExecEvent::DisplayLine(display_line.to_string())).await;
+            }
             let _ = tx.send(ExecEvent::OutputLine(line.clone())).await;
 
             if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&line) {
