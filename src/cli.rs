@@ -86,18 +86,121 @@ pub fn run() {
 }
 
 async fn execute_plan(plan_path: String, config: crate::config::Config) -> Result<()> {
-    use crate::executor::{spawn_execution, ExecEvent};
-    use crate::handoff::{self, AgentType};
-    use crate::jobs::{JobMetadata, JobStatus};
-    let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
-
-    // Canonicalize to absolute path before find_repo_root so relative paths
-    // like "mock/plan/test-plan.md" resolve correctly.
+    // Canonicalize early so both paths get an absolute path.
     let plan = std::fs::canonicalize(&plan_path)
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(&plan_path));
     if !plan.exists() {
         anyhow::bail!("Plan file not found: {}", plan_path);
     }
+
+    // If the daemon is running, delegate to it so TUI sessions also see the job.
+    if crate::ipc::socket_path().exists() {
+        return execute_via_daemon(plan, config).await;
+    }
+    execute_standalone(plan, config).await
+}
+
+/// Sends Execute to the daemon and streams JobDisplayLine events to the terminal.
+async fn execute_via_daemon(plan: PathBuf, config: crate::config::Config) -> Result<()> {
+    use crate::ipc::{DaemonEvent, TuiRequest};
+    use crate::jobs::JobStatus;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let quoted = plan.to_string_lossy().replace('"', "\\\"");
+
+    println!("╔══ plan-executor execute (via daemon) ════════════════════════");
+    println!("║  Plan:  {}", plan.display());
+    println!("║  Cmd:   {}", config.agents.main);
+    println!("╚══════════════════════════════════════════════════════════════");
+    println!();
+
+    let stream = UnixStream::connect(crate::ipc::socket_path()).await
+        .context("Daemon not reachable")?;
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half).lines();
+
+    // Snapshot current running job IDs before we trigger execution.
+    let gs = serde_json::to_string(&TuiRequest::GetState)?;
+    write_half.write_all(format!("{}\n", gs).as_bytes()).await?;
+
+    let mut existing_ids = std::collections::HashSet::<String>::new();
+    if let Ok(Some(line)) = reader.next_line().await {
+        if let Ok(DaemonEvent::State { running_jobs, .. }) = serde_json::from_str(&line) {
+            existing_ids = running_jobs.iter().map(|j| j.id.clone()).collect();
+        }
+    }
+
+    // Trigger execution.
+    let req = serde_json::to_string(&TuiRequest::Execute {
+        plan_path: plan.to_string_lossy().to_string(),
+    })?;
+    write_half.write_all(format!("{}\n", req).as_bytes()).await?;
+
+    // Stream events until the job finishes.
+    let mut our_job_id: Option<String> = None;
+
+    loop {
+        let line = match reader.next_line().await? {
+            Some(l) => l,
+            None => break,
+        };
+        if let Ok(event) = serde_json::from_str::<DaemonEvent>(&line) {
+            match event {
+                DaemonEvent::State { running_jobs, .. } => {
+                    if our_job_id.is_none() {
+                        for j in &running_jobs {
+                            if !existing_ids.contains(&j.id) {
+                                our_job_id = Some(j.id.clone());
+                                break;
+                            }
+                        }
+                    }
+                }
+                DaemonEvent::JobDisplayLine { job_id, line } => {
+                    let is_ours = our_job_id.as_deref() == Some(&job_id)
+                        || our_job_id.is_none();
+                    if is_ours {
+                        if our_job_id.is_none() { our_job_id = Some(job_id); }
+                        // ANSI codes from sjv render natively in the terminal.
+                        println!("{}", line);
+                    }
+                }
+                DaemonEvent::JobUpdated { job } => {
+                    if our_job_id.as_deref() == Some(&job.id)
+                        && job.status != JobStatus::Running
+                    {
+                        println!();
+                        println!("╔══ done ═══════════════════════════════════════════════════════");
+                        match job.status {
+                            JobStatus::Success => println!("║  Status:   success"),
+                            JobStatus::Failed  => println!("║  Status:   FAILED"),
+                            other              => println!("║  Status:   {:?}", other),
+                        }
+                        if let Some(ms) = job.duration_ms {
+                            println!("║  Duration: {}s", ms / 1000);
+                        }
+                        if let Some(cost) = job.cost_usd {
+                            println!("║  Cost:     ${:.4}", cost);
+                        }
+                        println!("╚══════════════════════════════════════════════════════════════");
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Standalone execution — used when no daemon is running.
+async fn execute_standalone(plan: PathBuf, config: crate::config::Config) -> Result<()> {
+    use crate::executor::{spawn_execution, ExecEvent};
+    use crate::handoff::{self, AgentType};
+    use crate::jobs::{JobMetadata, JobStatus};
+    let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
 
     let execution_root = find_repo_root(&plan)
         .unwrap_or_else(|| plan.parent().unwrap_or(plan.as_path()).to_path_buf());
