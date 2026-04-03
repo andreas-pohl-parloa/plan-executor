@@ -232,12 +232,22 @@ fn format_elapsed(secs: i64) -> String {
 /// sjv uses only: ESC[0m reset, ESC[1m bold, ESC[2m dim, ESC[3m italic,
 /// ESC[31m red, ESC[32m green, ESC[34m blue, ESC[36m cyan.
 fn ansi_line(s: &str) -> Line<'static> {
-    // Colour the "⏺ [plan-executor]" prefix yellow, rest of line normal.
+    // Colour the "⏺ [plan-executor]" prefix: red for failures, yellow otherwise.
     if let Some(rest) = s.strip_prefix("⏺ [plan-executor]") {
-        let yellow = Style::default().fg(Color::Yellow);
+        let is_failure = rest.contains("failed");
+        let prefix_style = if is_failure {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        let rest_style = if is_failure {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
         return Line::from(vec![
-            Span::styled("⏺ [plan-executor]".to_string(), yellow),
-            Span::styled(rest.to_string(), Style::default().fg(Color::Gray)),
+            Span::styled("⏺ [plan-executor]".to_string(), prefix_style),
+            Span::styled(rest.to_string(), rest_style),
         ]);
     }
     // Colour plain "⏺" prefix green (sjv bullet).
