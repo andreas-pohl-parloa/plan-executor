@@ -268,6 +268,9 @@ pub async fn resume_execution(
         let mut resumed_session_id = session_id_owned.clone();
         let mut resumed_model: Option<String> = None;
         let mut resumed_cost: Option<f64> = None;
+        let mut resumed_duration_ms: Option<u64> = None;
+        let mut resumed_input_tokens: Option<u64> = None;
+        let mut resumed_output_tokens: Option<u64> = None;
         let mut resumed_failed = false;
 
         // Open the output and display files for appending.
@@ -314,7 +317,13 @@ pub async fn resume_execution(
                         if let Some(c) = ev.get("total_cost_usd").and_then(|c| c.as_f64()) {
                             resumed_cost = Some(c);
                         }
-                        // Check subtype for failure
+                        if let Some(d) = ev.get("duration_ms").and_then(|d| d.as_u64()) {
+                            resumed_duration_ms = Some(d);
+                        }
+                        if let Some(u) = ev.get("usage") {
+                            resumed_input_tokens = u.get("input_tokens").and_then(|v| v.as_u64());
+                            resumed_output_tokens = u.get("output_tokens").and_then(|v| v.as_u64());
+                        }
                         if ev.get("subtype").and_then(|s| s.as_str()) != Some("success") {
                             resumed_failed = true;
                         }
@@ -355,6 +364,9 @@ pub async fn resume_execution(
         placeholder.session_id = Some(session_id_owned);
         placeholder.model = resumed_model;
         placeholder.cost_usd = resumed_cost;
+        placeholder.duration_ms = resumed_duration_ms;
+        placeholder.input_tokens = resumed_input_tokens;
+        placeholder.output_tokens = resumed_output_tokens;
         placeholder.status = if resumed_failed { JobStatus::Failed } else { JobStatus::Success };
         placeholder.finished_at = Some(chrono::Utc::now());
         let _ = tx.send(ExecEvent::Finished(placeholder)).await;
