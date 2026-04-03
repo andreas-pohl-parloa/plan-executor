@@ -37,6 +37,12 @@ pub enum Commands {
     Status,
     /// List job history
     Jobs,
+    /// Kill a running job by job ID (prefix match)
+    Kill { job_id: String },
+    /// Pause a running job at the next handoff
+    Pause { job_id: String },
+    /// Resume a paused job
+    Unpause { job_id: String },
 }
 
 pub fn run() {
@@ -44,9 +50,12 @@ pub fn run() {
 
     // Synchronous commands — handle before creating the async runtime.
     match &cli.command {
-        Commands::Stop => { stop_daemon(); return; }
-        Commands::Jobs => { list_jobs(); return; }
+        Commands::Stop   => { stop_daemon(); return; }
+        Commands::Jobs   => { list_jobs(); return; }
         Commands::Ensure => { ensure_daemon(); return; }
+        Commands::Kill   { job_id } => { daemon_job_request("kill",    job_id); return; }
+        Commands::Pause  { job_id } => { daemon_job_request("pause",   job_id); return; }
+        Commands::Unpause{ job_id } => { daemon_job_request("unpause", job_id); return; }
         _ => {}
     }
 
@@ -76,7 +85,8 @@ pub fn run() {
         Commands::Execute { plan } => rt.block_on(execute_plan(plan, config)),
         Commands::Tui => rt.block_on(crate::tui::run_tui()),
         Commands::Status => rt.block_on(show_status()),
-        Commands::Stop | Commands::Jobs | Commands::Ensure => unreachable!(),
+        Commands::Stop | Commands::Jobs | Commands::Ensure
+        | Commands::Kill { .. } | Commands::Pause { .. } | Commands::Unpause { .. } => unreachable!(),
     };
 
     if let Err(e) = result {
@@ -93,11 +103,10 @@ async fn execute_plan(plan_path: String, config: crate::config::Config) -> Resul
         anyhow::bail!("Plan file not found: {}", plan_path);
     }
 
-    // If the daemon is running, delegate to it so TUI sessions also see the job.
-    if crate::ipc::socket_path().exists() {
-        return execute_via_daemon(plan, config).await;
+    if !crate::ipc::socket_path().exists() {
+        anyhow::bail!("Daemon not running. Start with: plan-executor daemon");
     }
-    execute_standalone(plan, config).await
+    execute_via_daemon(plan, config).await
 }
 
 /// Sends Execute to the daemon and streams JobDisplayLine events to the terminal.
@@ -192,154 +201,53 @@ async fn execute_via_daemon(plan: PathBuf, config: crate::config::Config) -> Res
     Ok(())
 }
 
-/// Standalone execution — used when no daemon is running.
-async fn execute_standalone(plan: PathBuf, config: crate::config::Config) -> Result<()> {
-    use crate::executor::{spawn_execution, ExecEvent};
-    use crate::handoff::{self, AgentType};
-    use crate::jobs::{JobMetadata, JobStatus};
-    let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
+/// Resolves a job ID prefix to a full ID from running jobs, sends the
+/// corresponding daemon request, and prints the result.
+fn daemon_job_request(action: &str, job_id_prefix: &str) {
+    use crate::ipc::{DaemonEvent, TuiRequest};
+    use std::os::unix::net::UnixStream;
+    use std::io::{BufRead, BufReader, Write};
 
-    let execution_root = find_repo_root(&plan)
-        .unwrap_or_else(|| plan.parent().unwrap_or(plan.as_path()).to_path_buf());
-
-    let quoted = plan.to_string_lossy().replace('"', "\\\"");
-    println!("╔══ plan-executor execute ═════════════════════════════════════");
-    println!("║  Plan:  {}", plan.display());
-    println!("║  Root:  {}", execution_root.display());
-    println!("║  Cmd:   {} \\", config.agents.main);
-    println!("║           -p \"/my:execute-plan-non-interactive \\\"{}\\\"\"", quoted);
-    println!("╚══════════════════════════════════════════════════════════════");
-    println!();
-
-    let job = JobMetadata::new(plan.clone());
-    let job_id = job.id.clone();
-    let (_, _pgid, mut exec_rx) = spawn_execution(job, execution_root.clone(), &config.agents.main)
-        .context("failed to spawn main agent")?;
-
-    'outer: loop {
-        let mut handoff_event: Option<(String, std::path::PathBuf)> = None;
-        let mut finished_event: Option<crate::jobs::JobMetadata> = None;
-
-        while let Some(event) = exec_rx.recv().await {
-            match event {
-                ExecEvent::OutputLine(line) => {
-                    let rendered = sjv::render_runtime_line(&line, false, use_color);
-                    if !rendered.is_empty() {
-                        println!("{}", rendered);
-                    }
-                }
-                ExecEvent::DisplayLine(_) => {} // rendered via OutputLine above
-                ExecEvent::HandoffRequired { session_id, state_file } => {
-                    handoff_event = Some((session_id, state_file));
-                    break;
-                }
-                ExecEvent::Finished(job) => {
-                    finished_event = Some(job);
-                    break;
-                }
-            }
-        }
-
-        if let Some(finished) = finished_event {
-            println!();
-            println!("╔══ done ═══════════════════════════════════════════════════════");
-            match finished.status {
-                JobStatus::Success => println!("║  Status:   success"),
-                JobStatus::Failed  => println!("║  Status:   FAILED"),
-                other              => println!("║  Status:   {:?}", other),
-            }
-            if let Some(ms) = finished.duration_ms {
-                println!("║  Duration: {}s", ms / 1000);
-            }
-            if let Some(cost) = finished.cost_usd {
-                println!("║  Cost:     ${:.4}", cost);
-            }
-            if let (Some(i), Some(o)) = (finished.input_tokens, finished.output_tokens) {
-                println!("║  Tokens:   {} in / {} out", i, o);
-            }
-            println!("╚══════════════════════════════════════════════════════════════");
-            break 'outer;
-        }
-
-        if let Some((session_id, state_file)) = handoff_event {
-                    let state = handoff::load_state(&state_file)
-                        .context("failed to read handoff state file")?;
-
-                    println!();
-                    println!("┌── handoff: phase={} ──────────────────────────────────────────", state.phase);
-                    println!("│  Session: {}", session_id);
-                    println!("│  Dispatching {} sub-agent(s):", state.handoffs.len());
-                    for h in &state.handoffs {
-                        let cmd = match h.agent_type {
-                            AgentType::Claude => format!(
-                                "claude --dangerously-skip-permissions -p {}",
-                                h.prompt_file.display()
-                            ),
-                            AgentType::Codex => format!(
-                                "codex --dangerously-bypass-approvals-and-sandbox exec {}",
-                                h.prompt_file.display()
-                            ),
-                            AgentType::Gemini => format!(
-                                "gemini --yolo -p {}",
-                                h.prompt_file.display()
-                            ),
-                        };
-                        println!("│  [{}] {}", h.index, cmd);
-                    }
-                    println!("└──────────────────────────────────────────────────────────────");
-                    println!();
-
-                    let (results, _sub_pgids) = handoff::dispatch_all(
-                        state.handoffs,
-                        &config.agents.claude,
-                        &config.agents.codex,
-                        &config.agents.gemini,
-                    ).await;
-
-                    for r in &results {
-                        if r.success {
-                            println!("  [{}] ✓ done ({} chars)", r.index, r.stdout.len());
-                        } else {
-                            let first_err = r.stderr.lines().next().unwrap_or("(no stderr)");
-                            println!("  [{}] ✗ failed: {}", r.index, first_err);
-                        }
-                    }
-
-                    // Remove state file before resuming so the resume turn
-                    // doesn't re-detect it and loop with another HandoffRequired.
-                    let _ = std::fs::remove_file(&state_file);
-
-                    let continuation = handoff::build_continuation(&results);
-                    println!();
-                    println!("┌── resume ─────────────────────────────────────────────────────");
-                    println!("│  claude --dangerously-skip-permissions --verbose \\");
-                    println!("│    --output-format stream-json --resume {} \\", session_id);
-                    println!("│    -p <continuation>");
-                    println!("└───────────────────────────────────────────────────────────────");
-                    println!();
-
-                    let (_, _, new_rx) = handoff::resume_execution(
-                        &session_id,
-                        &continuation,
-                        execution_root.clone(),
-                        Some(job_id.clone()),
-                        Some(plan.clone()),
-                        &config.agents.main,
-                    )
-                    .await
-                    .context("failed to resume agent session")?;
-                    exec_rx = new_rx;
-                    continue 'outer;
-        }
-
-        break 'outer; // channel closed without Finished
+    let sock = crate::ipc::socket_path();
+    if !sock.exists() {
+        eprintln!("Daemon not running.");
+        std::process::exit(1);
     }
 
-    // If the job never emitted Finished (error / cancelled), mark it Failed on disk
-    // so it shows up in history rather than being filtered out as Running.
-    mark_job_failed_if_running(&job_id);
+    let mut stream = match UnixStream::connect(&sock) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("Cannot connect to daemon: {}", e); std::process::exit(1); }
+    };
 
-    Ok(())
+    // Get state to resolve job ID prefix.
+    let gs = serde_json::to_string(&TuiRequest::GetState).unwrap();
+    let _ = stream.write_all(format!("{}\n", gs).as_bytes());
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut line = String::new();
+    let _ = reader.read_line(&mut line);
+
+    let full_id = if let Ok(DaemonEvent::State { running_jobs, .. }) = serde_json::from_str(&line) {
+        running_jobs.into_iter()
+            .find(|j| j.id.starts_with(job_id_prefix))
+            .map(|j| j.id)
+    } else {
+        None
+    };
+
+    let Some(job_id) = full_id else {
+        eprintln!("No running job matching '{}'.", job_id_prefix);
+        std::process::exit(1);
+    };
+
+    let req = match action {
+        "kill"    => TuiRequest::KillJob   { job_id: job_id.clone() },
+        "pause"   => TuiRequest::PauseJob  { job_id: job_id.clone() },
+        "unpause" => TuiRequest::ResumeJob { job_id: job_id.clone() },
+        _ => unreachable!(),
+    };
+
+    let _ = stream.write_all(format!("{}\n", serde_json::to_string(&req).unwrap()).as_bytes());
+    println!("{} job {}.", action, &job_id[..job_id.len().min(8)]);
 }
 
 fn mark_job_failed_if_running(job_id: &str) {
