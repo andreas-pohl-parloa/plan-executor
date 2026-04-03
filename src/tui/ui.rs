@@ -108,7 +108,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                     ("RUNNING", st_running)
                 };
                 // Pad filename so time_str lands at the right edge of inner_w
-                let pad = inner_w.saturating_sub(filename.len() + time_str.len() + 1);
+                let pad = inner_w.saturating_sub(filename.len() + time_str.len());
                 let spacer = " ".repeat(pad.max(1));
                 ListItem::new(Text::from(vec![
                     Line::from(vec![
@@ -137,14 +137,15 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                 let time_str = j.duration_ms
                     .map(|ms| format_elapsed((ms / 1000) as i64))
                     .unwrap_or_default();
-                let pad1 = inner_w.saturating_sub(filename.len() + time_str.len() + 1);
+                // inner_w excludes the 8-char status col; same offset as the
+                // "        " indent on line 2, so both use the same formula.
+                let pad1 = inner_w.saturating_sub(filename.len() + time_str.len());
                 let spacer1 = " ".repeat(pad1.max(1));
 
                 // Line 2: project label right-aligned with cost
                 let proj = project_label(&j.plan_path.to_string_lossy());
                 let cost_str = j.cost_usd.map(|c| format!("${:.4}", c)).unwrap_or_default();
-                let indent = 8usize; // matches "        " prefix
-                let pad2 = inner_w.saturating_sub(indent + proj.len() + cost_str.len() + 1);
+                let pad2 = inner_w.saturating_sub(proj.len() + cost_str.len());
                 let spacer2 = " ".repeat(pad2.max(1));
 
                 ListItem::new(Text::from(vec![
