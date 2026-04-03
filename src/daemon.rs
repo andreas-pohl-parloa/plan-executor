@@ -391,7 +391,11 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                             }
                         }
                     }
-                    ExecEvent::Finished(finished_job) => {
+                    ExecEvent::Finished(mut finished_job) => {
+                        // Persist final status to disk so daemon restarts don't
+                        // lose the job (resume_execution creates a placeholder
+                        // that was never saved).
+                        let _ = finished_job.save();
                         let success = finished_job.status == JobStatus::Success;
                         let cost = finished_job.cost_usd;
                         let mut st = state_clone.lock().await;
