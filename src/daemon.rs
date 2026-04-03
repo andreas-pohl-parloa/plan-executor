@@ -363,6 +363,12 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                             let _ = st.event_tx.send(DaemonEvent::JobOutput { job_id: job_id.clone(), line });
                         }
 
+                        // If any sub-agent failed, fail the job — don't resume.
+                        if results.iter().any(|r| !r.success) {
+                            let _ = std::fs::remove_file(&state_file);
+                            break 'outer;
+                        }
+
                         // Remove state file so resume_execution doesn't re-detect it
                         // and loop forever with another HandoffRequired.
                         let _ = std::fs::remove_file(&state_file);
