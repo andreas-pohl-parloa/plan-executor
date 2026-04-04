@@ -12,7 +12,7 @@ use crate::tui::app::{App, Tab};
 use crate::jobs::JobStatus;
 
 const HELP: &str =
-    " enter/e: execute  c: cancel  p: pause  u: unpause  x: kill  r: reload  tab: switch  q: quit";
+    " enter/e: execute  c: cancel  p: pause  u: unpause  x: kill  R: retry  r: reload  pgup/pgdn: scroll  tab: switch  q: quit";
 
 /// Renders the full TUI frame. Takes `&mut App` so it can lazily load
 /// job output from disk when a history job is selected.
@@ -142,11 +142,8 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                 let pad1 = inner_w.saturating_sub(filename.len() + time_str.len());
                 let spacer1 = " ".repeat(pad1.max(1));
 
-                // Line 2: project label right-aligned with cost
+                // Line 2: project label
                 let proj = project_label(&j.plan_path.to_string_lossy());
-                let cost_str = j.cost_usd.map(|c| format!("${:.4}", c)).unwrap_or_default();
-                let pad2 = inner_w.saturating_sub(proj.len() + cost_str.len());
-                let spacer2 = " ".repeat(pad2.max(1));
 
                 ListItem::new(Text::from(vec![
                     Line::from(vec![
@@ -155,11 +152,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                         Span::styled(spacer1, normal),
                         Span::styled(time_str, dim),
                     ]),
-                    Line::from(vec![
-                        Span::styled(format!("        {}", proj), dim),
-                        Span::styled(spacer2, normal),
-                        Span::styled(cost_str, dim),
-                    ]),
+                    Line::from(Span::styled(format!("        {}", proj), dim)),
                 ]))
             }).collect()
         }
@@ -293,13 +286,53 @@ fn ansi_line(s: &str) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Returns the number of visible characters in a string, stripping ANSI escape codes.
+fn ansi_display_width(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut width = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j] != b'm' { j += 1; }
+            i = j + 1;
+        } else {
+            if bytes[i] & 0xC0 != 0x80 { width += 1; } // count non-continuation UTF-8 bytes
+            i += 1;
+        }
+    }
+    width
+}
+
+/// Finds the start index in `lines` such that the slice `lines[start..]`
+/// fills approximately `target_rows` visual rows when wrapped to `col_width`.
+fn scroll_start(lines: &[String], target_rows: usize, col_width: usize) -> usize {
+    if col_width == 0 || lines.is_empty() { return 0; }
+    let mut rows = 0usize;
+    for i in (0..lines.len()).rev() {
+        let w = ansi_display_width(&lines[i]);
+        let line_rows = ((w + col_width - 1) / col_width).max(1);
+        if rows + line_rows > target_rows {
+            // Including this line would exceed the visible area — start one
+            // line later so the tail is never clipped at the bottom.
+            return i + 1;
+        }
+        rows += line_rows;
+    }
+    0
+}
+
 fn render_output(frame: &mut Frame, app: &App, area: Rect) {
     // Subtract 2 for top/bottom borders so the tail is truly visible.
     let visible = area.height.saturating_sub(2) as usize;
+    // Inner width for wrap calculation: area width minus left/right borders (2).
+    let col_width = area.width.saturating_sub(2) as usize;
 
     let content = if let Some(job) = app.selected_job() {
         let lines = app.job_display_output.get(&job.id).map(|v| v.as_slice()).unwrap_or(&[]);
-        let start = lines.len().saturating_sub(visible + app.output_scroll);
+        // `output_scroll` is in visual rows; find the logical-line start that
+        // places the tail at the bottom of the visible area.
+        let start = scroll_start(lines, visible + app.output_scroll, col_width);
         Text::from(lines[start..].iter().map(|l| ansi_line(l)).collect::<Vec<_>>())
     } else {
         Text::from(Line::from(Span::styled(

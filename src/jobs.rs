@@ -30,8 +30,6 @@ pub struct JobMetadata {
     pub cache_creation_tokens: Option<u64>,
     /// Cache read tokens
     pub cache_read_tokens: Option<u64>,
-    /// Calculated cost in USD
-    pub cost_usd: Option<f64>,
     /// Duration in milliseconds (from result event)
     pub duration_ms: Option<u64>,
     /// Claude session ID (from stream-json system/init), used for --resume in handoff loop
@@ -51,7 +49,6 @@ impl JobMetadata {
             output_tokens: None,
             cache_creation_tokens: None,
             cache_read_tokens: None,
-            cost_usd: None,
             duration_ms: None,
             session_id: None,
         }
@@ -82,6 +79,25 @@ impl JobMetadata {
         let json = serde_json::to_string_pretty(self)?;
         std::fs::write(self.metadata_path(), json)?;
         Ok(())
+    }
+
+    /// Loads a single job by full or prefix-matched ID.
+    pub fn load_by_id_prefix(prefix: &str) -> Option<Self> {
+        let jobs_dir = Config::base_dir().join("jobs");
+        let Ok(entries) = std::fs::read_dir(&jobs_dir) else { return None };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with(prefix) {
+                let meta_path = entry.path().join("metadata.json");
+                if let Ok(content) = std::fs::read_to_string(meta_path) {
+                    if let Ok(meta) = serde_json::from_str::<Self>(&content) {
+                        return Some(meta);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Loads all jobs from ~/.plan-executor/jobs/

@@ -51,6 +51,28 @@ pub enum Commands {
         #[arg(short = 'f', long)]
         follow: bool,
     },
+    /// Retry the handoff for a job whose sub-agents were never dispatched
+    Retry {
+        /// Job ID prefix (from `plan-executor jobs`)
+        job_id: String,
+    },
+}
+
+/// Prints a display line to the terminal, coloring plan-executor prefix lines
+/// the same way the TUI does (yellow prefix, red for failures; green ⏺ bullet).
+fn print_display_line(line: &str) {
+    if let Some(rest) = line.strip_prefix("⏺ [plan-executor]") {
+        let is_failure = rest.contains("failed");
+        if is_failure {
+            println!("\x1b[31m⏺ [plan-executor]{}\x1b[0m", rest);
+        } else {
+            println!("\x1b[33m⏺ [plan-executor]\x1b[0m{}", rest);
+        }
+    } else if let Some(rest) = line.strip_prefix("⏺") {
+        println!("\x1b[32m⏺\x1b[0m{}", rest);
+    } else {
+        println!("{}", line);
+    }
 }
 
 pub fn run() {
@@ -94,6 +116,7 @@ pub fn run() {
         Commands::Tui => rt.block_on(crate::tui::run_tui()),
         Commands::Status => rt.block_on(show_status()),
         Commands::Output { job_id, follow } => rt.block_on(output_job(job_id, follow)),
+        Commands::Retry { job_id } => rt.block_on(retry_job(job_id)),
         Commands::Stop | Commands::Jobs | Commands::Ensure
         | Commands::Kill { .. } | Commands::Pause { .. } | Commands::Unpause { .. } => unreachable!(),
     };
@@ -142,7 +165,7 @@ async fn output_job(job_id_prefix: String, follow: bool) -> Result<()> {
     if display_path.exists() {
         let content = std::fs::read_to_string(&display_path)?;
         for line in content.lines() {
-            println!("{}", line);
+            print_display_line(line);
         }
     }
 
@@ -159,7 +182,7 @@ async fn output_job(job_id_prefix: String, follow: bool) -> Result<()> {
                     serde_json::from_str::<DaemonEvent>(&line)
                 {
                     if jid == job_id {
-                        println!("{}", text);
+                        print_display_line(&text);
                     }
                 } else if let Ok(DaemonEvent::JobUpdated { job }) =
                     serde_json::from_str::<DaemonEvent>(&line)
@@ -173,6 +196,59 @@ async fn output_job(job_id_prefix: String, follow: bool) -> Result<()> {
                 }
             }
             None => break,
+        }
+    }
+    Ok(())
+}
+
+async fn retry_job(job_id_prefix: String) -> Result<()> {
+    use crate::ipc::{DaemonEvent, TuiRequest};
+    use crate::jobs::JobStatus;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    if !crate::ipc::socket_path().exists() {
+        anyhow::bail!("Daemon not running. Start with: plan-executor daemon");
+    }
+
+    // Resolve prefix → full job ID from history.
+    let job = crate::jobs::JobMetadata::load_by_id_prefix(&job_id_prefix)
+        .ok_or_else(|| anyhow::anyhow!("No job matching '{}'", job_id_prefix))?;
+    let job_id = job.id.clone();
+
+    println!("Retrying handoff for job {} ({})", &job_id[..job_id.len().min(8)],
+        job.plan_path.file_name().and_then(|n| n.to_str()).unwrap_or("?"));
+
+    let stream = UnixStream::connect(crate::ipc::socket_path()).await?;
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half).lines();
+
+    let req = serde_json::to_string(&TuiRequest::RetryHandoff { job_id: job_id.clone() })?;
+    write_half.write_all(format!("{}\n", req).as_bytes()).await?;
+
+    // Stream output until the job finishes.
+    loop {
+        let line = match reader.next_line().await? {
+            Some(l) => l,
+            None => break,
+        };
+        if let Ok(event) = serde_json::from_str::<DaemonEvent>(&line) {
+            match event {
+                DaemonEvent::JobDisplayLine { job_id: jid, line: text } if jid == job_id => {
+                    print_display_line(&text);
+                }
+                DaemonEvent::JobUpdated { job } if job.id == job_id
+                    && job.status != JobStatus::Running =>
+                {
+                    println!("\nJob finished: {:?}", job.status);
+                    break;
+                }
+                DaemonEvent::Error { message } => {
+                    eprintln!("Error: {}", message);
+                    break;
+                }
+                _ => {}
+            }
         }
     }
     Ok(())
@@ -290,8 +366,7 @@ async fn execute_via_daemon(plan: PathBuf, config: crate::config::Config) -> Res
                         || our_job_id.is_none();
                     if is_ours {
                         if our_job_id.is_none() { our_job_id = Some(job_id); }
-                        // ANSI codes from sjv render natively in the terminal.
-                        println!("{}", line);
+                        print_display_line(&line);
                     }
                 }
                 DaemonEvent::JobUpdated { job } => {
@@ -307,9 +382,6 @@ async fn execute_via_daemon(plan: PathBuf, config: crate::config::Config) -> Res
                         }
                         if let Some(ms) = job.duration_ms {
                             println!("║  Duration: {}s", ms / 1000);
-                        }
-                        if let Some(cost) = job.cost_usd {
-                            println!("║  Cost:     ${:.4}", cost);
                         }
                         println!("╚══════════════════════════════════════════════════════════════");
                         break;
@@ -409,17 +481,14 @@ fn list_jobs() {
     let plan_w = 34;
     let status_w = 9;
     let dur_w = 10;
-    let cost_w = 8;
 
     println!(
-        "{:<id_w$}  {:<plan_w$}  {:<status_w$}  {:>dur_w$}  {:>cost_w$}",
-        "ID", "PLAN", "STATUS", "DURATION", "COST",
-        id_w = id_w, plan_w = plan_w, status_w = status_w,
-        dur_w = dur_w, cost_w = cost_w,
+        "{:<id_w$}  {:<plan_w$}  {:<status_w$}  {:>dur_w$}",
+        "ID", "PLAN", "STATUS", "DURATION",
+        id_w = id_w, plan_w = plan_w, status_w = status_w, dur_w = dur_w,
     );
-    println!("{}", "─".repeat(id_w + 2 + plan_w + 2 + status_w + 2 + dur_w + 2 + cost_w));
+    println!("{}", "─".repeat(id_w + 2 + plan_w + 2 + status_w + 2 + dur_w));
 
-    // Show pending (READY) plans first.
     for p in &pending {
         let plan = std::path::Path::new(&p.plan_path)
             .file_name().and_then(|n| n.to_str()).unwrap_or(&p.plan_path);
@@ -429,46 +498,33 @@ fn list_jobs() {
             plan.to_string()
         };
         println!(
-            "{:<id_w$}  {:<plan_w$}  {:<status_w$}  {:>dur_w$}  {:>cost_w$}",
-            "-", plan_truncated, "ready", "-", "-",
-            id_w = id_w, plan_w = plan_w, status_w = status_w,
-            dur_w = dur_w, cost_w = cost_w,
+            "{:<id_w$}  {:<plan_w$}  {:<status_w$}  {:>dur_w$}",
+            "-", plan_truncated, "ready", "-",
+            id_w = id_w, plan_w = plan_w, status_w = status_w, dur_w = dur_w,
         );
     }
 
     for job in &jobs {
         let id = &job.id[..job.id.len().min(6)];
-
-        let plan = job.plan_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("?");
+        let plan = job.plan_path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
         let plan_truncated = if plan.len() > plan_w {
             format!("{}…", &plan[..plan_w - 1])
         } else {
             plan.to_string()
         };
-
         let status = match job.status {
             JobStatus::Success => "success",
             JobStatus::Failed  => "failed",
             JobStatus::Killed  => "killed",
             JobStatus::Running => "running",
         };
-
         let duration = job.duration_ms
             .map(|ms| format!("{}s", ms / 1000))
             .unwrap_or_else(|| "-".to_string());
-
-        let cost = job.cost_usd
-            .map(|c| format!("${:.4}", c))
-            .unwrap_or_else(|| "-".to_string());
-
         println!(
-            "{:<id_w$}  {:<plan_w$}  {:<status_w$}  {:>dur_w$}  {:>cost_w$}",
-            id, plan_truncated, status, duration, cost,
-            id_w = id_w, plan_w = plan_w, status_w = status_w,
-            dur_w = dur_w, cost_w = cost_w,
+            "{:<id_w$}  {:<plan_w$}  {:<status_w$}  {:>dur_w$}",
+            id, plan_truncated, status, duration,
+            id_w = id_w, plan_w = plan_w, status_w = status_w, dur_w = dur_w,
         );
     }
 }

@@ -25,6 +25,8 @@ pub enum TuiRequest {
     ResumeJob { job_id: String },
     /// Request full state snapshot
     GetState,
+    /// Retry the handoff for a job whose sub-agents were never dispatched
+    RetryHandoff { job_id: String },
 }
 
 /// Messages sent from Daemon → TUI

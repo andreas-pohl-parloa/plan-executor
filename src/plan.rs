@@ -41,6 +41,16 @@ pub fn parse_plan_status(path: &Path) -> Result<PlanStatus> {
     Ok(PlanStatus::Unknown("missing".to_string()))
 }
 
+/// Returns true if the plan file has `**non-interactive:** [x]` (checked).
+/// The check is case-insensitive for the checkbox marker.
+pub fn is_non_interactive(path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else { return false };
+    content.lines().any(|line| {
+        let l = line.trim();
+        l.starts_with("**non-interactive:**") && l.contains("[x]")
+    })
+}
+
 // Directories that are never worth descending into when scanning for plans.
 const SKIP_DIRS: &[&str] = &[
     "target", "node_modules", ".git", ".hg", ".svn",
@@ -123,14 +133,16 @@ fn scan_recursive(base_dir: &Path, sub_pattern: &str) -> Vec<PathBuf> {
     results
 }
 
-/// Scans all watch_dirs with all patterns and returns READY plan files.
+/// Scans all watch_dirs with all patterns and returns READY non-interactive plan files.
+/// A plan qualifies only when it has both `**Status:** READY` and
+/// `**non-interactive:** [x]` set in its header.
 pub fn find_ready_plans(watch_dirs: &[PathBuf], patterns: &[String]) -> Vec<PlanFile> {
     let mut results = Vec::new();
     for dir in watch_dirs {
         for pattern in patterns {
             for path in scan_for_plans(dir, pattern) {
                 if let Ok(status) = parse_plan_status(&path) {
-                    if status == PlanStatus::Ready {
+                    if status == PlanStatus::Ready && is_non_interactive(&path) {
                         results.push(PlanFile { path, status });
                     }
                 }

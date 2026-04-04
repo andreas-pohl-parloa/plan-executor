@@ -21,14 +21,11 @@ pub fn notify_plan_ready(plan_path: &str, auto_execute: bool) -> Result<()> {
 }
 
 /// Sends a macOS notification that a plan execution completed.
-pub fn notify_execution_complete(plan_path: &str, success: bool, cost_usd: Option<f64>) -> Result<()> {
+pub fn notify_execution_complete(plan_path: &str, success: bool) -> Result<()> {
     let filename = std::path::Path::new(plan_path)
         .file_name().and_then(|n| n.to_str()).unwrap_or(plan_path);
-
     let status = if success { "succeeded" } else { "failed" };
-    let cost_str = cost_usd.map(|c| format!(" (${:.4})", c)).unwrap_or_default();
-
-    send(&format!("Plan {}", status), &format!("{}{}", filename, cost_str))?;
+    send(&format!("Plan {}", status), filename)?;
     Ok(())
 }
 

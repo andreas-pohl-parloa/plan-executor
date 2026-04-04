@@ -7,7 +7,6 @@ mod ipc;
 mod jobs;
 mod notifications;
 mod plan;
-mod pricing;
 mod tui;
 mod watcher;
 

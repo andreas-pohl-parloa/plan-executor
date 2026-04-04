@@ -135,6 +135,7 @@ async fn run_loop(
                             app::Tab::History => app::Tab::Running,
                         };
                         app.selected = 0;
+                        app.output_scroll = 0;
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         let max = match app.current_tab {
@@ -142,9 +143,11 @@ async fn run_loop(
                             app::Tab::History => app.history.len(),
                         }.saturating_sub(1);
                         app.selected = (app.selected + 1).min(max);
+                        app.output_scroll = 0;
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
                         app.selected = app.selected.saturating_sub(1);
+                        app.output_scroll = 0;
                     }
                     KeyCode::Enter | KeyCode::Char('e') => {
                         if let Some(pending) = app.pending_plans.get(app.selected) {
@@ -194,6 +197,18 @@ async fn run_loop(
                                 let _ = app.daemon_tx.send(TuiRequest::ResumeJob {
                                     job_id: job.id.clone(),
                                 }).await;
+                            }
+                        }
+                    }
+                    KeyCode::Char('R') => {
+                        if app.current_tab == app::Tab::History {
+                            if let Some(job) = app.history.get(app.selected) {
+                                let _ = app.daemon_tx.send(TuiRequest::RetryHandoff {
+                                    job_id: job.id.clone(),
+                                }).await;
+                                // Switch to Running tab so output is immediately visible.
+                                app.current_tab = app::Tab::Running;
+                                app.selected = 0;
                             }
                         }
                     }

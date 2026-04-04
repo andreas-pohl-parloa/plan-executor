@@ -21,6 +21,10 @@ pub struct Handoff {
     pub index: usize,
     pub agent_type: AgentType,
     pub prompt_file: PathBuf,
+    /// `canFail: true` in state file / `can-fail: true` on handoff line.
+    /// A can-fail agent that exits non-zero does NOT fail the job; its slot
+    /// receives an error-annotated block so the batch stays structurally complete.
+    pub can_fail: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +39,8 @@ pub struct HandoffResult {
     pub stdout: String,
     pub stderr: String,
     pub success: bool,
+    /// Mirrors `Handoff::can_fail` so callers can decide whether to propagate failures.
+    pub can_fail: bool,
 }
 
 // ── State file deserialization ─────────────────────────────────────────────
@@ -53,6 +59,9 @@ struct RawHandoff {
     /// snake_case (actual) or camelCase alias (spec)
     #[serde(alias = "promptFile")]
     prompt_file: String,
+    /// Protocol §3/§5: `canFail: true` marks this agent as optional.
+    #[serde(rename = "canFail", alias = "can_fail", default)]
+    can_fail: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -94,13 +103,12 @@ pub fn load_state(state_file: &Path) -> Result<HandoffState> {
         raw.handoffs
     };
 
-    let handoffs = raw_handoffs
+    let mut handoffs: Vec<Handoff> = raw_handoffs
         .into_iter()
         .map(|h| {
             let agent_type = match h.agent_type.as_str() {
                 "codex"  => AgentType::Codex,
                 "gemini" => AgentType::Gemini,
-                // "claude" or absent → Claude
                 other => {
                     if !other.is_empty() && other != "claude" {
                         tracing::warn!("unknown agent-type '{}', defaulting to claude", other);
@@ -110,9 +118,37 @@ pub fn load_state(state_file: &Path) -> Result<HandoffState> {
             };
             let pf = PathBuf::from(&h.prompt_file);
             let prompt_file = if pf.is_absolute() { pf } else { base_dir.join(pf) };
-            Handoff { index: h.index, agent_type, prompt_file }
+            Handoff { index: h.index, agent_type, prompt_file, can_fail: h.can_fail }
         })
         .collect();
+
+    // If the state file listed no handoffs, auto-detect from co-located
+    // `.tmp-subtask-*.md` prompt files. Some skill phases (e.g. code_review)
+    // omit the handoffs array and rely on named prompt files instead.
+    if handoffs.is_empty() {
+        let mut detected: Vec<Handoff> = std::fs::read_dir(base_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if !name.starts_with(".tmp-subtask-") || !name.ends_with(".md") {
+                    return None;
+                }
+                let agent_type = if name.ends_with("-claude.md") { AgentType::Claude }
+                    else if name.ends_with("-codex.md")  { AgentType::Codex  }
+                    else if name.ends_with("-gemini.md") { AgentType::Gemini }
+                    else { AgentType::Claude };
+                Some(Handoff { index: 0, agent_type, prompt_file: e.path(), can_fail: false })
+            })
+            .collect();
+        detected.sort_by_key(|h| h.prompt_file.clone());
+        for (i, h) in detected.iter_mut().enumerate() { h.index = i + 1; }
+        if !detected.is_empty() {
+            tracing::info!("auto-detected {} prompt file(s) for phase '{}'", detected.len(), phase);
+        }
+        handoffs = detected;
+    }
 
     Ok(HandoffState { phase, handoffs })
 }
@@ -121,6 +157,7 @@ pub fn load_state(state_file: &Path) -> Result<HandoffState> {
 
 async fn dispatch_agent(handoff: Handoff, cmd: String) -> (HandoffResult, u32) {
     let path = handoff.prompt_file.to_string_lossy().into_owned();
+    let can_fail = handoff.can_fail;
 
     // Verify the prompt file exists before attempting to dispatch.
     if !handoff.prompt_file.exists() {
@@ -129,6 +166,7 @@ async fn dispatch_agent(handoff: Handoff, cmd: String) -> (HandoffResult, u32) {
             stdout: String::new(),
             stderr: format!("prompt file not found: {}", path),
             success: false,
+            can_fail,
         }, 0);
     }
 
@@ -152,6 +190,7 @@ async fn dispatch_agent(handoff: Handoff, cmd: String) -> (HandoffResult, u32) {
             stdout: String::new(),
             stderr: format!("failed to spawn agent: {}", e),
             success: false,
+            can_fail,
         }, 0),
     };
 
@@ -165,12 +204,14 @@ async fn dispatch_agent(handoff: Handoff, cmd: String) -> (HandoffResult, u32) {
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             success: out.status.success(),
+            can_fail,
         },
         Err(e) => HandoffResult {
             index: handoff.index,
             stdout: String::new(),
             stderr: format!("failed waiting for agent: {}", e),
             success: false,
+            can_fail,
         },
     };
     (result, pgid)
@@ -214,7 +255,19 @@ pub fn build_continuation(results: &[HandoffResult]) -> String {
     sorted.sort_by_key(|r| r.index);
     let mut out = String::new();
     for r in &sorted {
-        out.push_str(&format!("# output sub-agent {}:\n{}\n\n", r.index, r.stdout));
+        let body = if r.success {
+            r.stdout.clone()
+        } else {
+            // §7 can-fail: inject error-annotated block to keep batch structurally complete.
+            let stderr_summary = r.stderr.lines()
+                .filter(|l| !l.trim().is_empty())
+                .take(3)
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!("[SKIPPED — agent exited non-zero. stderr: {}]",
+                if stderr_summary.is_empty() { "(none)".to_string() } else { stderr_summary })
+        };
+        out.push_str(&format!("# output sub-agent {}:\n{}\n\n", r.index, body));
     }
     out.trim_end().to_string()
 }
@@ -267,7 +320,6 @@ pub async fn resume_execution(
         let mut reader = tokio::io::BufReader::new(stdout).lines();
         let mut resumed_session_id = session_id_owned.clone();
         let mut resumed_model: Option<String> = None;
-        let mut resumed_cost: Option<f64> = None;
         let mut resumed_duration_ms: Option<u64> = None;
         let mut resumed_input_tokens: Option<u64> = None;
         let mut resumed_output_tokens: Option<u64> = None;
@@ -289,6 +341,8 @@ pub async fn resume_execution(
             None
         };
 
+        let mut last_display_blank = false;
+        let mut saw_handoff_call = false;
         while let Ok(Some(line)) = reader.next_line().await {
             // Append raw line to output file (same as initial turn).
             if let Some(ref mut f) = out_file {
@@ -297,6 +351,14 @@ pub async fn resume_execution(
             // Emit sjv-rendered display line (same as initial turn).
             let rendered = sjv::render_runtime_line(&line, false, true);
             for display_line in rendered.lines().filter(|l| !l.is_empty()) {
+                let is_blank = crate::executor::is_visually_blank(display_line);
+                if is_blank && last_display_blank {
+                    continue;
+                }
+                last_display_blank = is_blank;
+                if display_line.contains("call sub-agent") {
+                    saw_handoff_call = true;
+                }
                 if let Some(ref mut f) = disp_file {
                     let _ = f.write_all(format!("{}\n", display_line).as_bytes()).await;
                 }
@@ -316,9 +378,6 @@ pub async fn resume_execution(
                     }
                     Some("result") => {
                         got_result = true;
-                        if let Some(c) = ev.get("total_cost_usd").and_then(|c| c.as_f64()) {
-                            resumed_cost = Some(c);
-                        }
                         if let Some(d) = ev.get("duration_ms").and_then(|d| d.as_u64()) {
                             resumed_duration_ms = Some(d);
                         }
@@ -335,14 +394,20 @@ pub async fn resume_execution(
             }
         }
 
-        // Check for another handoff pause
-        let state_file = execution_root.join(".tmp-execute-plan-state.json");
-        if state_file.exists() {
+        // Check for another handoff pause (check repo root AND worktree paths).
+        if let Some(state_file) = crate::executor::find_state_file(&execution_root) {
             let _ = tx.send(ExecEvent::HandoffRequired {
                 session_id: resumed_session_id,
                 state_file,
             }).await;
             return;
+        } else if saw_handoff_call {
+            let err = "⏺ [plan-executor] handoff protocol error: agent requested sub-agent calls but did not write the state file (.tmp-execute-plan-state.json)";
+            if let Some(ref mut f) = disp_file {
+                let _ = f.write_all(format!("{}\n", err).as_bytes()).await;
+            }
+            let _ = tx.send(ExecEvent::DisplayLine(err.to_string())).await;
+            resumed_failed = true;
         }
 
         // Execution complete
@@ -365,13 +430,17 @@ pub async fn resume_execution(
         };
         placeholder.session_id = Some(session_id_owned);
         placeholder.model = resumed_model;
-        placeholder.cost_usd = resumed_cost;
         placeholder.duration_ms = resumed_duration_ms;
         placeholder.input_tokens = resumed_input_tokens;
         placeholder.output_tokens = resumed_output_tokens;
         // No result event = process crashed or was killed before finishing.
         if !got_result {
             resumed_failed = true;
+            let err = "⏺ [plan-executor] resume exited without a result event — process crashed or was killed";
+            if let Some(ref mut f) = disp_file {
+                let _ = f.write_all(format!("{}\n", err).as_bytes()).await;
+            }
+            let _ = tx.send(ExecEvent::DisplayLine(err.to_string())).await;
         }
         placeholder.status = if resumed_failed { JobStatus::Failed } else { JobStatus::Success };
         placeholder.finished_at = Some(chrono::Utc::now());
