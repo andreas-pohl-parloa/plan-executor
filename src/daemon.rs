@@ -335,14 +335,20 @@ pub async fn retry_handoff_from_state(
     let job = match crate::jobs::JobMetadata::load_by_id_prefix(&job_id) {
         Some(j) => j,
         None => {
-            tracing::error!("retry: job not found: {}", job_id);
+            let msg = format!("retry: job not found: {}", job_id);
+            tracing::error!("{}", msg);
+            let st = state.lock().await;
+            let _ = st.event_tx.send(crate::ipc::DaemonEvent::Error { message: msg });
             return;
         }
     };
     let session_id = match job.session_id.clone() {
         Some(s) => s,
         None => {
-            tracing::error!("retry: no session_id for job {}", job_id);
+            let msg = format!("retry: job {} has no session_id — cannot resume", job_id);
+            tracing::error!("{}", msg);
+            let st = state.lock().await;
+            let _ = st.event_tx.send(crate::ipc::DaemonEvent::Error { message: msg });
             return;
         }
     };

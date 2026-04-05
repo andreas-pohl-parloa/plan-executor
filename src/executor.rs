@@ -76,7 +76,10 @@ pub fn find_state_file(execution_root: &PathBuf) -> Option<PathBuf> {
         }
     }
     // Worktree placement: <repo>/.my/worktrees/*/<state-file>
+    // Collect ALL matching state files across all worktrees to avoid non-deterministic
+    // selection when multiple concurrent plans run in different worktrees of the same repo.
     let worktrees = execution_root.join(".my").join("worktrees");
+    let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&worktrees) {
         for entry in entries.flatten() {
             if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -85,12 +88,25 @@ pub fn find_state_file(execution_root: &PathBuf) -> Option<PathBuf> {
             for name in STATE_FILE_NAMES {
                 let candidate = entry.path().join(name);
                 if candidate.exists() {
-                    return Some(candidate);
+                    candidates.push(candidate);
+                    break; // highest-priority name wins for this worktree
                 }
             }
         }
     }
-    None
+    match candidates.len() {
+        1 => candidates.into_iter().next(),
+        0 => None,
+        n => {
+            tracing::warn!(
+                "find_state_file: {} worktrees have a state file — ambiguous, returning None. \
+                 Candidates: {:?}",
+                n,
+                candidates
+            );
+            None
+        }
+    }
 }
 
 /// Spawns claude and returns a child handle and an event receiver.
