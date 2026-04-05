@@ -1,5 +1,6 @@
 //! TUI rendering logic.
 use chrono::Utc;
+use unicode_width::UnicodeWidthStr;
 use std::path::Path;
 use ratatui::{
     Frame,
@@ -286,22 +287,32 @@ fn ansi_line(s: &str) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Returns the number of visible characters in a string, stripping ANSI escape codes.
+/// Returns the display width of a string in terminal columns, stripping ANSI escape codes.
+/// Wide characters (CJK, emoji) count as 2 columns each.
 fn ansi_display_width(s: &str) -> usize {
     let bytes = s.as_bytes();
-    let mut width = 0usize;
+    let mut plain = String::with_capacity(s.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            // Skip the CSI escape sequence up to and including the 'm' terminator.
             let mut j = i + 2;
             while j < bytes.len() && bytes[j] != b'm' { j += 1; }
             i = j + 1;
         } else {
-            if bytes[i] & 0xC0 != 0x80 { width += 1; } // count non-continuation UTF-8 bytes
-            i += 1;
+            // Determine the byte length of the current UTF-8 code point and append it.
+            let ch_len = if bytes[i] & 0x80 == 0 { 1 }
+                else if bytes[i] & 0xE0 == 0xC0 { 2 }
+                else if bytes[i] & 0xF0 == 0xE0 { 3 }
+                else { 4 };
+            let end = (i + ch_len).min(bytes.len());
+            if let Ok(ch) = std::str::from_utf8(&bytes[i..end]) {
+                plain.push_str(ch);
+            }
+            i = end;
         }
     }
-    width
+    UnicodeWidthStr::width(plain.as_str())
 }
 
 /// Finds the start index in `lines` such that the slice `lines[start..]`

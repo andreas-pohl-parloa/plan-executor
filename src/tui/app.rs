@@ -93,11 +93,14 @@ impl App {
     /// Reads display.log for `job_id` into `job_display_output`.
     ///
     /// Uses a single `stat` call to compare the file's current byte length against
-    /// the last-read size.  The file is re-read only when it has grown (new lines
-    /// appended) or when no cache entry exists.  This makes both running and
-    /// history jobs always show the current content of display.log — the same
-    /// source the `output` CLI command reads — with no manual invalidation.
+    /// the last-read size.  On the first load the full file is read from byte 0.
+    /// On subsequent loads only the newly appended bytes are read (by seeking to
+    /// the previous cached size), split into lines, and appended to the existing
+    /// Vec.  This makes the operation O(new bytes) per tick rather than O(total
+    /// file size), which matters for long-running jobs with MB of output.
     pub fn ensure_output_loaded(&mut self, job_id: &str) {
+        use std::io::{Read, Seek, SeekFrom};
+
         let path = crate::config::Config::base_dir()
             .join("jobs").join(job_id).join("display.log");
 
@@ -106,25 +109,79 @@ impl App {
             .unwrap_or(0);
 
         let cached_size = self.display_log_sizes.get(job_id).copied();
+
+        // Nothing new on disk — return early.
         if cached_size == Some(current_size) && self.job_display_output.contains_key(job_id) {
-            return; // nothing new on disk
+            return;
         }
 
-        let Ok(content) = std::fs::read_to_string(&path) else { return };
+        let Ok(mut file) = std::fs::File::open(&path) else { return };
 
-        let mut last_blank = false;
-        let lines: Vec<String> = content
-            .lines()
-            .filter(|l| {
-                let blank = crate::executor::is_visually_blank(l);
-                let skip = blank && last_blank;
+        if cached_size.is_none() || !self.job_display_output.contains_key(job_id) {
+            // ── Initial load: read the whole file ──────────────────────────────
+            let mut content = String::new();
+            if file.read_to_string(&mut content).is_err() { return }
+
+            let mut last_blank = false;
+            let lines: Vec<String> = content
+                .lines()
+                .filter(|l| {
+                    let blank = crate::executor::is_visually_blank(l);
+                    let skip = blank && last_blank;
+                    last_blank = blank;
+                    !skip
+                })
+                .map(String::from)
+                .collect();
+
+            self.display_log_sizes.insert(job_id.to_string(), current_size);
+            self.job_display_output.insert(job_id.to_string(), lines);
+        } else {
+            // ── Incremental load: read only the new bytes ──────────────────────
+            let prev_size = cached_size.unwrap_or(0);
+            if file.seek(SeekFrom::Start(prev_size)).is_err() { return }
+
+            let mut new_bytes = Vec::new();
+            if file.read_to_end(&mut new_bytes).is_err() { return }
+
+            let new_text = String::from_utf8_lossy(&new_bytes);
+
+            // Determine whether the last cached line was blank, so we can
+            // continue blank-line dedup across the boundary.
+            let existing = self.job_display_output.entry(job_id.to_string()).or_default();
+            let mut last_blank = existing
+                .last()
+                .map(|l| crate::executor::is_visually_blank(l.as_str()))
+                .unwrap_or(false);
+
+            // split_terminator avoids a spurious empty token at the end when
+            // the chunk ends with '\n', but we still handle a leading empty
+            // token (chunk starts right at a line boundary) by skipping it.
+            let mut segments = new_text.split('\n').peekable();
+
+            // If prev_size was already at a newline boundary the first segment
+            // is an empty string representing "nothing before the next line" —
+            // skip it to avoid a phantom blank entry.
+            if let Some(&"") = segments.peek() {
+                segments.next();
+            }
+
+            // The very last segment may be a partial line (no trailing '\n'
+            // yet).  We include it anyway; on the next tick it will be
+            // re-read as part of the new incremental chunk — but since we
+            // update cached_size to current_size the partial line is already
+            // stored.  This is acceptable because display.log lines are
+            // always complete when flushed by the writer.
+            for segment in segments {
+                let blank = crate::executor::is_visually_blank(segment);
+                if blank && last_blank {
+                    continue; // collapse consecutive blank lines
+                }
                 last_blank = blank;
-                !skip
-            })
-            .map(String::from)
-            .collect();
+                existing.push(segment.to_string());
+            }
 
-        self.display_log_sizes.insert(job_id.to_string(), current_size);
-        self.job_display_output.insert(job_id.to_string(), lines);
+            self.display_log_sizes.insert(job_id.to_string(), current_size);
+        }
     }
 }

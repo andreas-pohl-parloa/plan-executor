@@ -559,15 +559,22 @@ fn stop_daemon() {
         }
     };
 
-    match std::process::Command::new("kill").arg(&pid).status() {
-        Ok(s) if s.success() => {
-            let _ = std::fs::remove_file(&pid_path);
-            println!("Daemon stopped (pid={}).", pid);
-        }
-        _ => {
-            eprintln!("Failed to stop daemon (pid={}). It may have already exited.", pid);
+    let pid: u32 = match pid.trim().parse() {
+        Ok(n) => n,
+        Err(_) => {
+            eprintln!("Invalid PID in pid file: {:?}", pid);
             std::process::exit(1);
         }
+    };
+
+    // Safety: pid > 0 guaranteed by parse into u32; we only send SIGTERM.
+    let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if ret == 0 {
+        let _ = std::fs::remove_file(&pid_path);
+        println!("Daemon stopped (pid={}).", pid);
+    } else {
+        eprintln!("Failed to stop daemon (pid={}). It may have already exited.", pid);
+        std::process::exit(1);
     }
 }
 

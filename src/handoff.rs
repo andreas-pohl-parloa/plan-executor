@@ -105,7 +105,7 @@ pub fn load_state(state_file: &Path) -> Result<HandoffState> {
 
     let mut handoffs: Vec<Handoff> = raw_handoffs
         .into_iter()
-        .map(|h| {
+        .filter_map(|h| {
             let agent_type = match h.agent_type.as_str() {
                 "codex"  => AgentType::Codex,
                 "gemini" => AgentType::Gemini,
@@ -117,8 +117,19 @@ pub fn load_state(state_file: &Path) -> Result<HandoffState> {
                 }
             };
             let pf = PathBuf::from(&h.prompt_file);
-            let prompt_file = if pf.is_absolute() { pf } else { base_dir.join(pf) };
-            Handoff { index: h.index, agent_type, prompt_file, can_fail: h.can_fail }
+            if pf.is_absolute() {
+                tracing::warn!("load_state: rejecting absolute prompt_file path: {}", pf.display());
+                return None;
+            }
+            let prompt_file = base_dir.join(&pf);
+            // Verify the resolved path stays within base_dir
+            let canonical = prompt_file.canonicalize().unwrap_or_else(|_| prompt_file.clone());
+            let canonical_base = base_dir.canonicalize().unwrap_or_else(|_| base_dir.to_path_buf());
+            if !canonical.starts_with(&canonical_base) {
+                tracing::warn!("load_state: rejecting prompt_file that escapes base_dir: {}", canonical.display());
+                return None;
+            }
+            Some(Handoff { index: h.index, agent_type, prompt_file, can_fail: h.can_fail })
         })
         .collect();
 
@@ -142,7 +153,17 @@ pub fn load_state(state_file: &Path) -> Result<HandoffState> {
                 Some(Handoff { index: 0, agent_type, prompt_file: e.path(), can_fail: false })
             })
             .collect();
-        detected.sort_by_key(|h| h.prompt_file.clone());
+        detected.sort_by(|a, b| {
+            fn numeric_suffix(p: &std::path::PathBuf) -> u64 {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).filter(|p| !p.is_empty()).last())
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0)
+            }
+            numeric_suffix(&a.prompt_file).cmp(&numeric_suffix(&b.prompt_file))
+                .then_with(|| a.prompt_file.cmp(&b.prompt_file))
+        });
         for (i, h) in detected.iter_mut().enumerate() { h.index = i + 1; }
         if !detected.is_empty() {
             tracing::info!("auto-detected {} prompt file(s) for phase '{}'", detected.len(), phase);
@@ -259,6 +280,7 @@ pub fn build_continuation(results: &[HandoffResult]) -> String {
             r.stdout.clone()
         } else {
             // §7 can-fail: inject error-annotated block to keep batch structurally complete.
+            debug_assert!(r.can_fail, "build_continuation called with failed required agent (index={})", r.index);
             let stderr_summary = r.stderr.lines()
                 .filter(|l| !l.trim().is_empty())
                 .take(3)
