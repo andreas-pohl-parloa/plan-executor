@@ -72,7 +72,11 @@ jobs:
 
       - name: Update Cargo.lock
         if: steps.version.outputs.skipped == 'false'
-        run: cargo update -p plan-executor
+        run: |
+          # Only update the workspace package version in the lock file.
+          # Use sed to directly patch the version rather than cargo update
+          # which may re-resolve dependencies differently on Linux vs macOS.
+          sed -i "s/^version = \"0\.[0-9]*\.[0-9]*\"/version = \"${{ steps.version.outputs.version }}\"/" Cargo.lock
 
       - name: Generate changelog
         if: steps.version.outputs.skipped == 'false'
@@ -167,7 +171,7 @@ jobs:
           echo "--- build verbose ---"
 
       - name: Build release binary
-        run: cargo build --release -vv 2>&1 | tail -100
+        run: cargo build --release
 
       - name: Package
         run: zip -j plan-executor-linux-x86_64.zip target/release/plan-executor
