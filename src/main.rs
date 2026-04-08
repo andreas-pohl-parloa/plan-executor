@@ -4,6 +4,7 @@ mod daemon;
 mod executor;
 mod handoff;
 mod ipc;
+mod remote;
 mod jobs;
 mod notifications;
 mod plan;
