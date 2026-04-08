@@ -149,15 +149,17 @@ jobs:
           token: ${{ secrets.GH_PAT }}
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
 
       - name: Build release binary
-        run: cargo build --release --locked --bin plan-executor
+        run: cargo build --release --locked --bin plan-executor --target x86_64-unknown-linux-gnu
 
       - name: Package
-        run: zip -j plan-executor-linux-x86_64.zip target/release/plan-executor
+        run: zip -j plan-executor-linux-x86_64.zip target/x86_64-unknown-linux-gnu/release/plan-executor
 
       - name: Attach to release
         uses: softprops/action-gh-release@v2
