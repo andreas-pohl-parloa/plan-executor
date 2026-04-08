@@ -259,10 +259,6 @@ async fn retry_job(job_id_prefix: String) -> Result<()> {
 }
 
 async fn execute_plan(plan_path: String, config: crate::config::Config) -> Result<()> {
-    if !crate::ipc::socket_path().exists() {
-        anyhow::bail!("Daemon not running. Start with: plan-executor daemon");
-    }
-
     // If the argument looks like a job ID prefix, resolve it to a plan path.
     let resolved_path = resolve_plan_path(&plan_path);
 
@@ -273,11 +269,15 @@ async fn execute_plan(plan_path: String, config: crate::config::Config) -> Resul
         anyhow::bail!("Plan file not found: {}", resolved_path);
     }
 
-    // Check execution mode
+    // Remote plans don't need the daemon — trigger directly.
     if crate::plan::parse_execution_mode(&plan) == crate::plan::ExecutionMode::Remote {
         return trigger_remote(plan, config).await;
     }
 
+    // Local execution requires the daemon.
+    if !crate::ipc::socket_path().exists() {
+        anyhow::bail!("Daemon not running. Start with: plan-executor daemon");
+    }
     execute_via_daemon(plan, config).await
 }
 
@@ -292,7 +292,9 @@ async fn trigger_remote(plan: PathBuf, config: crate::config::Config) -> Result<
         .unwrap_or("plan.md")
         .to_string();
 
-    let (target_repo, target_ref, target_branch) = crate::remote::gather_git_context()?;
+    let repo_root = find_repo_root(&plan)
+        .ok_or_else(|| anyhow::anyhow!("could not find git repo root for {}", plan.display()))?;
+    let (target_repo, target_ref, target_branch) = crate::remote::gather_git_context(&repo_root)?;
     let started_at = chrono::Utc::now().to_rfc3339();
 
     let meta = crate::remote::ExecutionMetadata {
