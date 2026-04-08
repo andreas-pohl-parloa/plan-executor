@@ -254,7 +254,7 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<String> {
         .arg(dir)
         .args(args)
         .output()
-        .context("failed to run git")?;
+        .map_err(|e| anyhow::anyhow!("failed to run git: {e}"))?;
     if !output.status.success() {
         anyhow::bail!(
             "git {} failed: {}",
@@ -269,7 +269,7 @@ fn run_gh(args: &[&str]) -> Result<String> {
     let output = std::process::Command::new("gh")
         .args(args)
         .output()
-        .context("failed to run gh — is the GitHub CLI installed and authenticated?")?;
+        .map_err(|e| anyhow::anyhow!("failed to run gh: {e}"))?;
     if !output.status.success() {
         anyhow::bail!(
             "gh {} failed: {}",
@@ -316,7 +316,7 @@ pub fn gh_secret_set_stdin(name: &str, repo: &str, value: &str) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .context("failed to run gh")?;
+        .map_err(|e| anyhow::anyhow!("failed to run gh: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(value.as_bytes())?;
     }
