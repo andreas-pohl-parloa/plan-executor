@@ -29,6 +29,7 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
+          token: ${{ secrets.GH_PAT }}
 
       - name: git config
         run: |
@@ -115,6 +116,7 @@ jobs:
         with:
           ref: ${{ needs.release.outputs.tag }}
           submodules: recursive
+          token: ${{ secrets.GH_PAT }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -144,6 +146,7 @@ jobs:
         with:
           ref: ${{ needs.release.outputs.tag }}
           submodules: recursive
+          token: ${{ secrets.GH_PAT }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -176,6 +179,7 @@ jobs:
         with:
           ref: ${{ needs.release.outputs.tag }}
           submodules: recursive
+          token: ${{ secrets.GH_PAT }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
