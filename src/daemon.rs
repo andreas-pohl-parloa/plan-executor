@@ -1,4 +1,4 @@
-use libc;
+
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -300,8 +300,8 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
             let result = std::process::Command::new("git")
                 .args(["-C", &parent_dir, "remote", "get-url", "origin"])
                 .output();
-            if let Ok(output) = result {
-                if output.status.success() {
+            if let Ok(output) = result
+                && output.status.success() {
                     let origin = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     let head = std::process::Command::new("git")
                         .args(["-C", &parent_dir, "rev-parse", "HEAD"])
@@ -336,7 +336,6 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                     let _ = st.event_tx.send(event);
                     return;
                 }
-            }
             tracing::error!(plan = %plan_path, "remote execution: could not determine git origin");
         } else {
             tracing::error!("remote execution: remote_repo not configured");
@@ -757,8 +756,8 @@ async fn run_exec_event_loop(
     // Clean up job if it never finished (resume failure or channel closed)
     {
         let mut st = state.lock().await;
-        if let Some(mut job) = st.running_jobs.remove(&job_id) {
-            if job.status == JobStatus::Running {
+        if let Some(mut job) = st.running_jobs.remove(&job_id)
+            && job.status == JobStatus::Running {
                 job.status = JobStatus::Failed;
                 job.finished_at = Some(chrono::Utc::now());
                 let _ = job.save();
@@ -770,7 +769,6 @@ async fn run_exec_event_loop(
                 st.job_display_output.remove(&job_id);
                 let _ = st.event_tx.send(DaemonEvent::JobUpdated { job });
             }
-        }
     }
 }
 
@@ -821,11 +819,10 @@ async fn handle_tui_client(
             }
             // Outgoing daemon event
             Ok(event) = event_rx.recv() => {
-                if let Ok(json) = serde_json::to_string(&event) {
-                    if write_half.write_all(format!("{}\n", json).as_bytes()).await.is_err() {
+                if let Ok(json) = serde_json::to_string(&event)
+                    && write_half.write_all(format!("{}\n", json).as_bytes()).await.is_err() {
                         break;
                     }
-                }
             }
         }
     }
@@ -859,12 +856,11 @@ async fn handle_tui_request(
             let mut st = state.lock().await;
 
             // Kill the main agent's process group
-            if let Some(pgid) = st.process_group_ids.remove(&job_id) {
-                if pgid > 0 {
+            if let Some(pgid) = st.process_group_ids.remove(&job_id)
+                && pgid > 0 {
                     #[cfg(unix)]
                     unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL); }
                 }
-            }
             // Kill any active handoff sub-agent process groups
             if let Some(pgids) = st.sub_agent_pgids.remove(&job_id) {
                 for pgid in pgids {

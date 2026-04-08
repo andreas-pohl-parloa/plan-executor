@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
@@ -67,7 +67,7 @@ const STATE_FILE_NAMES: &[&str] = &[
 /// Finds a handoff state file in either the repo root (non-worktree case) or
 /// inside any `.my/worktrees/<slug>/` subdirectory (worktree case).
 /// Checks all known state file names in priority order.
-pub fn find_state_file(execution_root: &PathBuf) -> Option<PathBuf> {
+pub fn find_state_file(execution_root: &Path) -> Option<PathBuf> {
     // Direct placement (non-worktree execution)
     for name in STATE_FILE_NAMES {
         let candidate = execution_root.join(name);

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use libc;
+
 
 #[derive(Parser)]
 #[command(name = "plan-executor", about = "Monitor and execute Claude plan files")]
@@ -104,11 +104,10 @@ pub fn run() {
 
     // Daemonize before creating the Tokio runtime — forking after Tokio's
     // thread pool is initialized is undefined behavior.
-    if let Commands::Daemon { foreground } = &cli.command {
-        if !foreground {
+    if let Commands::Daemon { foreground } = &cli.command
+        && !foreground {
             daemonize();
         }
-    }
 
     tracing_subscriber::fmt::init();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -187,9 +186,7 @@ async fn output_job(job_id_prefix: String, follow: bool) -> Result<()> {
 
     // Follow mode: stream live JobDisplayLine events for this job.
     eprintln!("[following {} — Ctrl+C to stop]", &job_id[..job_id.len().min(8)]);
-    loop {
-        match reader.next_line().await? {
-            Some(line) => {
+    while let Some(line) = reader.next_line().await? {
                 if let Ok(DaemonEvent::JobDisplayLine { job_id: jid, line: text }) =
                     serde_json::from_str::<DaemonEvent>(&line)
                 {
@@ -198,17 +195,12 @@ async fn output_job(job_id_prefix: String, follow: bool) -> Result<()> {
                     }
                 } else if let Ok(DaemonEvent::JobUpdated { job }) =
                     serde_json::from_str::<DaemonEvent>(&line)
-                {
-                    if job.id == job_id
+                    && job.id == job_id
                         && job.status != crate::jobs::JobStatus::Running
-                    {
+                {
                         eprintln!("[job finished: {:?}]", job.status);
                         break;
-                    }
                 }
-            }
-            None => break,
-        }
     }
     Ok(())
 }
@@ -510,11 +502,10 @@ async fn execute_via_daemon(plan: PathBuf, config: crate::config::Config) -> Res
     write_half.write_all(format!("{}\n", gs).as_bytes()).await?;
 
     let mut existing_ids = std::collections::HashSet::<String>::new();
-    if let Ok(Some(line)) = reader.next_line().await {
-        if let Ok(DaemonEvent::State { running_jobs, .. }) = serde_json::from_str(&line) {
+    if let Ok(Some(line)) = reader.next_line().await
+        && let Ok(DaemonEvent::State { running_jobs, .. }) = serde_json::from_str(&line) {
             existing_ids = running_jobs.iter().map(|j| j.id.clone()).collect();
         }
-    }
 
     // Trigger execution.
     let req = serde_json::to_string(&TuiRequest::Execute {
@@ -721,8 +712,8 @@ fn list_jobs() {
                 let r_status_w = 10;
                 let target_w = 30;
                 println!(
-                    "{:<pr_w$}  {:<r_plan_w$}  {:<r_status_w$}  {}",
-                    "PR", "PLAN", "STATUS", "TARGET",
+                    "{:<pr_w$}  {:<r_plan_w$}  {:<r_status_w$}  TARGET",
+                    "PR", "PLAN", "STATUS",
                     pr_w = pr_w, r_plan_w = r_plan_w, r_status_w = r_status_w,
                 );
                 println!("{}", "─".repeat(pr_w + 2 + r_plan_w + 2 + r_status_w + 2 + target_w));

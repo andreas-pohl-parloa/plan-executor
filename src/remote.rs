@@ -31,8 +31,7 @@ pub fn branch_name(plan_filename: &str, iso_timestamp: &str) -> String {
         .unwrap_or(plan_filename);
     // Parse "2026-04-08T14:30:22Z" -> "20260408-143022"
     let ts = iso_timestamp
-        .replace('-', "")
-        .replace(':', "")
+        .replace(['-', ':'], "")
         .replace('T', "-")
         .replace('Z', "");
     // Truncate to YYYYMMDD-HHMMSS (15 chars)

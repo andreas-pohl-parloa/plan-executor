@@ -154,10 +154,10 @@ pub fn load_state(state_file: &Path) -> Result<HandoffState> {
             })
             .collect();
         detected.sort_by(|a, b| {
-            fn numeric_suffix(p: &std::path::PathBuf) -> u64 {
+            fn numeric_suffix(p: &std::path::Path) -> u64 {
                 p.file_stem()
                     .and_then(|s| s.to_str())
-                    .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).filter(|p| !p.is_empty()).last())
+                    .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).rfind(|p| !p.is_empty()))
                     .and_then(|n| n.parse().ok())
                     .unwrap_or(0)
             }

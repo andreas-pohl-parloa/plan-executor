@@ -1,0 +1,42 @@
+{
+  "skillVersion": "execute-plan-non-interactive/578d809035da",
+  "planPath": "/Users/andreas.pohl/workspace/code/plan-executor/.my/plans/plan-remote-execution-via-github-actions.md",
+  "executionRoot": "/Users/andreas.pohl/workspace/code/plan-executor/.my/worktrees/remote-execution",
+  "worktreeBranch": "feat/remote-execution-via-github-actions",
+  "language": "rust",
+  "recipeList": ["rust-services:production-code-recipe", "rust-services:test-code-recipe"],
+  "skipCodeReview": false,
+  "skipPr": false,
+  "draftPr": false,
+  "phase": "wave_execution",
+  "wave": 5,
+  "attempt": 1,
+  "batch": 1,
+  "waveMetadata": {
+    "totalWaves": 5,
+    "waves": [
+      { "wave": 1, "status": "completed" },
+      { "wave": 2, "status": "completed" },
+      { "wave": 3, "status": "completed" },
+      { "wave": 4, "status": "completed" },
+      {
+        "wave": 5,
+        "tasks": ["Task 10: integration test + clippy"],
+        "parallel": false,
+        "totalBatches": 1
+      }
+    ]
+  },
+  "attemptState": {
+    "totalBatches": 1,
+    "completedBatches": [],
+    "completedHandoffs": []
+  },
+  "handoffs": [
+    {
+      "index": 1,
+      "agentType": "claude",
+      "promptFile": "/Users/andreas.pohl/workspace/code/plan-executor/.my/worktrees/remote-execution/.tmp-subtask-wave-5-batch-1-1.md"
+    }
+  ]
+}

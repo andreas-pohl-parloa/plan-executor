@@ -40,7 +40,7 @@ fn send(title: &str, body: &str) -> Result<()> {
             n.app_icon(icon_str);
         }
         n.send()?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     {
