@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.5] - 2026-04-08
+
+### Bug Fixes
+
+- **ci:** Pin notify-rust to 4.12.0 for Linux build compatibility ([a55176e](https://github.com/andreas-pohl-parloa/plan-executor/commit/a55176e2950a121cb44115a6b37c3b1090ccea6c))
 ## [0.1.4] - 2026-04-08
 
 ### Bug Fixes
