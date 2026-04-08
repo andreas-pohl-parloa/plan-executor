@@ -39,26 +39,26 @@ pub fn branch_name(plan_filename: &str, iso_timestamp: &str) -> String {
     format!("exec/{}-{}", ts_short, stem)
 }
 
-/// Gathers git context from the current working directory.
+/// Gathers git context from the specified directory.
 ///
 /// Returns `(owner/repo, HEAD SHA, branch name)`.
 ///
 /// # Errors
 ///
 /// Returns an error if git commands fail or the remote URL cannot be parsed.
-pub fn gather_git_context() -> Result<(String, String, String)> {
-    let origin_url = run_git(&["remote", "get-url", "origin"])?;
+pub fn gather_git_context(repo_dir: &Path) -> Result<(String, String, String)> {
+    let origin_url = run_git(repo_dir, &["remote", "get-url", "origin"])?;
     let repo_slug = parse_repo_slug(&origin_url)
         .context("Could not parse owner/repo from git remote URL")?;
-    let head_sha = run_git(&["rev-parse", "HEAD"])?;
-    let branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let head_sha = run_git(repo_dir, &["rev-parse", "HEAD"])?;
+    let branch = run_git(repo_dir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     Ok((repo_slug, head_sha, branch))
 }
 
 /// Extracts `owner/repo` from a git remote URL.
 /// Supports HTTPS (`https://github.com/owner/repo.git`) and
 /// SSH (`git@github.com:owner/repo.git`) formats.
-fn parse_repo_slug(url: &str) -> Option<String> {
+pub fn parse_repo_slug(url: &str) -> Option<String> {
     let url = url.trim();
     if let Some(path) = url.strip_prefix("https://github.com/") {
         let slug = path.trim_end_matches(".git");
@@ -233,8 +233,10 @@ pub struct RemoteJob {
 
 // -- Helpers ------------------------------------------------------------------
 
-fn run_git(args: &[&str]) -> Result<String> {
+fn run_git(dir: &Path, args: &[&str]) -> Result<String> {
     let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
         .args(args)
         .output()
         .context("failed to run git")?;
