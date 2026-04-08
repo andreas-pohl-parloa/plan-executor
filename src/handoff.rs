@@ -117,12 +117,9 @@ pub fn load_state(state_file: &Path) -> Result<HandoffState> {
                 }
             };
             let pf = PathBuf::from(&h.prompt_file);
-            if pf.is_absolute() {
-                tracing::warn!("load_state: rejecting absolute prompt_file path: {}", pf.display());
-                return None;
-            }
-            let prompt_file = base_dir.join(&pf);
-            // Verify the resolved path stays within base_dir
+            // Resolve relative paths against base_dir; accept absolute if they
+            // stay within base_dir (the skill writes absolute paths).
+            let prompt_file = if pf.is_absolute() { pf } else { base_dir.join(pf) };
             let canonical = prompt_file.canonicalize().unwrap_or_else(|_| prompt_file.clone());
             let canonical_base = base_dir.canonicalize().unwrap_or_else(|_| base_dir.to_path_buf());
             if !canonical.starts_with(&canonical_base) {
