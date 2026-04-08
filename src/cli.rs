@@ -705,6 +705,48 @@ fn list_jobs() {
             id_w = id_w, plan_w = plan_w, status_w = status_w, dur_w = dur_w,
         );
     }
+
+    // Show remote executions if remote_repo is configured
+    let config = crate::config::Config::load(None).ok();
+    if let Some(remote_repo) = config.and_then(|c| c.remote_repo) {
+        match crate::remote::list_remote_executions(&remote_repo) {
+            Ok(remote_jobs) if !remote_jobs.is_empty() => {
+                println!();
+                println!("Remote ({}):", remote_repo);
+                let pr_w = 6;
+                let r_plan_w = 34;
+                let r_status_w = 10;
+                let target_w = 30;
+                println!(
+                    "{:<pr_w$}  {:<r_plan_w$}  {:<r_status_w$}  {}",
+                    "PR", "PLAN", "STATUS", "TARGET",
+                    pr_w = pr_w, r_plan_w = r_plan_w, r_status_w = r_status_w,
+                );
+                println!("{}", "─".repeat(pr_w + 2 + r_plan_w + 2 + r_status_w + 2 + target_w));
+                for rj in &remote_jobs {
+                    let plan_truncated = if rj.plan_name.len() > r_plan_w {
+                        format!("{}…", &rj.plan_name[..r_plan_w - 1])
+                    } else {
+                        rj.plan_name.clone()
+                    };
+                    let target_truncated = if rj.target.len() > target_w {
+                        format!("{}…", &rj.target[..target_w - 1])
+                    } else {
+                        rj.target.clone()
+                    };
+                    println!(
+                        "#{:<width$}  {:<r_plan_w$}  {:<r_status_w$}  {}",
+                        rj.number, plan_truncated, rj.status, target_truncated,
+                        width = pr_w - 1, r_plan_w = r_plan_w, r_status_w = r_status_w,
+                    );
+                }
+            }
+            Ok(_) => {} // no remote jobs, don't print header
+            Err(e) => {
+                eprintln!("(could not fetch remote jobs: {})", e);
+            }
+        }
+    }
 }
 
 /// Start the daemon if it is not already running. Used by the shell hook.
