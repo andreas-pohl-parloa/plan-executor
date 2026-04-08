@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.4] - 2026-04-08
+
+### Bug Fixes
+
+- **ci:** Use targeted cargo update to preserve dep versions ([1aefff2](https://github.com/andreas-pohl-parloa/plan-executor/commit/1aefff2e28440b7c936d2532ef61ba89f1841966))
 ## [0.1.3] - 2026-04-08
 
 ### Bug Fixes
