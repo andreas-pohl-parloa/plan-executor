@@ -1,11 +1,6 @@
 use anyhow::Result;
 
-fn icon_path() -> Option<String> {
-    let p = crate::config::Config::base_dir().join("icon.png");
-    if p.exists() { Some(p.to_string_lossy().into_owned()) } else { None }
-}
-
-/// Sends a native macOS notification for a READY plan.
+/// Sends a native notification for a READY plan.
 pub fn notify_plan_ready(plan_path: &str, auto_execute: bool) -> Result<()> {
     let filename = std::path::Path::new(plan_path)
         .file_name().and_then(|n| n.to_str()).unwrap_or(plan_path);
@@ -20,7 +15,7 @@ pub fn notify_plan_ready(plan_path: &str, auto_execute: bool) -> Result<()> {
     Ok(())
 }
 
-/// Sends a macOS notification that a plan execution completed.
+/// Sends a notification that a plan execution completed.
 pub fn notify_execution_complete(plan_path: &str, success: bool) -> Result<()> {
     let filename = std::path::Path::new(plan_path)
         .file_name().and_then(|n| n.to_str()).unwrap_or(plan_path);
@@ -30,21 +25,6 @@ pub fn notify_execution_complete(plan_path: &str, success: bool) -> Result<()> {
 }
 
 fn send(title: &str, body: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let icon = icon_path();
-        let icon_str = icon.as_deref().unwrap_or("");
-        let mut n = mac_notification_sys::Notification::default();
-        n.title(title).message(body);
-        if !icon_str.is_empty() {
-            n.app_icon(icon_str);
-        }
-        n.send()?;
-        Ok(())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        notify_rust::Notification::new().summary(title).body(body).show()?;
-        Ok(())
-    }
+    notify_rust::Notification::new().summary(title).body(body).show()?;
+    Ok(())
 }
