@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.15] - 2026-04-08
+
+### Bug Fixes
+
+- **ci:** Simplify Linux build — native cargo + diagnostics ([1a68725](https://github.com/andreas-pohl-parloa/plan-executor/commit/1a68725178a03597c9dbf8993439888121e6a01e))
 ## [0.1.14] - 2026-04-08
 
 ### Miscellaneous
