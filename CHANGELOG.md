@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.14] - 2026-04-08
+
+### Miscellaneous
+
+- Update stream-json-view submodule (edition 2021) ([7ec38da](https://github.com/andreas-pohl-parloa/plan-executor/commit/7ec38da013655f12bcc9f561759bb9632c200fc1))
 ## [0.1.13] - 2026-04-08
 
 ### Bug Fixes
