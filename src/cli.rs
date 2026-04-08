@@ -26,6 +26,9 @@ pub enum Commands {
     Execute {
         /// Plan file path or job ID prefix (from `plan-executor jobs`)
         plan: String,
+        /// Run in foreground without the daemon
+        #[arg(short = 'f', long)]
+        foreground: bool,
     },
     /// Stop the running daemon
     Stop,
@@ -112,7 +115,13 @@ pub fn run() {
 
     let result: Result<()> = match cli.command {
         Commands::Daemon { .. } => rt.block_on(crate::daemon::run_daemon(config)),
-        Commands::Execute { plan } => rt.block_on(execute_plan(plan, config)),
+        Commands::Execute { plan, foreground } => {
+            if foreground {
+                rt.block_on(execute_foreground(plan, config))
+            } else {
+                rt.block_on(execute_plan(plan, config))
+            }
+        }
         Commands::Tui => rt.block_on(crate::tui::run_tui()),
         Commands::Status => rt.block_on(show_status()),
         Commands::Output { job_id, follow } => rt.block_on(output_job(job_id, follow)),
@@ -304,6 +313,132 @@ fn resolve_plan_path(arg: &str) -> String {
         }
     }
     arg.to_string()
+}
+
+async fn execute_foreground(plan_path: String, config: crate::config::Config) -> Result<()> {
+    use crate::executor::{spawn_execution, ExecEvent};
+    use crate::handoff;
+    use crate::jobs::JobMetadata;
+
+    let resolved_path = std::fs::canonicalize(&plan_path)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(&plan_path));
+    if !resolved_path.exists() {
+        anyhow::bail!("Plan file not found: {}", plan_path);
+    }
+
+    let execution_root = find_repo_root(&resolved_path)
+        .unwrap_or_else(|| resolved_path.parent().unwrap_or(&resolved_path).to_path_buf());
+
+    let job = JobMetadata::new(resolved_path.clone());
+    let job_id = job.id.clone();
+
+    let (mut child, _pgid, mut exec_rx) = spawn_execution(
+        job, execution_root.clone(), &config.agents.main,
+    )?;
+
+    let mut last_display_blank = false;
+    let mut final_status = None;
+
+    'outer: loop {
+        while let Some(event) = exec_rx.recv().await {
+            match event {
+                ExecEvent::OutputLine(_) => {}
+                ExecEvent::DisplayLine(line) => {
+                    let is_blank = crate::executor::is_visually_blank(&line);
+                    if is_blank && last_display_blank {
+                        continue;
+                    }
+                    last_display_blank = is_blank;
+                    print_display_line(&line);
+                }
+                ExecEvent::HandoffRequired { session_id, state_file } => {
+                    let state_data = handoff::load_state(&state_file)?;
+
+                    println!("\x1b[33m\u{23fa} [plan-executor]\x1b[0m dispatching {} sub-agent(s) (phase: {})",
+                        state_data.handoffs.len(), state_data.phase);
+
+                    let (results, _pgids) = handoff::dispatch_all(
+                        state_data.handoffs,
+                        &config.agents.claude,
+                        &config.agents.codex,
+                        &config.agents.gemini,
+                    ).await;
+
+                    for r in &results {
+                        if r.success {
+                            println!("\x1b[33m\u{23fa} [plan-executor]\x1b[0m sub-agent {} done ({} chars)",
+                                r.index, r.stdout.len());
+                        } else if r.can_fail {
+                            println!("\x1b[33m\u{23fa} [plan-executor]\x1b[0m sub-agent {} skipped (can-fail): {}",
+                                r.index, r.stderr.lines().next().unwrap_or("(no stderr)"));
+                        } else {
+                            eprintln!("\x1b[31m\u{23fa} [plan-executor] sub-agent {} failed: {}\x1b[0m",
+                                r.index, r.stderr.lines().next().unwrap_or("(no stderr)"));
+                        }
+                    }
+
+                    if results.iter().any(|r| !r.success && !r.can_fail) {
+                        let _ = std::fs::remove_file(&state_file);
+                        final_status = Some(false);
+                        break 'outer;
+                    }
+
+                    let _ = std::fs::remove_file(&state_file);
+
+                    println!("\x1b[33m\u{23fa} [plan-executor]\x1b[0m resuming session {}",
+                        &session_id[..session_id.len().min(16)]);
+
+                    let continuation = handoff::build_continuation(&results);
+                    match handoff::resume_execution(
+                        &session_id,
+                        &continuation,
+                        execution_root.clone(),
+                        Some(job_id.clone()),
+                        Some(resolved_path.clone()),
+                        &config.agents.main,
+                    ).await {
+                        Ok((new_child, _new_pgid, new_rx)) => {
+                            child = new_child;
+                            exec_rx = new_rx;
+                            continue 'outer;
+                        }
+                        Err(e) => {
+                            eprintln!("\x1b[31m\u{23fa} [plan-executor] failed to resume session: {}\x1b[0m", e);
+                            final_status = Some(false);
+                            break 'outer;
+                        }
+                    }
+                }
+                ExecEvent::Finished(finished_job) => {
+                    final_status = Some(finished_job.status == crate::jobs::JobStatus::Success);
+                    break 'outer;
+                }
+            }
+        }
+        break;
+    }
+
+    let _ = child;
+    let success = final_status.unwrap_or(false);
+    if !success {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Walk up from a path to find the closest directory containing `.git`.
+fn find_repo_root(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut dir = if path.is_file() {
+        path.parent()?.to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir);
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
 }
 
 /// Sends Execute to the daemon and streams JobDisplayLine events to the terminal.
