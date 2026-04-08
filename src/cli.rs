@@ -278,7 +278,45 @@ async fn execute_plan(plan_path: String, config: crate::config::Config) -> Resul
         anyhow::bail!("Plan file not found: {}", resolved_path);
     }
 
+    // Check execution mode
+    if crate::plan::parse_execution_mode(&plan) == crate::plan::ExecutionMode::Remote {
+        return trigger_remote(plan, config).await;
+    }
+
     execute_via_daemon(plan, config).await
+}
+
+async fn trigger_remote(plan: PathBuf, config: crate::config::Config) -> Result<()> {
+    let remote_repo = config.remote_repo.as_deref()
+        .ok_or_else(|| anyhow::anyhow!(
+            "remote execution requires 'remote_repo' in config — run 'plan-executor remote-setup'"
+        ))?;
+
+    let plan_filename = plan.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("plan.md")
+        .to_string();
+
+    let (target_repo, target_ref, target_branch) = crate::remote::gather_git_context()?;
+    let started_at = chrono::Utc::now().to_rfc3339();
+
+    let meta = crate::remote::ExecutionMetadata {
+        target_repo,
+        target_ref,
+        target_branch,
+        plan_filename,
+        started_at,
+    };
+
+    // Push Codex OAuth token (idempotent, skips if no auth file)
+    let _ = crate::remote::push_codex_auth(remote_repo);
+
+    let pr_url = crate::remote::trigger_remote_execution(remote_repo, &plan, &meta)?;
+
+    println!("Remote execution triggered.");
+    println!("PR: {}", pr_url);
+
+    Ok(())
 }
 
 /// If `arg` matches a job ID prefix in daemon state, returns the plan path.
@@ -324,6 +362,11 @@ async fn execute_foreground(plan_path: String, config: crate::config::Config) ->
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(&plan_path));
     if !resolved_path.exists() {
         anyhow::bail!("Plan file not found: {}", plan_path);
+    }
+
+    // Remote plans always trigger remotely, even with -f
+    if crate::plan::parse_execution_mode(&resolved_path) == crate::plan::ExecutionMode::Remote {
+        return trigger_remote(resolved_path, config).await;
     }
 
     let execution_root = find_repo_root(&resolved_path)
