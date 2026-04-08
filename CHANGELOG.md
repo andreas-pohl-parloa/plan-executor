@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.19] - 2026-04-08
+
+### Bug Fixes
+
+- **ci:** Remove platform-specific deps section to fix Linux builds ([7c911e8](https://github.com/andreas-pohl-parloa/plan-executor/commit/7c911e87dd8ebef217cea7c5f6d280c112e13280))
 ## [0.1.18] - 2026-04-08
 
 ### Bug Fixes
