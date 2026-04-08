@@ -286,6 +286,64 @@ async fn handle_rescan(state: &Arc<Mutex<DaemonState>>, config: &Config) {
 
 pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str) {
     let plan = PathBuf::from(plan_path);
+
+    // Route remote plans to GitHub PR trigger instead of local execution.
+    if crate::plan::parse_execution_mode(&plan) == crate::plan::ExecutionMode::Remote {
+        let config = { state.lock().await.config.clone() };
+        if let Some(remote_repo) = config.remote_repo.as_deref() {
+            let plan_filename = plan
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("plan.md")
+                .to_string();
+            let parent_dir = plan.parent().unwrap_or(&plan).to_string_lossy().to_string();
+            let result = std::process::Command::new("git")
+                .args(["-C", &parent_dir, "remote", "get-url", "origin"])
+                .output();
+            if let Ok(output) = result {
+                if output.status.success() {
+                    let origin = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    let head = std::process::Command::new("git")
+                        .args(["-C", &parent_dir, "rev-parse", "HEAD"])
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .unwrap_or_default();
+                    let branch = std::process::Command::new("git")
+                        .args(["-C", &parent_dir, "rev-parse", "--abbrev-ref", "HEAD"])
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .unwrap_or_default();
+
+                    let meta = crate::remote::ExecutionMetadata {
+                        target_repo: origin
+                            .trim_start_matches("https://github.com/")
+                            .trim_start_matches("git@github.com:")
+                            .trim_end_matches(".git")
+                            .to_string(),
+                        target_ref: head,
+                        target_branch: branch,
+                        plan_filename,
+                        started_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    let _ = crate::remote::push_codex_auth(remote_repo);
+                    match crate::remote::trigger_remote_execution(remote_repo, &plan, &meta) {
+                        Ok(url) => tracing::info!(url = %url, "remote execution triggered"),
+                        Err(e) => tracing::error!(error = %e, "remote execution failed"),
+                    }
+                    let mut st = state.lock().await;
+                    st.pending_plans.remove(plan_path);
+                    let event = st.snapshot_state();
+                    let _ = st.event_tx.send(event);
+                    return;
+                }
+            }
+            tracing::error!(plan = %plan_path, "remote execution: could not determine git origin");
+        } else {
+            tracing::error!("remote execution: remote_repo not configured");
+        }
+        return;
+    }
+
     let execution_root = find_repo_root(&plan)
         .unwrap_or_else(|| plan.parent().unwrap_or(&plan).to_path_buf());
 
