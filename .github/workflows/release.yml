@@ -2,7 +2,10 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    branches: ['main']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
 
 permissions:
   contents: write
@@ -11,83 +14,184 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            name: macos-arm64
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: linux-x86_64
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: linux-arm64
-            use_cross: true
-
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux' && !matrix.use_cross
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
-
-      - name: Install cross
-        if: matrix.use_cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
-      - name: Build
-        run: |
-          if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
-          else
-            cargo build --release --target ${{ matrix.target }}
-          fi
-
-      - name: Package
-        run: |
-          cd target/${{ matrix.target }}/release
-          zip plan-executor-${{ matrix.name }}.zip plan-executor
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: plan-executor-${{ matrix.name }}
-          path: target/${{ matrix.target }}/release/plan-executor-${{ matrix.name }}.zip
-
   release:
-    needs: build
+    name: Determine release
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      skipped: ${{ steps.version.outputs.skipped }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          submodules: recursive
 
-      - uses: actions/download-artifact@v4
-        with:
-          merge-multiple: true
+      - name: git config
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Install git-cliff
         uses: taiki-e/install-action@git-cliff
 
-      - name: Generate changelog
-        run: git-cliff --latest --strip header -o RELEASE_NOTES.md
-
-      - name: Create release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Determine next version
+        id: version
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
-            --notes-file RELEASE_NOTES.md \
-            plan-executor-*.zip
+          CURRENT=$(awk '/^\[package\]/{in_pkg=1} in_pkg && /^version = "/{gsub(/^version = "|"$/,""); print; exit}' Cargo.toml)
+          NEXT=$(git-cliff --bumped-version | sed 's/^v//')
+          if [ -z "$NEXT" ] || ! echo "$NEXT" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$'; then
+            echo "::notice::git-cliff returned invalid version: '$NEXT' — skipping"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+          elif [ "$CURRENT" = "$NEXT" ]; then
+            echo "::notice::version unchanged ($CURRENT) — skipping"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+          else
+            CARGO_VERSION=$(echo "$NEXT" | sed 's/+.*//')
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+            echo "version=$CARGO_VERSION" >> "$GITHUB_OUTPUT"
+            echo "tag=v$NEXT" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update Cargo.toml version
+        if: steps.version.outputs.skipped == 'false'
+        run: |
+          awk -v ver="${{ steps.version.outputs.version }}" '
+            /^\[package\]/{in_pkg=1}
+            in_pkg && /^version = "/{$0 = "version = \"" ver "\""; in_pkg=0}
+            {print}
+          ' Cargo.toml > Cargo.toml.tmp && mv Cargo.toml.tmp Cargo.toml
+
+      - name: Install Rust stable
+        if: steps.version.outputs.skipped == 'false'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Update Cargo.lock
+        if: steps.version.outputs.skipped == 'false'
+        run: cargo update --workspace
+
+      - name: Generate changelog
+        if: steps.version.outputs.skipped == 'false'
+        run: git-cliff --tag "${{ steps.version.outputs.tag }}" -o CHANGELOG.md
+
+      - name: Get release notes
+        if: steps.version.outputs.skipped == 'false'
+        id: notes
+        run: |
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "body<<$EOF" >> "$GITHUB_OUTPUT"
+          git-cliff --tag "${{ steps.version.outputs.tag }}" --unreleased --strip header >> "$GITHUB_OUTPUT"
+          echo "$EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and tag version
+        if: steps.version.outputs.skipped == 'false'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: '[no ci] chore(release): ${{ steps.version.outputs.tag }}'
+          tagging_message: ${{ steps.version.outputs.tag }}
+
+      - name: Create Release
+        if: steps.version.outputs.skipped == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          body: ${{ steps.notes.outputs.body }}
+
+  build-macos-arm64:
+    name: Build macOS ARM64
+    needs: release
+    if: "success() && needs.release.outputs.skipped == 'false'"
+    runs-on: macos-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package
+        run: zip -j plan-executor-macos-arm64.zip target/release/plan-executor
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release.outputs.tag }}
+          files: plan-executor-macos-arm64.zip
+
+  build-linux-x86_64:
+    name: Build Linux x86_64
+    needs: release
+    if: "success() && needs.release.outputs.skipped == 'false'"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package
+        run: zip -j plan-executor-linux-x86_64.zip target/release/plan-executor
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release.outputs.tag }}
+          files: plan-executor-linux-x86_64.zip
+
+  build-linux-arm64:
+    name: Build Linux ARM64
+    needs: release
+    if: "success() && needs.release.outputs.skipped == 'false'"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build release binary
+        run: cross build --release --target aarch64-unknown-linux-gnu
+
+      - name: Package
+        run: zip -j plan-executor-linux-arm64.zip target/aarch64-unknown-linux-gnu/release/plan-executor
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release.outputs.tag }}
+          files: plan-executor-linux-arm64.zip
