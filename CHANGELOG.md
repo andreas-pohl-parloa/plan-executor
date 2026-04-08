@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.9] - 2026-04-08
+
+### Bug Fixes
+
+- **ci:** Use explicit --target on Linux x86_64 build ([0370920](https://github.com/andreas-pohl-parloa/plan-executor/commit/03709206d22a48ce57b6f53a60e6fd773dbf7212))
 ## [0.1.8] - 2026-04-08
 
 ### Bug Fixes
