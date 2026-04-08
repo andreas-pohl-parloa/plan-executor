@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.7] - 2026-04-08
+
+### Bug Fixes
+
+- **ci:** Build --bin target explicitly to work around resolver v3 bug ([b10e9fe](https://github.com/andreas-pohl-parloa/plan-executor/commit/b10e9fe237113a69ca95ab8f3f4b5ba19899efd5))
 ## [0.1.6] - 2026-04-08
 
 ### Bug Fixes
