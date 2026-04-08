@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.3] - 2026-04-08
+
+### Bug Fixes
+
+- **ci:** Use generate-lockfile and --locked for reproducible builds ([cf04434](https://github.com/andreas-pohl-parloa/plan-executor/commit/cf044348882f31619efc606d49d161d92f2c0f0e))
 ## [0.1.2] - 2026-04-08
 
 ### Bug Fixes
