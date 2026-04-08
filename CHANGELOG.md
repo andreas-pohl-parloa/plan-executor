@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.18] - 2026-04-08
+
+### Bug Fixes
+
+- **ci:** Use ubuntu-22.04 for Linux build, revert sed lock patching ([f69802c](https://github.com/andreas-pohl-parloa/plan-executor/commit/f69802c7233bb7b287b0ddc21470946216b9220a))
+- Regenerate Cargo.lock after sed corruption ([c7892a2](https://github.com/andreas-pohl-parloa/plan-executor/commit/c7892a2abdb31cb0f85718c97f95d7964735e230))
 ## [0.1.17] - 2026-04-08
 
 ### Bug Fixes
