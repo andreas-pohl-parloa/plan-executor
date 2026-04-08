@@ -9,6 +9,13 @@ pub struct PlanFile {
     pub status: PlanStatus,
 }
 
+/// Execution mode for a plan: local (default) or remote.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExecutionMode {
+    Local,
+    Remote,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlanStatus {
     Ready,
@@ -39,6 +46,23 @@ pub fn parse_plan_status(path: &Path) -> Result<PlanStatus> {
         }
     }
     Ok(PlanStatus::Unknown("missing".to_string()))
+}
+
+/// Reads a plan file and extracts its `**execution:**` field.
+/// Defaults to `ExecutionMode::Local` when absent or unrecognized.
+pub fn parse_execution_mode(path: &Path) -> ExecutionMode {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return ExecutionMode::Local;
+    };
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("**execution:**") {
+            return match rest.trim() {
+                "remote" => ExecutionMode::Remote,
+                _ => ExecutionMode::Local,
+            };
+        }
+    }
+    ExecutionMode::Local
 }
 
 /// Returns true if the plan file has `**non-interactive:** [x]` (checked).
