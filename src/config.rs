@@ -61,6 +61,10 @@ pub struct Config {
     /// Agent command overrides. Uses built-in defaults when absent.
     #[serde(default)]
     pub agents: AgentConfig,
+    /// GitHub repo slug for remote execution (e.g. "owner/plan-executions").
+    /// Set via `plan-executor remote-setup`.
+    #[serde(default)]
+    pub remote_repo: Option<String>,
 }
 
 impl Default for Config {
@@ -70,6 +74,7 @@ impl Default for Config {
             plan_patterns: vec!["**/.my/plans/*.md".to_string()],
             auto_execute: false,
             agents: AgentConfig::default(),
+            remote_repo: None,
         }
     }
 }

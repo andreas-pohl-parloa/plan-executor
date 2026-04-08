@@ -9,6 +9,13 @@ pub struct PlanFile {
     pub status: PlanStatus,
 }
 
+/// Execution mode for a plan: local (default) or remote.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExecutionMode {
+    Local,
+    Remote,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlanStatus {
     Ready,
@@ -41,6 +48,23 @@ pub fn parse_plan_status(path: &Path) -> Result<PlanStatus> {
     Ok(PlanStatus::Unknown("missing".to_string()))
 }
 
+/// Reads a plan file and extracts its `**execution:**` field.
+/// Defaults to `ExecutionMode::Local` when absent or unrecognized.
+pub fn parse_execution_mode(path: &Path) -> ExecutionMode {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return ExecutionMode::Local;
+    };
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("**execution:**") {
+            return match rest.trim() {
+                "remote" => ExecutionMode::Remote,
+                _ => ExecutionMode::Local,
+            };
+        }
+    }
+    ExecutionMode::Local
+}
+
 /// Returns true if the plan file has `**non-interactive:** [x]` (checked).
 /// The check is case-insensitive for the checkbox marker.
 pub fn is_non_interactive(path: &Path) -> bool {
@@ -67,8 +91,8 @@ const SKIP_DIRS: &[&str] = &[
 /// For patterns without `**/` the existing `glob` behaviour is used (fast,
 /// non-recursive).
 pub fn scan_for_plans(base_dir: &Path, pattern: &str) -> Vec<PathBuf> {
-    if pattern.starts_with("**/") {
-        scan_recursive(base_dir, &pattern[3..])
+    if let Some(stripped) = pattern.strip_prefix("**/") {
+        scan_recursive(base_dir, stripped)
     } else {
         scan_glob(base_dir, pattern)
     }
@@ -141,11 +165,10 @@ pub fn find_ready_plans(watch_dirs: &[PathBuf], patterns: &[String]) -> Vec<Plan
     for dir in watch_dirs {
         for pattern in patterns {
             for path in scan_for_plans(dir, pattern) {
-                if let Ok(status) = parse_plan_status(&path) {
-                    if status == PlanStatus::Ready && is_non_interactive(&path) {
+                if let Ok(status) = parse_plan_status(&path)
+                    && status == PlanStatus::Ready && is_non_interactive(&path) {
                         results.push(PlanFile { path, status });
                     }
-                }
             }
         }
     }

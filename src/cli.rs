@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use libc;
+
 
 #[derive(Parser)]
 #[command(name = "plan-executor", about = "Monitor and execute Claude plan files")]
@@ -26,6 +26,9 @@ pub enum Commands {
     Execute {
         /// Plan file path or job ID prefix (from `plan-executor jobs`)
         plan: String,
+        /// Run in foreground without the daemon
+        #[arg(short = 'f', long)]
+        foreground: bool,
     },
     /// Stop the running daemon
     Stop,
@@ -56,6 +59,8 @@ pub enum Commands {
         /// Job ID prefix (from `plan-executor jobs`)
         job_id: String,
     },
+    /// Interactive wizard to configure remote execution secrets
+    RemoteSetup,
 }
 
 /// Prints a display line to the terminal, coloring plan-executor prefix lines
@@ -83,6 +88,7 @@ pub fn run() {
         Commands::Stop   => { stop_daemon(); return; }
         Commands::Jobs   => { list_jobs(); return; }
         Commands::Ensure => { ensure_daemon(); return; }
+        Commands::RemoteSetup => { remote_setup(); return; }
         Commands::Kill   { job_id } => { daemon_job_request("kill",    job_id); return; }
         Commands::Pause  { job_id } => { daemon_job_request("pause",   job_id); return; }
         Commands::Unpause{ job_id } => { daemon_job_request("unpause", job_id); return; }
@@ -98,11 +104,10 @@ pub fn run() {
 
     // Daemonize before creating the Tokio runtime — forking after Tokio's
     // thread pool is initialized is undefined behavior.
-    if let Commands::Daemon { foreground } = &cli.command {
-        if !foreground {
+    if let Commands::Daemon { foreground } = &cli.command
+        && !foreground {
             daemonize();
         }
-    }
 
     tracing_subscriber::fmt::init();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -112,12 +117,18 @@ pub fn run() {
 
     let result: Result<()> = match cli.command {
         Commands::Daemon { .. } => rt.block_on(crate::daemon::run_daemon(config)),
-        Commands::Execute { plan } => rt.block_on(execute_plan(plan, config)),
+        Commands::Execute { plan, foreground } => {
+            if foreground {
+                rt.block_on(execute_foreground(plan, config))
+            } else {
+                rt.block_on(execute_plan(plan, config))
+            }
+        }
         Commands::Tui => rt.block_on(crate::tui::run_tui()),
         Commands::Status => rt.block_on(show_status()),
         Commands::Output { job_id, follow } => rt.block_on(output_job(job_id, follow)),
         Commands::Retry { job_id } => rt.block_on(retry_job(job_id)),
-        Commands::Stop | Commands::Jobs | Commands::Ensure
+        Commands::Stop | Commands::Jobs | Commands::Ensure | Commands::RemoteSetup
         | Commands::Kill { .. } | Commands::Pause { .. } | Commands::Unpause { .. } => unreachable!(),
     };
 
@@ -175,9 +186,7 @@ async fn output_job(job_id_prefix: String, follow: bool) -> Result<()> {
 
     // Follow mode: stream live JobDisplayLine events for this job.
     eprintln!("[following {} — Ctrl+C to stop]", &job_id[..job_id.len().min(8)]);
-    loop {
-        match reader.next_line().await? {
-            Some(line) => {
+    while let Some(line) = reader.next_line().await? {
                 if let Ok(DaemonEvent::JobDisplayLine { job_id: jid, line: text }) =
                     serde_json::from_str::<DaemonEvent>(&line)
                 {
@@ -186,24 +195,18 @@ async fn output_job(job_id_prefix: String, follow: bool) -> Result<()> {
                     }
                 } else if let Ok(DaemonEvent::JobUpdated { job }) =
                     serde_json::from_str::<DaemonEvent>(&line)
-                {
-                    if job.id == job_id
+                    && job.id == job_id
                         && job.status != crate::jobs::JobStatus::Running
-                    {
+                {
                         eprintln!("[job finished: {:?}]", job.status);
                         break;
-                    }
                 }
-            }
-            None => break,
-        }
     }
     Ok(())
 }
 
 async fn retry_job(job_id_prefix: String) -> Result<()> {
     use crate::ipc::{DaemonEvent, TuiRequest};
-    use crate::jobs::JobStatus;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
@@ -226,28 +229,37 @@ async fn retry_job(job_id_prefix: String) -> Result<()> {
     let req = serde_json::to_string(&TuiRequest::RetryHandoff { job_id: job_id.clone() })?;
     write_half.write_all(format!("{}\n", req).as_bytes()).await?;
 
-    // Stream output until the job finishes.
+    // Wait briefly for confirmation that the job moved to Running, then detach.
+    let short_id = &job_id[..job_id.len().min(8)];
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(2));
+    tokio::pin!(timeout);
+
     loop {
-        let line = match reader.next_line().await? {
-            Some(l) => l,
-            None => break,
-        };
-        if let Ok(event) = serde_json::from_str::<DaemonEvent>(&line) {
-            match event {
-                DaemonEvent::JobDisplayLine { job_id: jid, line: text } if jid == job_id => {
-                    print_display_line(&text);
+        tokio::select! {
+            line = reader.next_line() => {
+                let Ok(Some(line)) = line else { break };
+                if let Ok(event) = serde_json::from_str::<DaemonEvent>(&line) {
+                    match event {
+                        DaemonEvent::State { running_jobs, .. } => {
+                            if running_jobs.iter().any(|j| j.id == job_id) {
+                                println!("Retrying (job {})", short_id);
+                                println!("Watch: plan-executor output -f {}", short_id);
+                                return Ok(());
+                            }
+                        }
+                        DaemonEvent::Error { message } => {
+                            eprintln!("Error: {}", message);
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
                 }
-                DaemonEvent::JobUpdated { job } if job.id == job_id
-                    && job.status != JobStatus::Running =>
-                {
-                    println!("\nJob finished: {:?}", job.status);
-                    break;
-                }
-                DaemonEvent::Error { message } => {
-                    eprintln!("Error: {}", message);
-                    break;
-                }
-                _ => {}
+            }
+            _ = &mut timeout => {
+                // Timed out waiting for confirmation — assume it started.
+                println!("Retrying (job {})", short_id);
+                println!("Watch: plan-executor output -f {}", short_id);
+                return Ok(());
             }
         }
     }
@@ -255,10 +267,6 @@ async fn retry_job(job_id_prefix: String) -> Result<()> {
 }
 
 async fn execute_plan(plan_path: String, config: crate::config::Config) -> Result<()> {
-    if !crate::ipc::socket_path().exists() {
-        anyhow::bail!("Daemon not running. Start with: plan-executor daemon");
-    }
-
     // If the argument looks like a job ID prefix, resolve it to a plan path.
     let resolved_path = resolve_plan_path(&plan_path);
 
@@ -269,7 +277,51 @@ async fn execute_plan(plan_path: String, config: crate::config::Config) -> Resul
         anyhow::bail!("Plan file not found: {}", resolved_path);
     }
 
+    // Remote plans don't need the daemon — trigger directly.
+    if crate::plan::parse_execution_mode(&plan) == crate::plan::ExecutionMode::Remote {
+        return trigger_remote(plan, config).await;
+    }
+
+    // Local execution requires the daemon.
+    if !crate::ipc::socket_path().exists() {
+        anyhow::bail!("Daemon not running. Start with: plan-executor daemon");
+    }
     execute_via_daemon(plan, config).await
+}
+
+async fn trigger_remote(plan: PathBuf, config: crate::config::Config) -> Result<()> {
+    let remote_repo = config.remote_repo.as_deref()
+        .ok_or_else(|| anyhow::anyhow!(
+            "remote execution requires 'remote_repo' in config — run 'plan-executor remote-setup'"
+        ))?;
+
+    let plan_filename = plan.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("plan.md")
+        .to_string();
+
+    let repo_root = find_repo_root(&plan)
+        .ok_or_else(|| anyhow::anyhow!("could not find git repo root for {}", plan.display()))?;
+    let (target_repo, target_ref, target_branch) = crate::remote::gather_git_context(&repo_root)?;
+    let started_at = chrono::Utc::now().to_rfc3339();
+
+    let meta = crate::remote::ExecutionMetadata {
+        target_repo,
+        target_ref,
+        target_branch,
+        plan_filename,
+        started_at,
+    };
+
+    // Push Codex OAuth token (idempotent, skips if no auth file)
+    let _ = crate::remote::push_codex_auth(remote_repo);
+
+    let pr_url = crate::remote::trigger_remote_execution(remote_repo, &plan, &meta)?;
+
+    println!("Remote execution triggered.");
+    println!("PR: {}", pr_url);
+
+    Ok(())
 }
 
 /// If `arg` matches a job ID prefix in daemon state, returns the plan path.
@@ -306,18 +358,144 @@ fn resolve_plan_path(arg: &str) -> String {
     arg.to_string()
 }
 
-/// Sends Execute to the daemon and streams JobDisplayLine events to the terminal.
-async fn execute_via_daemon(plan: PathBuf, config: crate::config::Config) -> Result<()> {
+async fn execute_foreground(plan_path: String, config: crate::config::Config) -> Result<()> {
+    use crate::executor::{spawn_execution, ExecEvent};
+    use crate::handoff;
+    use crate::jobs::JobMetadata;
+
+    let resolved_path = std::fs::canonicalize(&plan_path)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(&plan_path));
+    if !resolved_path.exists() {
+        anyhow::bail!("Plan file not found: {}", plan_path);
+    }
+
+    // Remote plans always trigger remotely, even with -f
+    if crate::plan::parse_execution_mode(&resolved_path) == crate::plan::ExecutionMode::Remote {
+        return trigger_remote(resolved_path, config).await;
+    }
+
+    let execution_root = find_repo_root(&resolved_path)
+        .unwrap_or_else(|| resolved_path.parent().unwrap_or(&resolved_path).to_path_buf());
+
+    let job = JobMetadata::new(resolved_path.clone());
+    let job_id = job.id.clone();
+
+    let (mut child, _pgid, mut exec_rx) = spawn_execution(
+        job, execution_root.clone(), &config.agents.main,
+    )?;
+
+    let mut last_display_blank = false;
+    let mut final_status = None;
+
+    'outer: loop {
+        while let Some(event) = exec_rx.recv().await {
+            match event {
+                ExecEvent::OutputLine(_) => {}
+                ExecEvent::DisplayLine(line) => {
+                    let is_blank = crate::executor::is_visually_blank(&line);
+                    if is_blank && last_display_blank {
+                        continue;
+                    }
+                    last_display_blank = is_blank;
+                    print_display_line(&line);
+                }
+                ExecEvent::HandoffRequired { session_id, state_file } => {
+                    let state_data = handoff::load_state(&state_file)?;
+
+                    println!("\x1b[33m\u{23fa} [plan-executor]\x1b[0m dispatching {} sub-agent(s) (phase: {})",
+                        state_data.handoffs.len(), state_data.phase);
+
+                    let (results, _pgids) = handoff::dispatch_all(
+                        state_data.handoffs,
+                        &config.agents.claude,
+                        &config.agents.codex,
+                        &config.agents.gemini,
+                    ).await;
+
+                    for r in &results {
+                        if r.success {
+                            println!("\x1b[33m\u{23fa} [plan-executor]\x1b[0m sub-agent {} done ({} chars)",
+                                r.index, r.stdout.len());
+                        } else if r.can_fail {
+                            println!("\x1b[33m\u{23fa} [plan-executor]\x1b[0m sub-agent {} skipped (can-fail): {}",
+                                r.index, r.stderr.lines().next().unwrap_or("(no stderr)"));
+                        } else {
+                            eprintln!("\x1b[31m\u{23fa} [plan-executor] sub-agent {} failed: {}\x1b[0m",
+                                r.index, r.stderr.lines().next().unwrap_or("(no stderr)"));
+                        }
+                    }
+
+                    if results.iter().any(|r| !r.success && !r.can_fail) {
+                        crate::executor::consume_handoffs(&state_file);
+                        final_status = Some(false);
+                        break 'outer;
+                    }
+
+                    crate::executor::consume_handoffs(&state_file);
+
+                    println!("\x1b[33m\u{23fa} [plan-executor]\x1b[0m resuming session {}",
+                        &session_id[..session_id.len().min(16)]);
+
+                    let continuation = handoff::build_continuation(&results);
+                    match handoff::resume_execution(
+                        &session_id,
+                        &continuation,
+                        execution_root.clone(),
+                        Some(job_id.clone()),
+                        Some(resolved_path.clone()),
+                        &config.agents.main,
+                    ).await {
+                        Ok((new_child, _new_pgid, new_rx)) => {
+                            child = new_child;
+                            exec_rx = new_rx;
+                            continue 'outer;
+                        }
+                        Err(e) => {
+                            eprintln!("\x1b[31m\u{23fa} [plan-executor] failed to resume session: {}\x1b[0m", e);
+                            final_status = Some(false);
+                            break 'outer;
+                        }
+                    }
+                }
+                ExecEvent::Finished(finished_job) => {
+                    final_status = Some(finished_job.status == crate::jobs::JobStatus::Success);
+                    break 'outer;
+                }
+            }
+        }
+        break;
+    }
+
+    let _ = child;
+    let success = final_status.unwrap_or(false);
+    if !success {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Walk up from a path to find the closest directory containing `.git`.
+fn find_repo_root(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut dir = if path.is_file() {
+        path.parent()?.to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir);
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+}
+
+/// Sends Execute to the daemon, waits just long enough to identify the new
+/// job ID, prints it, and returns immediately.  Use `plan-executor output -f
+/// <job-id>` to watch the live output.
+async fn execute_via_daemon(plan: PathBuf, _config: crate::config::Config) -> Result<()> {
     use crate::ipc::{DaemonEvent, TuiRequest};
-    use crate::jobs::JobStatus;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
-
-    println!("╔══ plan-executor execute (via daemon) ════════════════════════");
-    println!("║  Plan:  {}", plan.display());
-    println!("║  Cmd:   {}", config.agents.main);
-    println!("╚══════════════════════════════════════════════════════════════");
-    println!();
 
     let stream = UnixStream::connect(crate::ipc::socket_path()).await
         .context("Daemon not reachable")?;
@@ -329,68 +507,54 @@ async fn execute_via_daemon(plan: PathBuf, config: crate::config::Config) -> Res
     write_half.write_all(format!("{}\n", gs).as_bytes()).await?;
 
     let mut existing_ids = std::collections::HashSet::<String>::new();
-    if let Ok(Some(line)) = reader.next_line().await {
-        if let Ok(DaemonEvent::State { running_jobs, .. }) = serde_json::from_str(&line) {
+    if let Ok(Some(line)) = reader.next_line().await
+        && let Ok(DaemonEvent::State { running_jobs, .. }) = serde_json::from_str(&line) {
             existing_ids = running_jobs.iter().map(|j| j.id.clone()).collect();
         }
-    }
 
     // Trigger execution.
-    let req = serde_json::to_string(&TuiRequest::Execute {
-        plan_path: plan.to_string_lossy().to_string(),
-    })?;
+    let plan_str = plan.to_string_lossy().to_string();
+    let req = serde_json::to_string(&TuiRequest::Execute { plan_path: plan_str.clone() })?;
     write_half.write_all(format!("{}\n", req).as_bytes()).await?;
 
-    // Stream events until the job finishes.
-    let mut our_job_id: Option<String> = None;
+    let filename = plan.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+
+    // Wait briefly for the State event that includes the new job, so we can
+    // print the job ID.  Time-box to ~2 seconds to avoid hanging.
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(2));
+    tokio::pin!(timeout);
 
     loop {
-        let line = match reader.next_line().await? {
-            Some(l) => l,
-            None => break,
-        };
-        if let Ok(event) = serde_json::from_str::<DaemonEvent>(&line) {
-            match event {
-                DaemonEvent::State { running_jobs, .. } => {
-                    if our_job_id.is_none() {
-                        for j in &running_jobs {
-                            if !existing_ids.contains(&j.id) {
-                                our_job_id = Some(j.id.clone());
-                                break;
+        tokio::select! {
+            line = reader.next_line() => {
+                let Ok(Some(line)) = line else { break };
+                if let Ok(event) = serde_json::from_str::<DaemonEvent>(&line) {
+                    match event {
+                        DaemonEvent::State { running_jobs, .. } => {
+                            if let Some(j) = running_jobs.iter().find(|j| !existing_ids.contains(&j.id)) {
+                                let short_id = &j.id[..j.id.len().min(8)];
+                                println!("Queued {} (job {})", filename, short_id);
+                                println!("Watch: plan-executor output -f {}", short_id);
+                                return Ok(());
                             }
                         }
-                    }
-                }
-                DaemonEvent::JobDisplayLine { job_id, line } => {
-                    let is_ours = our_job_id.as_deref() == Some(&job_id)
-                        || our_job_id.is_none();
-                    if is_ours {
-                        if our_job_id.is_none() { our_job_id = Some(job_id); }
-                        print_display_line(&line);
-                    }
-                }
-                DaemonEvent::JobUpdated { job } => {
-                    if our_job_id.as_deref() == Some(&job.id)
-                        && job.status != JobStatus::Running
-                    {
-                        println!();
-                        println!("╔══ done ═══════════════════════════════════════════════════════");
-                        match job.status {
-                            JobStatus::Success => println!("║  Status:   success"),
-                            JobStatus::Failed  => println!("║  Status:   FAILED"),
-                            other              => println!("║  Status:   {:?}", other),
+                        DaemonEvent::Error { message } => {
+                            eprintln!("Error: {}", message);
+                            return Ok(());
                         }
-                        if let Some(ms) = job.duration_ms {
-                            println!("║  Duration: {}s", ms / 1000);
-                        }
-                        println!("╚══════════════════════════════════════════════════════════════");
-                        break;
+                        _ => {}
                     }
                 }
-                _ => {}
+            }
+            _ = &mut timeout => {
+                println!("Queued {}", filename);
+                println!("Watch: plan-executor output -f <job-id>");
+                return Ok(());
             }
         }
     }
+
+    println!("Queued {}", filename);
     Ok(())
 }
 
@@ -527,6 +691,48 @@ fn list_jobs() {
             id_w = id_w, plan_w = plan_w, status_w = status_w, dur_w = dur_w,
         );
     }
+
+    // Show remote executions if remote_repo is configured
+    let config = crate::config::Config::load(None).ok();
+    if let Some(remote_repo) = config.and_then(|c| c.remote_repo) {
+        match crate::remote::list_remote_executions(&remote_repo) {
+            Ok(remote_jobs) if !remote_jobs.is_empty() => {
+                println!();
+                println!("Remote ({}):", remote_repo);
+                let pr_w = 6;
+                let r_plan_w = 34;
+                let r_status_w = 10;
+                let target_w = 30;
+                println!(
+                    "{:<pr_w$}  {:<r_plan_w$}  {:<r_status_w$}  TARGET",
+                    "PR", "PLAN", "STATUS",
+                    pr_w = pr_w, r_plan_w = r_plan_w, r_status_w = r_status_w,
+                );
+                println!("{}", "─".repeat(pr_w + 2 + r_plan_w + 2 + r_status_w + 2 + target_w));
+                for rj in &remote_jobs {
+                    let plan_truncated = if rj.plan_name.len() > r_plan_w {
+                        format!("{}…", &rj.plan_name[..r_plan_w - 1])
+                    } else {
+                        rj.plan_name.clone()
+                    };
+                    let target_truncated = if rj.target.len() > target_w {
+                        format!("{}…", &rj.target[..target_w - 1])
+                    } else {
+                        rj.target.clone()
+                    };
+                    println!(
+                        "#{:<width$}  {:<r_plan_w$}  {:<r_status_w$}  {}",
+                        rj.number, plan_truncated, rj.status, target_truncated,
+                        width = pr_w - 1, r_plan_w = r_plan_w, r_status_w = r_status_w,
+                    );
+                }
+            }
+            Ok(_) => {} // no remote jobs, don't print header
+            Err(e) => {
+                eprintln!("(could not fetch remote jobs: {})", e);
+            }
+        }
+    }
 }
 
 /// Start the daemon if it is not already running. Used by the shell hook.
@@ -644,4 +850,154 @@ async fn show_status() -> Result<()> {
         println!("Daemon not running");
     }
     Ok(())
+}
+
+fn remote_setup() {
+    use std::io::{self, BufRead, Write};
+
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+
+    // Check gh CLI
+    if std::process::Command::new("gh").arg("--version").output().is_err() {
+        eprintln!("Error: gh CLI not found. Install: https://cli.github.com");
+        std::process::exit(1);
+    }
+
+    // Step 1: Execution repo
+    let current_repo = crate::config::Config::load(None)
+        .ok()
+        .and_then(|c| c.remote_repo);
+    let default_display = current_repo.as_deref().unwrap_or("owner/plan-executions");
+    print!("Execution repo [{}]: ", default_display);
+    let _ = stdout.flush();
+    let mut repo_input = String::new();
+    stdin.lock().read_line(&mut repo_input).unwrap();
+    let repo_input = repo_input.trim();
+    let remote_repo = if repo_input.is_empty() {
+        default_display.to_string()
+    } else {
+        repo_input.to_string()
+    };
+
+    if !crate::remote::validate_repo_slug(&remote_repo) {
+        eprintln!("Error: invalid repo slug '{}'. Expected format: owner/repo", remote_repo);
+        std::process::exit(1);
+    }
+
+    // Save to config
+    match crate::config::Config::load(None) {
+        Ok(mut config) => {
+            config.remote_repo = Some(remote_repo.clone());
+            let config_path = crate::config::Config::config_path();
+            if let Ok(json) = serde_json::to_string_pretty(&config) {
+                let _ = std::fs::write(&config_path, json);
+                println!("  Saved to {}", config_path.display());
+            }
+        }
+        Err(e) => {
+            eprintln!("  Warning: could not update config: {}", e);
+        }
+    }
+
+    // Step 2: GitHub PAT
+    println!();
+    println!("GitHub PAT for cloning org repos:");
+    println!("  Create one at: https://github.com/settings/personal-access-tokens/new");
+    println!("  Scope: your org, permission: Contents -> Read");
+    print!("  Paste token: ");
+    let _ = stdout.flush();
+    let mut pat = String::new();
+    stdin.lock().read_line(&mut pat).unwrap();
+    let pat = pat.trim();
+    if !pat.is_empty() {
+        match gh_secret_set(&remote_repo, "TARGET_REPO_TOKEN", pat) {
+            Ok(()) => println!("  Stored as TARGET_REPO_TOKEN"),
+            Err(e) => eprintln!("  Error: {}", e),
+        }
+    } else {
+        println!("  Skipped.");
+    }
+
+    // Step 3: Anthropic API key
+    println!();
+    print!("Anthropic API key: ");
+    let _ = stdout.flush();
+    let mut anthropic = String::new();
+    stdin.lock().read_line(&mut anthropic).unwrap();
+    let anthropic = anthropic.trim();
+    if !anthropic.is_empty() {
+        match gh_secret_set(&remote_repo, "ANTHROPIC_API_KEY", anthropic) {
+            Ok(()) => println!("  Stored as ANTHROPIC_API_KEY"),
+            Err(e) => eprintln!("  Error: {}", e),
+        }
+    } else {
+        println!("  Skipped.");
+    }
+
+    // Step 4: Codex auth
+    println!();
+    print!("Codex auth — (o)auth / (a)pi key / (s)kip: ");
+    let _ = stdout.flush();
+    let mut codex_choice = String::new();
+    stdin.lock().read_line(&mut codex_choice).unwrap();
+    match codex_choice.trim() {
+        "o" | "oauth" => {
+            let auth_path = dirs::home_dir()
+                .expect("home dir")
+                .join(".codex")
+                .join("auth.json");
+            if auth_path.exists() {
+                match std::fs::read_to_string(&auth_path) {
+                    Ok(content) => {
+                        println!("  Read {}", auth_path.display());
+                        match gh_secret_set(&remote_repo, "CODEX_AUTH", &content) {
+                            Ok(()) => println!("  Stored as CODEX_AUTH"),
+                            Err(e) => eprintln!("  Error: {}", e),
+                        }
+                    }
+                    Err(e) => eprintln!("  Error reading {}: {}", auth_path.display(), e),
+                }
+            } else {
+                eprintln!("  {} not found. Run codex login first.", auth_path.display());
+            }
+        }
+        "a" | "api" => {
+            print!("  OpenAI API key: ");
+            let _ = stdout.flush();
+            let mut openai = String::new();
+            stdin.lock().read_line(&mut openai).unwrap();
+            let openai = openai.trim();
+            if !openai.is_empty() {
+                match gh_secret_set(&remote_repo, "OPENAI_API_KEY", openai) {
+                    Ok(()) => println!("  Stored as OPENAI_API_KEY"),
+                    Err(e) => eprintln!("  Error: {}", e),
+                }
+            }
+        }
+        _ => println!("  Skipped."),
+    }
+
+    // Step 5: Gemini API key
+    println!();
+    print!("Gemini API key (enter to skip): ");
+    let _ = stdout.flush();
+    let mut gemini = String::new();
+    stdin.lock().read_line(&mut gemini).unwrap();
+    let gemini = gemini.trim();
+    if !gemini.is_empty() {
+        match gh_secret_set(&remote_repo, "GEMINI_API_KEY", gemini) {
+            Ok(()) => println!("  Stored as GEMINI_API_KEY"),
+            Err(e) => eprintln!("  Error: {}", e),
+        }
+    } else {
+        println!("  Skipped.");
+    }
+
+    println!();
+    println!("Setup complete. Remote execution ready.");
+}
+
+fn gh_secret_set(repo: &str, name: &str, value: &str) -> Result<()> {
+    crate::remote::gh_secret_set_stdin(name, repo, value)
 }

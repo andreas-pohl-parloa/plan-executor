@@ -1,4 +1,4 @@
-use libc;
+
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -286,6 +286,46 @@ async fn handle_rescan(state: &Arc<Mutex<DaemonState>>, config: &Config) {
 
 pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str) {
     let plan = PathBuf::from(plan_path);
+
+    // Route remote plans to GitHub PR trigger instead of local execution.
+    if crate::plan::parse_execution_mode(&plan) == crate::plan::ExecutionMode::Remote {
+        let config = { state.lock().await.config.clone() };
+        if let Some(remote_repo) = config.remote_repo.as_deref() {
+            let plan_filename = plan.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("plan.md")
+                .to_string();
+            let plan_dir = plan.parent().unwrap_or(&plan).to_path_buf();
+            match crate::remote::gather_git_context(&plan_dir) {
+                Ok((target_repo, target_ref, target_branch)) => {
+                    let meta = crate::remote::ExecutionMetadata {
+                        target_repo,
+                        target_ref,
+                        target_branch,
+                        plan_filename,
+                        started_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    let _ = crate::remote::push_codex_auth(remote_repo);
+                    match crate::remote::trigger_remote_execution(remote_repo, &plan, &meta) {
+                        Ok(url) => tracing::info!(url = %url, "remote execution triggered"),
+                        Err(e) => tracing::error!(error = %e, "remote execution failed"),
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(plan = %plan_path, error = %e, "remote execution: could not determine git context");
+                }
+            }
+            let mut st = state.lock().await;
+            st.pending_plans.remove(plan_path);
+            let event = st.snapshot_state();
+            let _ = st.event_tx.send(event);
+            return;
+        } else {
+            tracing::error!("remote execution: remote_repo not configured");
+        }
+        return;
+    }
+
     let execution_root = find_repo_root(&plan)
         .unwrap_or_else(|| plan.parent().unwrap_or(&plan).to_path_buf());
 
@@ -444,12 +484,12 @@ pub async fn retry_handoff_from_state(
         }
 
         if results.iter().any(|r| !r.success && !r.can_fail) {
-            let _ = std::fs::remove_file(&state_file);
+            crate::executor::consume_handoffs(&state_file);
             fail_job_cleanup(&state_clone, &job_id_full).await;
             return;
         }
 
-        let _ = std::fs::remove_file(&state_file);
+        crate::executor::consume_handoffs(&state_file);
 
         {
             let line = format!("⏺ [plan-executor] resuming session {}", &session_id[..session_id.len().min(16)]);
@@ -552,12 +592,14 @@ async fn run_exec_event_loop(
                     }
                 }
                 ExecEvent::HandoffRequired { session_id, state_file } => {
-                    // Persist Running status to disk before the (potentially long)
-                    // sub-agent dispatch. A daemon kill during dispatch will then
-                    // show this job as Failed on next startup, not Success.
+                    // Store session_id on the running job and persist to disk
+                    // before the (potentially long) sub-agent dispatch. A daemon
+                    // kill during dispatch will then show this job as Failed on
+                    // next startup and `retry` can resume with the session_id.
                     {
-                        let st = state.lock().await;
-                        if let Some(job) = st.running_jobs.get(&job_id) {
+                        let mut st = state.lock().await;
+                        if let Some(job) = st.running_jobs.get_mut(&job_id) {
+                            job.session_id = Some(session_id.clone());
                             let _ = job.save();
                         }
                     }
@@ -633,11 +675,11 @@ async fn run_exec_event_loop(
                     }
 
                     if results.iter().any(|r| !r.success && !r.can_fail) {
-                        let _ = std::fs::remove_file(&state_file);
+                        crate::executor::consume_handoffs(&state_file);
                         break 'outer;
                     }
 
-                    let _ = std::fs::remove_file(&state_file);
+                    crate::executor::consume_handoffs(&state_file);
 
                     {
                         let line = format!("⏺ [plan-executor] resuming session {}", &session_id[..session_id.len().min(16)]);
@@ -677,18 +719,40 @@ async fn run_exec_event_loop(
                     }
                 }
                 ExecEvent::Finished(finished_job) => {
-                    let _ = finished_job.save();
-                    let success = finished_job.status == JobStatus::Success;
                     let mut st = state.lock().await;
-                    st.running_jobs.remove(&job_id);
+                    // Merge result fields from the resume placeholder into
+                    // the original running job (which has the correct
+                    // started_at from initial trigger_execution).
+                    let mut job = if let Some(running) = st.running_jobs.remove(&job_id) {
+                        running
+                    } else {
+                        finished_job.clone()
+                    };
+                    job.status = finished_job.status;
+                    job.model = job.model.or(finished_job.model);
+                    job.session_id = job.session_id.or(finished_job.session_id);
+                    job.input_tokens = finished_job.input_tokens.or(job.input_tokens);
+                    job.output_tokens = finished_job.output_tokens.or(job.output_tokens);
+                    job.cache_creation_tokens = finished_job.cache_creation_tokens.or(job.cache_creation_tokens);
+                    job.cache_read_tokens = finished_job.cache_read_tokens.or(job.cache_read_tokens);
+                    job.finished_at = Some(chrono::Utc::now());
+                    // Wall-clock duration from actual start to now, not
+                    // the per-turn duration_ms from the result event.
+                    job.duration_ms = Some(
+                        (chrono::Utc::now() - job.started_at)
+                            .num_milliseconds()
+                            .max(0) as u64,
+                    );
+                    let _ = job.save();
+                    let success = job.status == JobStatus::Success;
                     st.running_children.remove(&job_id);
                     st.process_group_ids.remove(&job_id);
                     st.sub_agent_pgids.remove(&job_id);
                     st.job_output.remove(&job_id);
                     st.job_display_output.remove(&job_id);
-                    st.history.insert(0, finished_job.clone());
+                    st.history.insert(0, job.clone());
                     let _ = notify_execution_complete(&plan_path_owned, success);
-                    let _ = st.event_tx.send(DaemonEvent::JobUpdated { job: finished_job });
+                    let _ = st.event_tx.send(DaemonEvent::JobUpdated { job });
                     break 'outer;
                 }
             }
@@ -699,8 +763,8 @@ async fn run_exec_event_loop(
     // Clean up job if it never finished (resume failure or channel closed)
     {
         let mut st = state.lock().await;
-        if let Some(mut job) = st.running_jobs.remove(&job_id) {
-            if job.status == JobStatus::Running {
+        if let Some(mut job) = st.running_jobs.remove(&job_id)
+            && job.status == JobStatus::Running {
                 job.status = JobStatus::Failed;
                 job.finished_at = Some(chrono::Utc::now());
                 let _ = job.save();
@@ -712,7 +776,6 @@ async fn run_exec_event_loop(
                 st.job_display_output.remove(&job_id);
                 let _ = st.event_tx.send(DaemonEvent::JobUpdated { job });
             }
-        }
     }
 }
 
@@ -763,11 +826,10 @@ async fn handle_tui_client(
             }
             // Outgoing daemon event
             Ok(event) = event_rx.recv() => {
-                if let Ok(json) = serde_json::to_string(&event) {
-                    if write_half.write_all(format!("{}\n", json).as_bytes()).await.is_err() {
+                if let Ok(json) = serde_json::to_string(&event)
+                    && write_half.write_all(format!("{}\n", json).as_bytes()).await.is_err() {
                         break;
                     }
-                }
             }
         }
     }
@@ -801,12 +863,11 @@ async fn handle_tui_request(
             let mut st = state.lock().await;
 
             // Kill the main agent's process group
-            if let Some(pgid) = st.process_group_ids.remove(&job_id) {
-                if pgid > 0 {
+            if let Some(pgid) = st.process_group_ids.remove(&job_id)
+                && pgid > 0 {
                     #[cfg(unix)]
                     unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL); }
                 }
-            }
             // Kill any active handoff sub-agent process groups
             if let Some(pgids) = st.sub_agent_pgids.remove(&job_id) {
                 for pgid in pgids {

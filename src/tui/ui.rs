@@ -322,7 +322,7 @@ fn scroll_start(lines: &[String], target_rows: usize, col_width: usize) -> usize
     let mut rows = 0usize;
     for i in (0..lines.len()).rev() {
         let w = ansi_display_width(&lines[i]);
-        let line_rows = ((w + col_width - 1) / col_width).max(1);
+        let line_rows = w.div_ceil(col_width).max(1);
         if rows + line_rows > target_rows {
             // Including this line would exceed the visible area — start one
             // line later so the tail is never clipped at the bottom.
