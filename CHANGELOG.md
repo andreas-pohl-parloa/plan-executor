@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.13] - 2026-04-08
+
+### Bug Fixes
+
+- **ci:** Downgrade to edition 2021 to fix Linux builds ([9d9ff3b](https://github.com/andreas-pohl-parloa/plan-executor/commit/9d9ff3b88c34c8567d1e209483c704f30c028f34))
 ## [0.1.12] - 2026-04-08
 
 ### Bug Fixes
