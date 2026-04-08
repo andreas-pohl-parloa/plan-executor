@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.2] - 2026-04-08
+
+### Bug Fixes
+
+- Avoid anyhow::Context ambiguity in cross-compilation ([91efe12](https://github.com/andreas-pohl-parloa/plan-executor/commit/91efe12680a149b99c5e124f289b9ec322867506))
 ## [0.1.1] - 2026-04-08
 
 ### Bug Fixes
