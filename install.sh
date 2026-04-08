@@ -6,10 +6,96 @@ BASE_DIR="$HOME/.plan-executor"
 LOG_FILE="$BASE_DIR/daemon.log"
 BINARY="$HOME/.cargo/bin/plan-executor"
 MARKER="# plan-executor"
+REPO_SLUG="andreas-pohl-parloa/plan-executor"
+BINARY_NAME="plan-executor"
 
 ACTION="${1:-install}"
 
 # ── helpers ────────────────────────────────────────────────────────────────
+
+_detect_platform() {
+    local os arch
+    os="$(uname -s)"
+    arch="$(uname -m)"
+    case "$os" in
+        Darwin)
+            case "$arch" in
+                arm64) echo "macos-arm64" ;;
+                *)     echo "" ;;
+            esac
+            ;;
+        Linux)
+            case "$arch" in
+                x86_64)  echo "linux-x86_64" ;;
+                aarch64) echo "linux-arm64" ;;
+                *)       echo "" ;;
+            esac
+            ;;
+        *) echo "" ;;
+    esac
+}
+
+_install_from_binary() {
+    local platform
+    platform="$(_detect_platform)"
+    if [[ -z "$platform" ]]; then
+        return 1
+    fi
+
+    if ! command -v gh >/dev/null 2>&1; then
+        echo "  gh CLI not found, skipping binary download."
+        return 1
+    fi
+
+    local latest_tag
+    latest_tag="$(gh release view --repo "$REPO_SLUG" --json tagName --jq '.tagName' 2>/dev/null || echo "")"
+    if [[ -z "$latest_tag" ]]; then
+        echo "  No release found."
+        return 1
+    fi
+
+    local asset="plan-executor-${platform}.zip"
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+
+    echo "  Downloading pre-built binary ($latest_tag, $platform)..."
+    if ! gh release download "$latest_tag" \
+            --repo "$REPO_SLUG" \
+            --pattern "$asset" \
+            --dir "$tmpdir" 2>/dev/null; then
+        rm -rf "$tmpdir"
+        echo "  Binary download failed."
+        return 1
+    fi
+
+    if ! unzip -q "$tmpdir/$asset" -d "$tmpdir"; then
+        rm -rf "$tmpdir"
+        echo "  Unzip failed."
+        return 1
+    fi
+
+    local extracted="$tmpdir/$BINARY_NAME"
+    if [[ ! -f "$extracted" ]]; then
+        rm -rf "$tmpdir"
+        echo "  Binary not found in zip."
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$BINARY")"
+    cp "$extracted" "$BINARY"
+    chmod 755 "$BINARY"
+    rm -rf "$tmpdir"
+
+    # macOS: re-sign for Gatekeeper
+    if [[ "$(uname -s)" = "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
+        codesign --force --sign - "$BINARY" 2>/dev/null || true
+    fi
+
+    mkdir -p "$BASE_DIR"
+    echo "binary" > "$BASE_DIR/install-mode"
+    echo "${latest_tag#v}" > "$BASE_DIR/installed-version"
+    return 0
+}
 
 _ensure_config() {
     local config="$BASE_DIR/config.json"
@@ -30,6 +116,7 @@ EOCFG
 }
 
 _remove_legacy_launchd() {
+    [[ "$(uname -s)" = "Darwin" ]] || return 0
     local label="com.plan-executor.daemon"
     local plist="$HOME/Library/LaunchAgents/$label.plist"
     if launchctl list "$label" &>/dev/null; then
@@ -84,14 +171,22 @@ install)
     # Stop the running daemon (if any) via the binary itself.
     "$BINARY" stop 2>/dev/null || true
 
-    echo "Updating git submodules..."
-    git -C "$SCRIPT_DIR" submodule update --init --remote stream-json-view
-    echo "Building and installing plan-executor..."
-    cargo install --path "$SCRIPT_DIR"
-    echo "Installed: $BINARY"
+    if [[ -z "${PE_SKIP_BINARY:-}" ]] && _install_from_binary; then
+        echo "Installed from pre-built binary: $BINARY"
+    else
+        echo "Updating git submodules..."
+        git -C "$SCRIPT_DIR" submodule update --init --remote stream-json-view
+        echo "Building and installing plan-executor..."
+        cargo install --path "$SCRIPT_DIR"
+        echo "Installed: $BINARY"
+        mkdir -p "$BASE_DIR"
+        echo "source" > "$BASE_DIR/install-mode"
+    fi
 
-    # Install notification icon
-    cp "$SCRIPT_DIR/assets/icon.png" "$BASE_DIR/icon.png"
+    # Install notification icon (only when running from repo checkout)
+    if [[ -f "$SCRIPT_DIR/assets/icon.png" ]]; then
+        cp "$SCRIPT_DIR/assets/icon.png" "$BASE_DIR/icon.png"
+    fi
 
     _ensure_config
     _add_shell_hook
