@@ -13,28 +13,55 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     if: startsWith(github.head_ref, 'exec/')
+    environment: execution
 
     steps:
       - name: Checkout execution repo
         uses: actions/checkout@v4
 
-      - name: Parse execution metadata
+      - name: Parse and validate execution metadata
         id: meta
         run: |
           TARGET_REPO=$(jq -r '.target_repo' execution.json)
           TARGET_REF=$(jq -r '.target_ref' execution.json)
           TARGET_BRANCH=$(jq -r '.target_branch' execution.json)
           PLAN_FILENAME=$(jq -r '.plan_filename' execution.json)
+
+          # Validate repo slug format (owner/repo)
+          if ! echo "$TARGET_REPO" | grep -qP '^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$'; then
+            echo "::error::Invalid target_repo: $TARGET_REPO"
+            exit 1
+          fi
+          # Validate target_ref is a 40-char hex SHA
+          if ! echo "$TARGET_REF" | grep -qP '^[0-9a-f]{40}$'; then
+            echo "::error::Invalid target_ref (must be full SHA): $TARGET_REF"
+            exit 1
+          fi
+          # Validate branch name (no shell metacharacters)
+          if ! echo "$TARGET_BRANCH" | grep -qP '^[a-zA-Z0-9._/-]+$'; then
+            echo "::error::Invalid target_branch: $TARGET_BRANCH"
+            exit 1
+          fi
+          # Validate plan filename (no path traversal or special chars)
+          if echo "$PLAN_FILENAME" | grep -qP '[/\.\.]|[^a-zA-Z0-9._-]'; then
+            echo "::error::Invalid plan_filename: $PLAN_FILENAME"
+            exit 1
+          fi
+
           echo "target_repo=${TARGET_REPO}" >> "$GITHUB_OUTPUT"
           echo "target_ref=${TARGET_REF}" >> "$GITHUB_OUTPUT"
           echo "target_branch=${TARGET_BRANCH}" >> "$GITHUB_OUTPUT"
           echo "plan_filename=${PLAN_FILENAME}" >> "$GITHUB_OUTPUT"
 
       - name: Clone target repo
+        env:
+          TARGET_REPO: ${{ steps.meta.outputs.target_repo }}
+          TARGET_REF: ${{ steps.meta.outputs.target_ref }}
+          TARGET_REPO_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
         run: |
-          git clone "https://x-access-token:${{ secrets.TARGET_REPO_TOKEN }}@github.com/${{ steps.meta.outputs.target_repo }}.git" workspace
+          git clone "https://x-access-token:${TARGET_REPO_TOKEN}@github.com/${TARGET_REPO}.git" workspace
           cd workspace
-          git checkout "${{ steps.meta.outputs.target_ref }}"
+          git checkout "$TARGET_REF"
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -71,52 +98,68 @@ jobs:
         run: |
           if [ -n "$CODEX_AUTH" ]; then
             mkdir -p ~/.codex
-            echo "$CODEX_AUTH" > ~/.codex/auth.json
+            printenv CODEX_AUTH > ~/.codex/auth.json
+            chmod 600 ~/.codex/auth.json
           fi
         env:
           CODEX_AUTH: ${{ secrets.CODEX_AUTH }}
 
       - name: Copy plan into target repo
+        env:
+          PLAN_FILENAME: ${{ steps.meta.outputs.plan_filename }}
         run: |
           PLAN_DIR="workspace/.my/plans"
           mkdir -p "$PLAN_DIR"
-          cp plan.md "$PLAN_DIR/${{ steps.meta.outputs.plan_filename }}"
+          cp plan.md "$PLAN_DIR/$PLAN_FILENAME"
           if [ -d prompt-files ]; then
             cp prompt-files/* "$PLAN_DIR/" 2>/dev/null || true
           fi
 
       - name: Execute plan
         id: execute
-        run: |
-          cd workspace
-          plan-executor execute -f ".my/plans/${{ steps.meta.outputs.plan_filename }}"
         env:
+          PLAN_FILENAME: ${{ steps.meta.outputs.plan_filename }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          cd workspace
+          plan-executor execute -f ".my/plans/$PLAN_FILENAME"
 
       - name: Post result comment
         if: always()
+        env:
+          EXECUTE_OUTCOME: ${{ steps.execute.outcome }}
+          TARGET_REPO: ${{ steps.meta.outputs.target_repo }}
+          TARGET_REF: ${{ steps.meta.outputs.target_ref }}
+          TARGET_BRANCH: ${{ steps.meta.outputs.target_branch }}
+          PLAN_FILENAME: ${{ steps.meta.outputs.plan_filename }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          if [ "${{ steps.execute.outcome }}" = "success" ]; then
+          if [ "$EXECUTE_OUTCOME" = "success" ]; then
             STATUS="succeeded"
           else
             STATUS="failed"
           fi
-          REF_SHORT=$(echo "${{ steps.meta.outputs.target_ref }}" | cut -c1-12)
-          gh pr comment "${{ github.event.pull_request.number }}" \
-            --repo "${{ github.repository }}" \
+          REF_SHORT="${TARGET_REF:0:12}"
+          gh pr comment "$PR_NUMBER" \
+            --repo "$GH_REPO" \
             --body "## Execution Complete
 
           **Status:** ${STATUS}
-          **Target:** ${{ steps.meta.outputs.target_repo }}@${REF_SHORT}
-          **Branch:** ${{ steps.meta.outputs.target_branch }}
-          **Plan:** ${{ steps.meta.outputs.plan_filename }}"
+          **Target:** ${TARGET_REPO}@${REF_SHORT}
+          **Branch:** ${TARGET_BRANCH}
+          **Plan:** ${PLAN_FILENAME}"
 
-          gh pr close "${{ github.event.pull_request.number }}" \
-            --repo "${{ github.repository }}" || true
-          gh pr edit "${{ github.event.pull_request.number }}" \
-            --repo "${{ github.repository }}" \
+          gh pr close "$PR_NUMBER" \
+            --repo "$GH_REPO" || true
+          gh pr edit "$PR_NUMBER" \
+            --repo "$GH_REPO" \
             --add-label "${STATUS}" || true
-        env:
-          GH_TOKEN: ${{ github.token }}
+
+      - name: Cleanup credentials
+        if: always()
+        run: |
+          rm -f ~/.codex/auth.json

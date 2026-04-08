@@ -29,6 +29,10 @@ pub fn branch_name(plan_filename: &str, iso_timestamp: &str) -> String {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or(plan_filename);
+    // Sanitize stem: keep only safe characters for git branch names
+    let safe_stem: String = stem.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
+        .collect();
     // Parse "2026-04-08T14:30:22Z" -> "20260408-143022"
     let ts = iso_timestamp
         .replace(['-', ':'], "")
@@ -36,7 +40,7 @@ pub fn branch_name(plan_filename: &str, iso_timestamp: &str) -> String {
         .replace('Z', "");
     // Truncate to YYYYMMDD-HHMMSS (15 chars)
     let ts_short = &ts[..ts.len().min(15)];
-    format!("exec/{}-{}", ts_short, stem)
+    format!("exec/{}-{}", ts_short, safe_stem)
 }
 
 /// Gathers git context from the specified directory.
@@ -60,15 +64,27 @@ pub fn gather_git_context(repo_dir: &Path) -> Result<(String, String, String)> {
 /// SSH (`git@github.com:owner/repo.git`) formats.
 pub fn parse_repo_slug(url: &str) -> Option<String> {
     let url = url.trim();
-    if let Some(path) = url.strip_prefix("https://github.com/") {
-        let slug = path.trim_end_matches(".git");
-        Some(slug.to_string())
+    let slug = if let Some(path) = url.strip_prefix("https://github.com/") {
+        path.trim_end_matches(".git").to_string()
     } else if let Some(path) = url.strip_prefix("git@github.com:") {
-        let slug = path.trim_end_matches(".git");
-        Some(slug.to_string())
+        path.trim_end_matches(".git").to_string()
     } else {
-        None
-    }
+        return None;
+    };
+    // Validate owner/repo format — reject traversal or injection attempts
+    if validate_repo_slug(&slug) { Some(slug) } else { None }
+}
+
+/// Returns true if the string matches a valid `owner/repo` GitHub slug.
+pub fn validate_repo_slug(slug: &str) -> bool {
+    let parts: Vec<&str> = slug.splitn(3, '/').collect();
+    if parts.len() != 2 { return false; }
+    let valid_part = |s: &str| {
+        !s.is_empty()
+            && !s.contains("..")
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    };
+    valid_part(parts[0]) && valid_part(parts[1])
 }
 
 /// Finds `.tmp-subtask-*.md` files co-located with the plan file.
@@ -95,15 +111,14 @@ pub fn find_prompt_files(plan_path: &Path) -> Vec<PathBuf> {
 /// Returns an error if reading the auth file or the `gh` command fails.
 pub fn push_codex_auth(remote_repo: &str) -> Result<()> {
     let auth_path = dirs::home_dir()
-        .expect("home dir must exist")
+        .context("could not determine home directory")?
         .join(".codex")
         .join("auth.json");
     if !auth_path.exists() {
         return Ok(()); // no auth file, skip
     }
     let content = std::fs::read_to_string(&auth_path)?;
-    run_gh(&["secret", "set", "CODEX_AUTH", "--repo", remote_repo, "--body", &content])?;
-    Ok(())
+    gh_secret_set_stdin("CODEX_AUTH", remote_repo, &content)
 }
 
 /// Creates a branch with plan files and execution metadata in the execution repo,
@@ -274,6 +289,11 @@ fn get_main_sha(remote_repo: &str) -> Result<String> {
 }
 
 fn push_file_to_branch(repo: &str, branch: &str, path: &str, content: &str) -> Result<()> {
+    // Reject path traversal attempts
+    anyhow::ensure!(
+        !path.contains("..") && !path.starts_with('/'),
+        "invalid file path: {}", path
+    );
     // GitHub Contents API requires base64-encoded content
     let encoded = base64_encode(content.as_bytes());
     run_gh(&[
@@ -283,6 +303,28 @@ fn push_file_to_branch(repo: &str, branch: &str, path: &str, content: &str) -> R
         "-f", &format!("branch={}", branch),
         "-f", &format!("content={}", encoded),
     ]).map(|_| ())
+}
+
+/// Pipes a secret value via stdin to `gh secret set` to avoid leaking it
+/// in process arguments visible via `ps aux` / `/proc/*/cmdline`.
+pub fn gh_secret_set_stdin(name: &str, repo: &str, value: &str) -> Result<()> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = std::process::Command::new("gh")
+        .args(["secret", "set", name, "--repo", repo])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to run gh")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(value.as_bytes())?;
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        anyhow::bail!("gh secret set {} failed: {}", name, String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(())
 }
 
 fn base64_encode(input: &[u8]) -> String {

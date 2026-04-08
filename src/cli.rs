@@ -880,6 +880,11 @@ fn remote_setup() {
         repo_input.to_string()
     };
 
+    if !crate::remote::validate_repo_slug(&remote_repo) {
+        eprintln!("Error: invalid repo slug '{}'. Expected format: owner/repo", remote_repo);
+        std::process::exit(1);
+    }
+
     // Save to config
     match crate::config::Config::load(None) {
         Ok(mut config) => {
@@ -994,12 +999,5 @@ fn remote_setup() {
 }
 
 fn gh_secret_set(repo: &str, name: &str, value: &str) -> Result<()> {
-    let output = std::process::Command::new("gh")
-        .args(["secret", "set", name, "--repo", repo, "--body", value])
-        .output()
-        .context("failed to run gh")?;
-    if !output.status.success() {
-        anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr));
-    }
-    Ok(())
+    crate::remote::gh_secret_set_stdin(name, repo, value)
 }
