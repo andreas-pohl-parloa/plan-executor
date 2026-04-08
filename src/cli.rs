@@ -59,6 +59,8 @@ pub enum Commands {
         /// Job ID prefix (from `plan-executor jobs`)
         job_id: String,
     },
+    /// Interactive wizard to configure remote execution secrets
+    RemoteSetup,
 }
 
 /// Prints a display line to the terminal, coloring plan-executor prefix lines
@@ -86,6 +88,7 @@ pub fn run() {
         Commands::Stop   => { stop_daemon(); return; }
         Commands::Jobs   => { list_jobs(); return; }
         Commands::Ensure => { ensure_daemon(); return; }
+        Commands::RemoteSetup => { remote_setup(); return; }
         Commands::Kill   { job_id } => { daemon_job_request("kill",    job_id); return; }
         Commands::Pause  { job_id } => { daemon_job_request("pause",   job_id); return; }
         Commands::Unpause{ job_id } => { daemon_job_request("unpause", job_id); return; }
@@ -126,7 +129,7 @@ pub fn run() {
         Commands::Status => rt.block_on(show_status()),
         Commands::Output { job_id, follow } => rt.block_on(output_job(job_id, follow)),
         Commands::Retry { job_id } => rt.block_on(retry_job(job_id)),
-        Commands::Stop | Commands::Jobs | Commands::Ensure
+        Commands::Stop | Commands::Jobs | Commands::Ensure | Commands::RemoteSetup
         | Commands::Kill { .. } | Commands::Pause { .. } | Commands::Unpause { .. } => unreachable!(),
     };
 
@@ -862,6 +865,158 @@ async fn show_status() -> Result<()> {
         println!("Daemon running  pid={}  socket={}", pid, sock.display());
     } else {
         println!("Daemon not running");
+    }
+    Ok(())
+}
+
+fn remote_setup() {
+    use std::io::{self, BufRead, Write};
+
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+
+    // Check gh CLI
+    if std::process::Command::new("gh").arg("--version").output().is_err() {
+        eprintln!("Error: gh CLI not found. Install: https://cli.github.com");
+        std::process::exit(1);
+    }
+
+    // Step 1: Execution repo
+    let current_repo = crate::config::Config::load(None)
+        .ok()
+        .and_then(|c| c.remote_repo);
+    let default_display = current_repo.as_deref().unwrap_or("owner/plan-executions");
+    print!("Execution repo [{}]: ", default_display);
+    let _ = stdout.flush();
+    let mut repo_input = String::new();
+    stdin.lock().read_line(&mut repo_input).unwrap();
+    let repo_input = repo_input.trim();
+    let remote_repo = if repo_input.is_empty() {
+        default_display.to_string()
+    } else {
+        repo_input.to_string()
+    };
+
+    // Save to config
+    match crate::config::Config::load(None) {
+        Ok(mut config) => {
+            config.remote_repo = Some(remote_repo.clone());
+            let config_path = crate::config::Config::config_path();
+            if let Ok(json) = serde_json::to_string_pretty(&config) {
+                let _ = std::fs::write(&config_path, json);
+                println!("  Saved to {}", config_path.display());
+            }
+        }
+        Err(e) => {
+            eprintln!("  Warning: could not update config: {}", e);
+        }
+    }
+
+    // Step 2: GitHub PAT
+    println!();
+    println!("GitHub PAT for cloning org repos:");
+    println!("  Create one at: https://github.com/settings/personal-access-tokens/new");
+    println!("  Scope: your org, permission: Contents -> Read");
+    print!("  Paste token: ");
+    let _ = stdout.flush();
+    let mut pat = String::new();
+    stdin.lock().read_line(&mut pat).unwrap();
+    let pat = pat.trim();
+    if !pat.is_empty() {
+        match gh_secret_set(&remote_repo, "TARGET_REPO_TOKEN", pat) {
+            Ok(()) => println!("  Stored as TARGET_REPO_TOKEN"),
+            Err(e) => eprintln!("  Error: {}", e),
+        }
+    } else {
+        println!("  Skipped.");
+    }
+
+    // Step 3: Anthropic API key
+    println!();
+    print!("Anthropic API key: ");
+    let _ = stdout.flush();
+    let mut anthropic = String::new();
+    stdin.lock().read_line(&mut anthropic).unwrap();
+    let anthropic = anthropic.trim();
+    if !anthropic.is_empty() {
+        match gh_secret_set(&remote_repo, "ANTHROPIC_API_KEY", anthropic) {
+            Ok(()) => println!("  Stored as ANTHROPIC_API_KEY"),
+            Err(e) => eprintln!("  Error: {}", e),
+        }
+    } else {
+        println!("  Skipped.");
+    }
+
+    // Step 4: Codex auth
+    println!();
+    print!("Codex auth — (o)auth / (a)pi key / (s)kip: ");
+    let _ = stdout.flush();
+    let mut codex_choice = String::new();
+    stdin.lock().read_line(&mut codex_choice).unwrap();
+    match codex_choice.trim() {
+        "o" | "oauth" => {
+            let auth_path = dirs::home_dir()
+                .expect("home dir")
+                .join(".codex")
+                .join("auth.json");
+            if auth_path.exists() {
+                match std::fs::read_to_string(&auth_path) {
+                    Ok(content) => {
+                        println!("  Read {}", auth_path.display());
+                        match gh_secret_set(&remote_repo, "CODEX_AUTH", &content) {
+                            Ok(()) => println!("  Stored as CODEX_AUTH"),
+                            Err(e) => eprintln!("  Error: {}", e),
+                        }
+                    }
+                    Err(e) => eprintln!("  Error reading {}: {}", auth_path.display(), e),
+                }
+            } else {
+                eprintln!("  {} not found. Run codex login first.", auth_path.display());
+            }
+        }
+        "a" | "api" => {
+            print!("  OpenAI API key: ");
+            let _ = stdout.flush();
+            let mut openai = String::new();
+            stdin.lock().read_line(&mut openai).unwrap();
+            let openai = openai.trim();
+            if !openai.is_empty() {
+                match gh_secret_set(&remote_repo, "OPENAI_API_KEY", openai) {
+                    Ok(()) => println!("  Stored as OPENAI_API_KEY"),
+                    Err(e) => eprintln!("  Error: {}", e),
+                }
+            }
+        }
+        _ => println!("  Skipped."),
+    }
+
+    // Step 5: Gemini API key
+    println!();
+    print!("Gemini API key (enter to skip): ");
+    let _ = stdout.flush();
+    let mut gemini = String::new();
+    stdin.lock().read_line(&mut gemini).unwrap();
+    let gemini = gemini.trim();
+    if !gemini.is_empty() {
+        match gh_secret_set(&remote_repo, "GEMINI_API_KEY", gemini) {
+            Ok(()) => println!("  Stored as GEMINI_API_KEY"),
+            Err(e) => eprintln!("  Error: {}", e),
+        }
+    } else {
+        println!("  Skipped.");
+    }
+
+    println!();
+    println!("Setup complete. Remote execution ready.");
+}
+
+fn gh_secret_set(repo: &str, name: &str, value: &str) -> Result<()> {
+    let output = std::process::Command::new("gh")
+        .args(["secret", "set", name, "--repo", repo, "--body", value])
+        .output()
+        .context("failed to run gh")?;
+    if !output.status.success() {
+        anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr));
     }
     Ok(())
 }
