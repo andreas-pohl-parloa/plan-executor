@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.12] - 2026-04-08
+
+### Bug Fixes
+
+- **ci:** Remove lib.rs to fix edition 2024 Linux build failure ([2315931](https://github.com/andreas-pohl-parloa/plan-executor/commit/2315931dc60215260ca46ede95c30fb1927d65f0))
 ## [0.1.11] - 2026-04-08
 
 ### Bug Fixes
