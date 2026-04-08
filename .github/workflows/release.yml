@@ -72,7 +72,7 @@ jobs:
 
       - name: Update Cargo.lock
         if: steps.version.outputs.skipped == 'false'
-        run: cargo generate-lockfile
+        run: cargo update -p plan-executor
 
       - name: Generate changelog
         if: steps.version.outputs.skipped == 'false'
