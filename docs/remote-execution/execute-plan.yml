@@ -1,0 +1,118 @@
+name: Execute Plan
+
+on:
+  pull_request:
+    types: [opened]
+    branches: ['exec/**']
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  execute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout execution repo
+        uses: actions/checkout@v4
+
+      - name: Parse execution metadata
+        id: meta
+        run: |
+          TARGET_REPO=$(jq -r '.target_repo' execution.json)
+          TARGET_REF=$(jq -r '.target_ref' execution.json)
+          TARGET_BRANCH=$(jq -r '.target_branch' execution.json)
+          PLAN_FILENAME=$(jq -r '.plan_filename' execution.json)
+          echo "target_repo=${TARGET_REPO}" >> "$GITHUB_OUTPUT"
+          echo "target_ref=${TARGET_REF}" >> "$GITHUB_OUTPUT"
+          echo "target_branch=${TARGET_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "plan_filename=${PLAN_FILENAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Clone target repo
+        run: |
+          git clone "https://x-access-token:${{ secrets.TARGET_REPO_TOKEN }}@github.com/${{ steps.meta.outputs.target_repo }}.git" workspace
+          cd workspace
+          git checkout "${{ steps.meta.outputs.target_ref }}"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Claude CLI
+        run: |
+          npm install -g @anthropic-ai/claude-code
+
+      - name: Install Codex CLI
+        run: |
+          npm install -g @openai/codex
+
+      - name: Install Gemini CLI
+        run: |
+          npm install -g @anthropic-ai/gemini-cli || true
+
+      - name: Install my-coding plugin
+        run: |
+          bash -c "$(curl -fsSL https://raw.githubusercontent.com/andreas-pohl-parloa/my-coding/main/install.sh)" || \
+          bash -c "$(gh api 'repos/andreas-pohl-parloa/my-coding/contents/install.sh' --header 'Accept: application/vnd.github.raw')"
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
+
+      - name: Restore agent auth
+        run: |
+          if [ -n "$CODEX_AUTH" ]; then
+            mkdir -p ~/.codex
+            echo "$CODEX_AUTH" > ~/.codex/auth.json
+          fi
+        env:
+          CODEX_AUTH: ${{ secrets.CODEX_AUTH }}
+
+      - name: Copy plan into target repo
+        run: |
+          PLAN_DIR="workspace/.my/plans"
+          mkdir -p "$PLAN_DIR"
+          cp plan.md "$PLAN_DIR/${{ steps.meta.outputs.plan_filename }}"
+          if [ -d prompt-files ]; then
+            cp prompt-files/* "$PLAN_DIR/" 2>/dev/null || true
+          fi
+
+      - name: Execute plan
+        id: execute
+        run: |
+          cd workspace
+          plan-executor execute -f ".my/plans/${{ steps.meta.outputs.plan_filename }}"
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+      - name: Post result comment
+        if: always()
+        run: |
+          if [ "${{ steps.execute.outcome }}" = "success" ]; then
+            STATUS="succeeded"
+          else
+            STATUS="failed"
+          fi
+          REF_SHORT=$(echo "${{ steps.meta.outputs.target_ref }}" | cut -c1-12)
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --body "## Execution Complete
+
+          **Status:** ${STATUS}
+          **Target:** ${{ steps.meta.outputs.target_repo }}@${REF_SHORT}
+          **Branch:** ${{ steps.meta.outputs.target_branch }}
+          **Plan:** ${{ steps.meta.outputs.plan_filename }}"
+
+          gh pr close "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" || true
+          gh pr edit "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --add-label "${STATUS}" || true
+        env:
+          GH_TOKEN: ${{ github.token }}
