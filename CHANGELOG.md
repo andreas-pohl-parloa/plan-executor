@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.8] - 2026-04-08
+
+### Bug Fixes
+
+- **ci:** Add explicit [lib] section to fix Linux dep resolution ([3c07f7b](https://github.com/andreas-pohl-parloa/plan-executor/commit/3c07f7bd9b58bbedf0d6a5c1aec5fcef4bb42d72))
 ## [0.1.7] - 2026-04-08
 
 ### Bug Fixes
