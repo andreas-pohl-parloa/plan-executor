@@ -207,7 +207,6 @@ async fn output_job(job_id_prefix: String, follow: bool) -> Result<()> {
 
 async fn retry_job(job_id_prefix: String) -> Result<()> {
     use crate::ipc::{DaemonEvent, TuiRequest};
-    use crate::jobs::JobStatus;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
@@ -230,28 +229,37 @@ async fn retry_job(job_id_prefix: String) -> Result<()> {
     let req = serde_json::to_string(&TuiRequest::RetryHandoff { job_id: job_id.clone() })?;
     write_half.write_all(format!("{}\n", req).as_bytes()).await?;
 
-    // Stream output until the job finishes.
+    // Wait briefly for confirmation that the job moved to Running, then detach.
+    let short_id = &job_id[..job_id.len().min(8)];
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(2));
+    tokio::pin!(timeout);
+
     loop {
-        let line = match reader.next_line().await? {
-            Some(l) => l,
-            None => break,
-        };
-        if let Ok(event) = serde_json::from_str::<DaemonEvent>(&line) {
-            match event {
-                DaemonEvent::JobDisplayLine { job_id: jid, line: text } if jid == job_id => {
-                    print_display_line(&text);
+        tokio::select! {
+            line = reader.next_line() => {
+                let Ok(Some(line)) = line else { break };
+                if let Ok(event) = serde_json::from_str::<DaemonEvent>(&line) {
+                    match event {
+                        DaemonEvent::State { running_jobs, .. } => {
+                            if running_jobs.iter().any(|j| j.id == job_id) {
+                                println!("Retrying (job {})", short_id);
+                                println!("Watch: plan-executor output -f {}", short_id);
+                                return Ok(());
+                            }
+                        }
+                        DaemonEvent::Error { message } => {
+                            eprintln!("Error: {}", message);
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
                 }
-                DaemonEvent::JobUpdated { job } if job.id == job_id
-                    && job.status != JobStatus::Running =>
-                {
-                    println!("\nJob finished: {:?}", job.status);
-                    break;
-                }
-                DaemonEvent::Error { message } => {
-                    eprintln!("Error: {}", message);
-                    break;
-                }
-                _ => {}
+            }
+            _ = &mut timeout => {
+                // Timed out waiting for confirmation — assume it started.
+                println!("Retrying (job {})", short_id);
+                println!("Watch: plan-executor output -f {}", short_id);
+                return Ok(());
             }
         }
     }
@@ -418,12 +426,12 @@ async fn execute_foreground(plan_path: String, config: crate::config::Config) ->
                     }
 
                     if results.iter().any(|r| !r.success && !r.can_fail) {
-                        let _ = std::fs::remove_file(&state_file);
+                        crate::executor::consume_handoffs(&state_file);
                         final_status = Some(false);
                         break 'outer;
                     }
 
-                    let _ = std::fs::remove_file(&state_file);
+                    crate::executor::consume_handoffs(&state_file);
 
                     println!("\x1b[33m\u{23fa} [plan-executor]\x1b[0m resuming session {}",
                         &session_id[..session_id.len().min(16)]);
@@ -481,18 +489,13 @@ fn find_repo_root(path: &std::path::Path) -> Option<std::path::PathBuf> {
     }
 }
 
-/// Sends Execute to the daemon and streams JobDisplayLine events to the terminal.
-async fn execute_via_daemon(plan: PathBuf, config: crate::config::Config) -> Result<()> {
+/// Sends Execute to the daemon, waits just long enough to identify the new
+/// job ID, prints it, and returns immediately.  Use `plan-executor output -f
+/// <job-id>` to watch the live output.
+async fn execute_via_daemon(plan: PathBuf, _config: crate::config::Config) -> Result<()> {
     use crate::ipc::{DaemonEvent, TuiRequest};
-    use crate::jobs::JobStatus;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
-
-    println!("╔══ plan-executor execute (via daemon) ════════════════════════");
-    println!("║  Plan:  {}", plan.display());
-    println!("║  Cmd:   {}", config.agents.main);
-    println!("╚══════════════════════════════════════════════════════════════");
-    println!();
 
     let stream = UnixStream::connect(crate::ipc::socket_path()).await
         .context("Daemon not reachable")?;
@@ -510,61 +513,48 @@ async fn execute_via_daemon(plan: PathBuf, config: crate::config::Config) -> Res
         }
 
     // Trigger execution.
-    let req = serde_json::to_string(&TuiRequest::Execute {
-        plan_path: plan.to_string_lossy().to_string(),
-    })?;
+    let plan_str = plan.to_string_lossy().to_string();
+    let req = serde_json::to_string(&TuiRequest::Execute { plan_path: plan_str.clone() })?;
     write_half.write_all(format!("{}\n", req).as_bytes()).await?;
 
-    // Stream events until the job finishes.
-    let mut our_job_id: Option<String> = None;
+    let filename = plan.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+
+    // Wait briefly for the State event that includes the new job, so we can
+    // print the job ID.  Time-box to ~2 seconds to avoid hanging.
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(2));
+    tokio::pin!(timeout);
 
     loop {
-        let line = match reader.next_line().await? {
-            Some(l) => l,
-            None => break,
-        };
-        if let Ok(event) = serde_json::from_str::<DaemonEvent>(&line) {
-            match event {
-                DaemonEvent::State { running_jobs, .. } => {
-                    if our_job_id.is_none() {
-                        for j in &running_jobs {
-                            if !existing_ids.contains(&j.id) {
-                                our_job_id = Some(j.id.clone());
-                                break;
+        tokio::select! {
+            line = reader.next_line() => {
+                let Ok(Some(line)) = line else { break };
+                if let Ok(event) = serde_json::from_str::<DaemonEvent>(&line) {
+                    match event {
+                        DaemonEvent::State { running_jobs, .. } => {
+                            if let Some(j) = running_jobs.iter().find(|j| !existing_ids.contains(&j.id)) {
+                                let short_id = &j.id[..j.id.len().min(8)];
+                                println!("Queued {} (job {})", filename, short_id);
+                                println!("Watch: plan-executor output -f {}", short_id);
+                                return Ok(());
                             }
                         }
-                    }
-                }
-                DaemonEvent::JobDisplayLine { job_id, line } => {
-                    let is_ours = our_job_id.as_deref() == Some(&job_id)
-                        || our_job_id.is_none();
-                    if is_ours {
-                        if our_job_id.is_none() { our_job_id = Some(job_id); }
-                        print_display_line(&line);
-                    }
-                }
-                DaemonEvent::JobUpdated { job } => {
-                    if our_job_id.as_deref() == Some(&job.id)
-                        && job.status != JobStatus::Running
-                    {
-                        println!();
-                        println!("╔══ done ═══════════════════════════════════════════════════════");
-                        match job.status {
-                            JobStatus::Success => println!("║  Status:   success"),
-                            JobStatus::Failed  => println!("║  Status:   FAILED"),
-                            other              => println!("║  Status:   {:?}", other),
+                        DaemonEvent::Error { message } => {
+                            eprintln!("Error: {}", message);
+                            return Ok(());
                         }
-                        if let Some(ms) = job.duration_ms {
-                            println!("║  Duration: {}s", ms / 1000);
-                        }
-                        println!("╚══════════════════════════════════════════════════════════════");
-                        break;
+                        _ => {}
                     }
                 }
-                _ => {}
+            }
+            _ = &mut timeout => {
+                println!("Queued {}", filename);
+                println!("Watch: plan-executor output -f <job-id>");
+                return Ok(());
             }
         }
     }
+
+    println!("Queued {}", filename);
     Ok(())
 }
 

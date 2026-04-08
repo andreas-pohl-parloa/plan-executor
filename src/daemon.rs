@@ -484,12 +484,12 @@ pub async fn retry_handoff_from_state(
         }
 
         if results.iter().any(|r| !r.success && !r.can_fail) {
-            let _ = std::fs::remove_file(&state_file);
+            crate::executor::consume_handoffs(&state_file);
             fail_job_cleanup(&state_clone, &job_id_full).await;
             return;
         }
 
-        let _ = std::fs::remove_file(&state_file);
+        crate::executor::consume_handoffs(&state_file);
 
         {
             let line = format!("⏺ [plan-executor] resuming session {}", &session_id[..session_id.len().min(16)]);
@@ -592,12 +592,14 @@ async fn run_exec_event_loop(
                     }
                 }
                 ExecEvent::HandoffRequired { session_id, state_file } => {
-                    // Persist Running status to disk before the (potentially long)
-                    // sub-agent dispatch. A daemon kill during dispatch will then
-                    // show this job as Failed on next startup, not Success.
+                    // Store session_id on the running job and persist to disk
+                    // before the (potentially long) sub-agent dispatch. A daemon
+                    // kill during dispatch will then show this job as Failed on
+                    // next startup and `retry` can resume with the session_id.
                     {
-                        let st = state.lock().await;
-                        if let Some(job) = st.running_jobs.get(&job_id) {
+                        let mut st = state.lock().await;
+                        if let Some(job) = st.running_jobs.get_mut(&job_id) {
+                            job.session_id = Some(session_id.clone());
                             let _ = job.save();
                         }
                     }
@@ -673,11 +675,11 @@ async fn run_exec_event_loop(
                     }
 
                     if results.iter().any(|r| !r.success && !r.can_fail) {
-                        let _ = std::fs::remove_file(&state_file);
+                        crate::executor::consume_handoffs(&state_file);
                         break 'outer;
                     }
 
-                    let _ = std::fs::remove_file(&state_file);
+                    crate::executor::consume_handoffs(&state_file);
 
                     {
                         let line = format!("⏺ [plan-executor] resuming session {}", &session_id[..session_id.len().min(16)]);
@@ -717,18 +719,40 @@ async fn run_exec_event_loop(
                     }
                 }
                 ExecEvent::Finished(finished_job) => {
-                    let _ = finished_job.save();
-                    let success = finished_job.status == JobStatus::Success;
                     let mut st = state.lock().await;
-                    st.running_jobs.remove(&job_id);
+                    // Merge result fields from the resume placeholder into
+                    // the original running job (which has the correct
+                    // started_at from initial trigger_execution).
+                    let mut job = if let Some(running) = st.running_jobs.remove(&job_id) {
+                        running
+                    } else {
+                        finished_job.clone()
+                    };
+                    job.status = finished_job.status;
+                    job.model = job.model.or(finished_job.model);
+                    job.session_id = job.session_id.or(finished_job.session_id);
+                    job.input_tokens = finished_job.input_tokens.or(job.input_tokens);
+                    job.output_tokens = finished_job.output_tokens.or(job.output_tokens);
+                    job.cache_creation_tokens = finished_job.cache_creation_tokens.or(job.cache_creation_tokens);
+                    job.cache_read_tokens = finished_job.cache_read_tokens.or(job.cache_read_tokens);
+                    job.finished_at = Some(chrono::Utc::now());
+                    // Wall-clock duration from actual start to now, not
+                    // the per-turn duration_ms from the result event.
+                    job.duration_ms = Some(
+                        (chrono::Utc::now() - job.started_at)
+                            .num_milliseconds()
+                            .max(0) as u64,
+                    );
+                    let _ = job.save();
+                    let success = job.status == JobStatus::Success;
                     st.running_children.remove(&job_id);
                     st.process_group_ids.remove(&job_id);
                     st.sub_agent_pgids.remove(&job_id);
                     st.job_output.remove(&job_id);
                     st.job_display_output.remove(&job_id);
-                    st.history.insert(0, finished_job.clone());
+                    st.history.insert(0, job.clone());
                     let _ = notify_execution_complete(&plan_path_owned, success);
-                    let _ = st.event_tx.send(DaemonEvent::JobUpdated { job: finished_job });
+                    let _ = st.event_tx.send(DaemonEvent::JobUpdated { job });
                     break 'outer;
                 }
             }
