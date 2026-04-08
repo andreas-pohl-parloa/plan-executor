@@ -137,7 +137,7 @@ jobs:
     needs: release
     if: "success() && needs.release.outputs.skipped == 'false'"
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: write
 
@@ -152,11 +152,11 @@ jobs:
         with:
           targets: x86_64-unknown-linux-gnu
 
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build release binary
-        run: cargo build --release --locked --bin plan-executor --target x86_64-unknown-linux-gnu
+        run: cross build --release --locked --target x86_64-unknown-linux-gnu
 
       - name: Package
         run: zip -j plan-executor-linux-x86_64.zip target/x86_64-unknown-linux-gnu/release/plan-executor
