@@ -64,14 +64,32 @@ const STATE_FILE_NAMES: &[&str] = &[
     ".tmp-review-state.json",
 ];
 
+/// Returns true if the state file contains pending handoffs that the daemon
+/// should dispatch. A file with an empty or absent handoffs array is not a
+/// pending handoff — the orchestrator is just using it for state tracking.
+fn has_pending_handoffs(path: &std::path::Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else { return false };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) else { return false };
+    // Check both field names used by different skill versions.
+    for key in &["handoffs", "expected_handoffs"] {
+        if let Some(arr) = val.get(key).and_then(|v| v.as_array()) {
+            if !arr.is_empty() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Finds a handoff state file in either the repo root (non-worktree case) or
 /// inside any `.my/worktrees/<slug>/` subdirectory (worktree case).
 /// Checks all known state file names in priority order.
+/// Only returns files that contain pending handoffs.
 pub fn find_state_file(execution_root: &PathBuf) -> Option<PathBuf> {
     // Direct placement (non-worktree execution)
     for name in STATE_FILE_NAMES {
         let candidate = execution_root.join(name);
-        if candidate.exists() {
+        if candidate.exists() && has_pending_handoffs(&candidate) {
             return Some(candidate);
         }
     }
@@ -87,7 +105,7 @@ pub fn find_state_file(execution_root: &PathBuf) -> Option<PathBuf> {
             }
             for name in STATE_FILE_NAMES {
                 let candidate = entry.path().join(name);
-                if candidate.exists() {
+                if candidate.exists() && has_pending_handoffs(&candidate) {
                     candidates.push(candidate);
                     break; // highest-priority name wins for this worktree
                 }
@@ -107,6 +125,21 @@ pub fn find_state_file(execution_root: &PathBuf) -> Option<PathBuf> {
             None
         }
     }
+}
+
+/// Clears the handoffs array in the state file so it won't re-trigger dispatch,
+/// while preserving all other orchestrator state (phase, wave, etc.).
+pub fn consume_handoffs(state_file: &std::path::Path) {
+    let Ok(content) = std::fs::read_to_string(state_file) else { return };
+    let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&content) else { return };
+    if let Some(obj) = val.as_object_mut() {
+        for key in &["handoffs", "expected_handoffs"] {
+            if obj.contains_key(*key) {
+                obj.insert((*key).to_string(), serde_json::json!([]));
+            }
+        }
+    }
+    let _ = std::fs::write(state_file, serde_json::to_string_pretty(&val).unwrap_or_default());
 }
 
 /// Spawns claude and returns a child handle and an event receiver.

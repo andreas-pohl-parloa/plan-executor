@@ -444,12 +444,12 @@ pub async fn retry_handoff_from_state(
         }
 
         if results.iter().any(|r| !r.success && !r.can_fail) {
-            let _ = std::fs::remove_file(&state_file);
+            crate::executor::consume_handoffs(&state_file);
             fail_job_cleanup(&state_clone, &job_id_full).await;
             return;
         }
 
-        let _ = std::fs::remove_file(&state_file);
+        crate::executor::consume_handoffs(&state_file);
 
         {
             let line = format!("⏺ [plan-executor] resuming session {}", &session_id[..session_id.len().min(16)]);
@@ -635,11 +635,11 @@ async fn run_exec_event_loop(
                     }
 
                     if results.iter().any(|r| !r.success && !r.can_fail) {
-                        let _ = std::fs::remove_file(&state_file);
+                        crate::executor::consume_handoffs(&state_file);
                         break 'outer;
                     }
 
-                    let _ = std::fs::remove_file(&state_file);
+                    crate::executor::consume_handoffs(&state_file);
 
                     {
                         let line = format!("⏺ [plan-executor] resuming session {}", &session_id[..session_id.len().min(16)]);
