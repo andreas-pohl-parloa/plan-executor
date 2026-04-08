@@ -2,6 +2,7 @@
 name = "plan-executor"
 version = "0.1.5"
 edition = "2024"
+resolver = "2"
 description = "Monitor and execute Claude plan files"
 default-run = "plan-executor"
 
