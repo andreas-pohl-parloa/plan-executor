@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.11] - 2026-04-08
+
+### Bug Fixes
+
+- **ci:** Add libdbus-1-dev to Cross.toml for x86_64 target ([4ccc29a](https://github.com/andreas-pohl-parloa/plan-executor/commit/4ccc29a5057f6486630f1217c3921113ae1f338b))
 ## [0.1.10] - 2026-04-08
 
 ### Bug Fixes
