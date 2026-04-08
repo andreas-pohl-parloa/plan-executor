@@ -72,7 +72,7 @@ jobs:
 
       - name: Update Cargo.lock
         if: steps.version.outputs.skipped == 'false'
-        run: cargo update --workspace
+        run: cargo generate-lockfile
 
       - name: Generate changelog
         if: steps.version.outputs.skipped == 'false'
@@ -121,7 +121,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Package
         run: zip -j plan-executor-macos-arm64.zip target/release/plan-executor
@@ -154,7 +154,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Package
         run: zip -j plan-executor-linux-x86_64.zip target/release/plan-executor
@@ -189,7 +189,7 @@ jobs:
         run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build release binary
-        run: cross build --release --target aarch64-unknown-linux-gnu
+        run: cross build --release --locked --target aarch64-unknown-linux-gnu
 
       - name: Package
         run: zip -j plan-executor-linux-arm64.zip target/aarch64-unknown-linux-gnu/release/plan-executor
