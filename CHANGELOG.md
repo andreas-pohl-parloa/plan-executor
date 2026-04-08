@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.10] - 2026-04-08
+
+### Bug Fixes
+
+- **ci:** Use cross for Linux x86_64 build to bypass cargo bug ([7966e3c](https://github.com/andreas-pohl-parloa/plan-executor/commit/7966e3cc589b029a778f313a0ca1a6684eee8e46))
 ## [0.1.9] - 2026-04-08
 
 ### Bug Fixes
