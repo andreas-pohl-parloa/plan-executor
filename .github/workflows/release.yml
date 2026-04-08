@@ -157,15 +157,17 @@ jobs:
         run: |
           rustc --version
           cargo --version
-          cat Cargo.toml | head -15
-          cat stream-json-view/Cargo.toml
-          echo "--- Cargo.lock plan-executor entry ---"
-          awk '/^name = "plan-executor"/{found=1} found{print; if(/^$/)exit}' Cargo.lock
-          echo "--- cargo tree depth 1 ---"
-          cargo tree --depth 1 2>&1 | head -30
+          echo "--- cargo config ---"
+          cat $CARGO_HOME/config.toml 2>/dev/null || echo "no cargo config"
+          cat $CARGO_HOME/config 2>/dev/null || echo "no legacy cargo config"
+          echo "--- ls src/ ---"
+          ls -la src/
+          echo "--- src/lib.rs? ---"
+          cat src/lib.rs 2>/dev/null || echo "no lib.rs"
+          echo "--- build verbose ---"
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release -vv 2>&1 | tail -100
 
       - name: Package
         run: zip -j plan-executor-linux-x86_64.zip target/release/plan-executor
