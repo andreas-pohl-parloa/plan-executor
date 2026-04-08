@@ -165,10 +165,11 @@ pub fn find_ready_plans(watch_dirs: &[PathBuf], patterns: &[String]) -> Vec<Plan
     for dir in watch_dirs {
         for pattern in patterns {
             for path in scan_for_plans(dir, pattern) {
-                if let Ok(status) = parse_plan_status(&path)
-                    && status == PlanStatus::Ready && is_non_interactive(&path) {
+                if let Ok(status) = parse_plan_status(&path) {
+                    if status == PlanStatus::Ready && is_non_interactive(&path) {
                         results.push(PlanFile { path, status });
                     }
+                }
             }
         }
     }

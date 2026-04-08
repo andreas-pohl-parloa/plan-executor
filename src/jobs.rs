@@ -90,10 +90,11 @@ impl JobMetadata {
             let name_str = name.to_string_lossy();
             if name_str.starts_with(prefix) {
                 let meta_path = entry.path().join("metadata.json");
-                if let Ok(content) = std::fs::read_to_string(meta_path)
-                    && let Ok(meta) = serde_json::from_str::<Self>(&content) {
+                if let Ok(content) = std::fs::read_to_string(meta_path) {
+                    if let Ok(meta) = serde_json::from_str::<Self>(&content) {
                         return Some(meta);
                     }
+                }
             }
         }
         None
@@ -108,10 +109,11 @@ impl JobMetadata {
         let mut jobs = Vec::new();
         for entry in entries.flatten() {
             let meta_path = entry.path().join("metadata.json");
-            if let Ok(content) = std::fs::read_to_string(&meta_path)
-                && let Ok(meta) = serde_json::from_str::<Self>(&content) {
+            if let Ok(content) = std::fs::read_to_string(&meta_path) {
+                if let Ok(meta) = serde_json::from_str::<Self>(&content) {
                     jobs.push(meta);
                 }
+            }
         }
         // Sort by started_at descending
         jobs.sort_by(|a, b| b.started_at.cmp(&a.started_at));

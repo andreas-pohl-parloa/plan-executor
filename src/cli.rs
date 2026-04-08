@@ -104,10 +104,11 @@ pub fn run() {
 
     // Daemonize before creating the Tokio runtime — forking after Tokio's
     // thread pool is initialized is undefined behavior.
-    if let Commands::Daemon { foreground } = &cli.command
-        && !foreground {
+    if let Commands::Daemon { foreground } = &cli.command {
+        if !foreground {
             daemonize();
         }
+    }
 
     tracing_subscriber::fmt::init();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -195,11 +196,11 @@ async fn output_job(job_id_prefix: String, follow: bool) -> Result<()> {
                     }
                 } else if let Ok(DaemonEvent::JobUpdated { job }) =
                     serde_json::from_str::<DaemonEvent>(&line)
-                    && job.id == job_id
-                        && job.status != crate::jobs::JobStatus::Running
                 {
+                    if job.id == job_id && job.status != crate::jobs::JobStatus::Running {
                         eprintln!("[job finished: {:?}]", job.status);
                         break;
+                    }
                 }
     }
     Ok(())
@@ -507,10 +508,11 @@ async fn execute_via_daemon(plan: PathBuf, _config: crate::config::Config) -> Re
     write_half.write_all(format!("{}\n", gs).as_bytes()).await?;
 
     let mut existing_ids = std::collections::HashSet::<String>::new();
-    if let Ok(Some(line)) = reader.next_line().await
-        && let Ok(DaemonEvent::State { running_jobs, .. }) = serde_json::from_str(&line) {
+    if let Ok(Some(line)) = reader.next_line().await {
+        if let Ok(DaemonEvent::State { running_jobs, .. }) = serde_json::from_str(&line) {
             existing_ids = running_jobs.iter().map(|j| j.id.clone()).collect();
         }
+    }
 
     // Trigger execution.
     let plan_str = plan.to_string_lossy().to_string();

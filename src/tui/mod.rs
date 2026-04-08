@@ -69,10 +69,11 @@ async fn connector(
                         line = reader.next_line() => {
                             match line {
                                 Ok(Some(l)) => {
-                                    if let Ok(ev) = serde_json::from_str::<DaemonEvent>(&l)
-                                        && event_tx.send(ev).await.is_err() {
+                                    if let Ok(ev) = serde_json::from_str::<DaemonEvent>(&l) {
+                                        if event_tx.send(ev).await.is_err() {
                                             return; // TUI closed
                                         }
+                                    }
                                 }
                                 _ => break, // EOF or error — daemon restarted
                             }
@@ -80,10 +81,11 @@ async fn connector(
                         req = req_rx.recv() => {
                             match req {
                                 Some(r) => {
-                                    if let Ok(json) = serde_json::to_string(&r)
-                                        && write_half.write_all(format!("{}\n", json).as_bytes()).await.is_err() {
+                                    if let Ok(json) = serde_json::to_string(&r) {
+                                        if write_half.write_all(format!("{}\n", json).as_bytes()).await.is_err() {
                                             break; // write failed, reconnect
                                         }
+                                    }
                                 }
                                 None => return, // req channel closed (TUI quit)
                             }
@@ -120,8 +122,8 @@ async fn run_loop(
             }
         }
 
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()? {
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
                 dirty = true;
                 match key.code {
                     KeyCode::Char('q') => {
@@ -152,12 +154,13 @@ async fn run_loop(
                             let _ = app.daemon_tx.send(TuiRequest::Execute {
                                 plan_path: pending.plan_path.clone(),
                             }).await;
-                        } else if app.current_tab == app::Tab::History
-                            && let Some(job) = app.history.get(app.selected) {
+                        } else if app.current_tab == app::Tab::History {
+                            if let Some(job) = app.history.get(app.selected) {
                                 let _ = app.daemon_tx.send(TuiRequest::Execute {
                                     plan_path: job.plan_path.to_string_lossy().to_string(),
                                 }).await;
                             }
+                        }
                     }
                     KeyCode::Char('c') => {
                         if let Some(pending) = app.pending_plans.get(app.selected) {
@@ -198,8 +201,8 @@ async fn run_loop(
                         }
                     }
                     KeyCode::Char('R') => {
-                        if app.current_tab == app::Tab::History
-                            && let Some(job) = app.history.get(app.selected) {
+                        if app.current_tab == app::Tab::History {
+                            if let Some(job) = app.history.get(app.selected) {
                                 let _ = app.daemon_tx.send(TuiRequest::RetryHandoff {
                                     job_id: job.id.clone(),
                                 }).await;
@@ -207,6 +210,7 @@ async fn run_loop(
                                 app.current_tab = app::Tab::Running;
                                 app.selected = 0;
                             }
+                        }
                     }
                     KeyCode::Char('r') => {
                         let _ = app.daemon_tx.send(TuiRequest::GetState).await;
@@ -224,6 +228,7 @@ async fn run_loop(
                     _ => { dirty = false; }
                 }
             }
+        }
 
         while let Ok(event) = event_rx.try_recv() {
             app.apply_event(event);
