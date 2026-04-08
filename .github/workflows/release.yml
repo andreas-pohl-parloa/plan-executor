@@ -72,11 +72,7 @@ jobs:
 
       - name: Update Cargo.lock
         if: steps.version.outputs.skipped == 'false'
-        run: |
-          # Only update the workspace package version in the lock file.
-          # Use sed to directly patch the version rather than cargo update
-          # which may re-resolve dependencies differently on Linux vs macOS.
-          sed -i "s/^version = \"0\.[0-9]*\.[0-9]*\"/version = \"${{ steps.version.outputs.version }}\"/" Cargo.lock
+        run: cargo update -p plan-executor
 
       - name: Generate changelog
         if: steps.version.outputs.skipped == 'false'
@@ -140,7 +136,7 @@ jobs:
     name: Build Linux x86_64
     needs: release
     if: "success() && needs.release.outputs.skipped == 'false'"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 20
     permissions:
       contents: write
@@ -156,19 +152,6 @@ jobs:
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
-
-      - name: Diagnostics
-        run: |
-          rustc --version
-          cargo --version
-          echo "--- cargo config ---"
-          cat $CARGO_HOME/config.toml 2>/dev/null || echo "no cargo config"
-          cat $CARGO_HOME/config 2>/dev/null || echo "no legacy cargo config"
-          echo "--- ls src/ ---"
-          ls -la src/
-          echo "--- src/lib.rs? ---"
-          cat src/lib.rs 2>/dev/null || echo "no lib.rs"
-          echo "--- build verbose ---"
 
       - name: Build release binary
         run: cargo build --release
