@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.17] - 2026-04-08
+
+### Bug Fixes
+
+- **ci:** Use sed to patch Cargo.lock version instead of cargo update ([c48bac1](https://github.com/andreas-pohl-parloa/plan-executor/commit/c48bac18da108110a973dae89ebe14081ce61e35))
 ## [0.1.16] - 2026-04-08
 
 ### Bug Fixes
