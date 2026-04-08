@@ -9,10 +9,6 @@ default-run = "plan-executor"
 name = "plan-executor"
 path = "src/main.rs"
 
-[lib]
-name = "plan_executor"
-path = "src/lib.rs"
-
 [dependencies]
 # Async runtime (includes process feature for subprocess spawning)
 tokio = { version = "1", features = ["full"] }

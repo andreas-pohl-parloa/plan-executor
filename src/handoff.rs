@@ -469,3 +469,60 @@ pub async fn resume_execution(
     Ok((child, resume_pgid, rx))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_continuation_orders_by_index() {
+        let results = vec![
+            HandoffResult { index: 2, stdout: "out2".to_string(), stderr: String::new(), success: true, can_fail: false },
+            HandoffResult { index: 1, stdout: "out1".to_string(), stderr: String::new(), success: true, can_fail: false },
+        ];
+        let s = build_continuation(&results);
+        assert!(s.find("# output sub-agent 1:").unwrap() < s.find("# output sub-agent 2:").unwrap());
+        assert!(s.contains("out1"));
+        assert!(s.contains("out2"));
+    }
+
+    #[test]
+    fn build_continuation_includes_empty_stdout_for_failed_agents() {
+        let results = vec![
+            HandoffResult { index: 1, stdout: String::new(), stderr: "error".to_string(), success: false, can_fail: true },
+        ];
+        let s = build_continuation(&results);
+        assert!(s.contains("# output sub-agent 1:"));
+    }
+
+    #[test]
+    fn load_state_parses_all_agent_types() {
+        // Create a temp dir so prompt files are co-located with the state file
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+
+        // Create the prompt files so canonicalize succeeds
+        let p1 = dir.path().join("p1.md");
+        let p2 = dir.path().join("p2.md");
+        let p3 = dir.path().join("p3.md");
+        std::fs::write(&p1, "prompt 1").unwrap();
+        std::fs::write(&p2, "prompt 2").unwrap();
+        std::fs::write(&p3, "prompt 3").unwrap();
+
+        let json = format!(r#"{{
+            "phase": "wave_execution",
+            "wave": 1, "attempt": 1, "batch": 1,
+            "handoffs": [
+                {{"index": 1, "agentType": "claude", "promptFile": "{}"}},
+                {{"index": 2, "agentType": "codex",  "promptFile": "{}"}},
+                {{"index": 3, "agentType": "gemini", "promptFile": "{}"}}
+            ]
+        }}"#, p1.display(), p2.display(), p3.display());
+        std::fs::write(&state_path, json).unwrap();
+
+        let state = load_state(&state_path).unwrap();
+        assert_eq!(state.handoffs.len(), 3);
+        assert!(matches!(state.handoffs[0].agent_type, AgentType::Claude));
+        assert!(matches!(state.handoffs[1].agent_type, AgentType::Codex));
+        assert!(matches!(state.handoffs[2].agent_type, AgentType::Gemini));
+    }
+}
