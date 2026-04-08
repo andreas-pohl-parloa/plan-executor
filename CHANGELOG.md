@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.6] - 2026-04-08
+
+### Bug Fixes
+
+- **ci:** Force resolver v2 to fix Linux dependency resolution ([288be1d](https://github.com/andreas-pohl-parloa/plan-executor/commit/288be1d675e35affed6bfa598ca253f9951ae6d9))
 ## [0.1.5] - 2026-04-08
 
 ### Bug Fixes
