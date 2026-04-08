@@ -2,7 +2,6 @@
 name = "plan-executor"
 version = "0.1.6"
 edition = "2024"
-resolver = "2"
 description = "Monitor and execute Claude plan files"
 default-run = "plan-executor"
 
@@ -34,7 +33,7 @@ glob = "0.3"
 # Directory walking (used for recursive plan scanning, skips target/ etc.)
 walkdir = "2"
 
-# macOS native notifications
+# Desktop notifications (D-Bus on Linux, not used on macOS where mac-notification-sys handles it)
 notify-rust = { version = "4", features = ["d"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
