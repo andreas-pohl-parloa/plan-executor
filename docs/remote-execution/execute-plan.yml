@@ -3,7 +3,6 @@ name: Execute Plan
 on:
   pull_request:
     types: [opened]
-    branches: ['exec/**']
 
 permissions:
   contents: read
@@ -13,6 +12,7 @@ jobs:
   execute:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    if: startsWith(github.head_ref, 'exec/')
 
     steps:
       - name: Checkout execution repo
@@ -38,6 +38,10 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install plan-executor
+        run: |
+          cd workspace && cargo install --path . --locked 2>/dev/null || cargo install --path .
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
