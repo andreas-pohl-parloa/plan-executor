@@ -1,6 +1,6 @@
 [package]
 name = "plan-executor"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2021"
 description = "Monitor and execute Claude plan files"
 default-run = "plan-executor"

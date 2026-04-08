@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.16] - 2026-04-08
+
+### Bug Fixes
+
+- **ci:** Add verbose build output for Linux debugging ([2108fb1](https://github.com/andreas-pohl-parloa/plan-executor/commit/2108fb1d946208dd220cfae1e89bfe683fa9780e))
 ## [0.1.15] - 2026-04-08
 
 ### Bug Fixes
