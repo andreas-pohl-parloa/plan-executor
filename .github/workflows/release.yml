@@ -132,12 +132,12 @@ jobs:
           tag_name: ${{ needs.release.outputs.tag }}
           files: plan-executor-macos-arm64.zip
 
-  build-linux-x86_64:
+  build-linux:
     name: Build Linux x86_64
     needs: release
     if: "success() && needs.release.outputs.skipped == 'false'"
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     permissions:
       contents: write
 
@@ -149,55 +149,29 @@ jobs:
           token: ${{ secrets.GH_PAT }}
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-gnu
 
-      - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - name: Diagnostics
+        run: |
+          rustc --version
+          cargo --version
+          cat Cargo.toml | head -15
+          cat stream-json-view/Cargo.toml
+          echo "--- Cargo.lock plan-executor entry ---"
+          awk '/^name = "plan-executor"/{found=1} found{print; if(/^$/)exit}' Cargo.lock
+          echo "--- cargo tree depth 1 ---"
+          cargo tree --depth 1 2>&1 | head -30
 
       - name: Build release binary
-        run: cross build --release --locked --target x86_64-unknown-linux-gnu
+        run: cargo build --release
 
       - name: Package
-        run: zip -j plan-executor-linux-x86_64.zip target/x86_64-unknown-linux-gnu/release/plan-executor
+        run: zip -j plan-executor-linux-x86_64.zip target/release/plan-executor
 
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.release.outputs.tag }}
           files: plan-executor-linux-x86_64.zip
-
-  build-linux-arm64:
-    name: Build Linux ARM64
-    needs: release
-    if: "success() && needs.release.outputs.skipped == 'false'"
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.release.outputs.tag }}
-          submodules: recursive
-          token: ${{ secrets.GH_PAT }}
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu
-
-      - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
-      - name: Build release binary
-        run: cross build --release --locked --bin plan-executor --target aarch64-unknown-linux-gnu
-
-      - name: Package
-        run: zip -j plan-executor-linux-arm64.zip target/aarch64-unknown-linux-gnu/release/plan-executor
-
-      - name: Attach to release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.release.outputs.tag }}
-          files: plan-executor-linux-arm64.zip
