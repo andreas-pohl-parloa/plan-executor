@@ -322,6 +322,12 @@ async fn trigger_remote(plan: PathBuf, config: crate::config::Config) -> Result<
 
     let pr_url = crate::remote::trigger_remote_execution(remote_repo, &plan, &meta)?;
 
+    // Update plan status and store PR number
+    let _ = crate::plan::set_plan_header(&plan, "status", "EXECUTING");
+    if let Some(pr_num) = crate::remote::pr_number_from_url(&pr_url) {
+        let _ = crate::plan::set_plan_header(&plan, "remote-pr", &pr_num.to_string());
+    }
+
     println!("Remote execution triggered.");
     println!("PR: {}", pr_url);
 
