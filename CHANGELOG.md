@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.4] - 2026-04-09
+
+### Bug Fixes
+
+- Configure git credentials for private repo clones in workflow ([e4bee36](https://github.com/andreas-pohl-parloa/plan-executor/commit/e4bee3694cceb9ebc99d45c60710ecd8c5e2a403))
 ## [0.4.3] - 2026-04-09
 
 ### Bug Fixes
