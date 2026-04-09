@@ -63,14 +63,6 @@ jobs:
           cd workspace
           git checkout "$TARGET_REF"
 
-      - name: Install my-coding plugin (includes plan-executor + sjv)
-        env:
-          GH_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
-        run: |
-          bash -c "$(gh api 'repos/andreas-pohl-parloa/my-coding/contents/install.sh?ref=main' --header 'Accept: application/vnd.github.raw')"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          echo "$HOME/bin" >> "$GITHUB_PATH"
-
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -84,6 +76,14 @@ jobs:
 
       - name: Install Gemini CLI
         run: npm install -g @anthropic-ai/gemini-cli || true
+
+      - name: Install my-coding plugin (includes plan-executor + sjv)
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
+        run: |
+          bash -c "$(gh api 'repos/andreas-pohl-parloa/my-coding/contents/install.sh?ref=main' --header 'Accept: application/vnd.github.raw')"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
 
       - name: Restore agent auth
         run: |
