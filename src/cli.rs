@@ -996,6 +996,14 @@ fn remote_setup() {
         println!("  Skipped.");
     }
 
+    // Step 6: Push workflow to execution repo
+    println!();
+    println!("Pushing execute-plan workflow to {}...", remote_repo);
+    match crate::remote::push_workflow(&remote_repo) {
+        Ok(()) => println!("  Workflow pushed to .github/workflows/execute-plan.yml"),
+        Err(e) => eprintln!("  Error pushing workflow: {}", e),
+    }
+
     println!();
     println!("Setup complete. Remote execution ready.");
 }

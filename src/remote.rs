@@ -121,6 +121,41 @@ pub fn push_codex_auth(remote_repo: &str) -> Result<()> {
     gh_secret_set_stdin("CODEX_AUTH", remote_repo, &content)
 }
 
+/// The embedded workflow YAML for the execution repo.
+const EXECUTE_PLAN_WORKFLOW: &str = include_str!("../docs/remote-execution/execute-plan.yml");
+
+/// Pushes the execute-plan workflow to `.github/workflows/execute-plan.yml`
+/// on the main branch of the execution repo. Creates or updates the file.
+pub fn push_workflow(remote_repo: &str) -> Result<()> {
+    let path = ".github/workflows/execute-plan.yml";
+    let encoded = base64_encode(EXECUTE_PLAN_WORKFLOW.as_bytes());
+
+    // Check if file already exists (need its SHA for updates)
+    let existing_sha = run_gh(&[
+        "api", &format!("repos/{}/contents/{}", remote_repo, path),
+        "--jq", ".sha",
+    ]).ok();
+
+    let mut args = vec![
+        "api".to_string(),
+        format!("repos/{}/contents/{}", remote_repo, path),
+        "-X".to_string(), "PUT".to_string(),
+        "-f".to_string(), "message=chore: update execute-plan workflow".to_string(),
+        "-f".to_string(), format!("content={}", encoded),
+    ];
+    if let Some(sha) = existing_sha {
+        let sha = sha.trim().trim_matches('"').to_string();
+        if !sha.is_empty() {
+            args.push("-f".to_string());
+            args.push(format!("sha={}", sha));
+        }
+    }
+
+    let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    run_gh(&args_ref)?;
+    Ok(())
+}
+
 /// Creates a branch with plan files and execution metadata in the execution repo,
 /// then opens a PR. Returns the PR URL.
 ///

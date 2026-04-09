@@ -63,12 +63,16 @@ jobs:
           cd workspace
           git checkout "$TARGET_REF"
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Install plan-executor
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
         run: |
-          cd workspace && cargo install --path . --locked 2>/dev/null || cargo install --path .
+          ASSET="plan-executor-linux-x86_64.zip"
+          gh release download --repo andreas-pohl-parloa/plan-executor \
+            --pattern "$ASSET" --dir /tmp
+          unzip -q "/tmp/$ASSET" -d /tmp
+          chmod +x /tmp/plan-executor
+          sudo mv /tmp/plan-executor /usr/local/bin/
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -76,23 +80,13 @@ jobs:
           node-version: '22'
 
       - name: Install Claude CLI
-        run: |
-          npm install -g @anthropic-ai/claude-code
+        run: npm install -g @anthropic-ai/claude-code
 
       - name: Install Codex CLI
-        run: |
-          npm install -g @openai/codex
+        run: npm install -g @openai/codex
 
       - name: Install Gemini CLI
-        run: |
-          npm install -g @anthropic-ai/gemini-cli || true
-
-      - name: Install my-coding plugin
-        run: |
-          bash -c "$(curl -fsSL https://raw.githubusercontent.com/andreas-pohl-parloa/my-coding/main/install.sh)" || \
-          bash -c "$(gh api 'repos/andreas-pohl-parloa/my-coding/contents/install.sh' --header 'Accept: application/vnd.github.raw')"
-        env:
-          GH_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
+        run: npm install -g @anthropic-ai/gemini-cli || true
 
       - name: Restore agent auth
         run: |
@@ -161,5 +155,4 @@ jobs:
 
       - name: Cleanup credentials
         if: always()
-        run: |
-          rm -f ~/.codex/auth.json
+        run: rm -f ~/.codex/auth.json
