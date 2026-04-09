@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.1] - 2026-04-09
+
+### Bug Fixes
+
+- Use my-coding plugin installer for plan-executor + sjv in workflow ([d8ed2c2](https://github.com/andreas-pohl-parloa/plan-executor/commit/d8ed2c269f997bab272eff60f94d6665e60fc778))
 ## [0.2.0] - 2026-04-09
 
 ### Features
