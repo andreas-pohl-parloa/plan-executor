@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.2] - 2026-04-09
+
+### Bug Fixes
+
+- Push workflow via git clone+push instead of Contents API ([094b607](https://github.com/andreas-pohl-parloa/plan-executor/commit/094b6073bbf5c68965d4a8993b8a9c399f628654))
 ## [0.3.1] - 2026-04-09
 
 ### Bug Fixes
