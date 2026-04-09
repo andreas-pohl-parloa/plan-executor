@@ -63,6 +63,9 @@ jobs:
           cd workspace
           git checkout "$TARGET_REF"
 
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
