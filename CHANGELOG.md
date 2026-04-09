@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.3] - 2026-04-09
+
+### Bug Fixes
+
+- Use gh api for private repo install script and add PATH setup ([aa9ec02](https://github.com/andreas-pohl-parloa/plan-executor/commit/aa9ec027bc385c54af3bdb3bf4be28c2c1a8a51a))
+- Move Node.js and agent CLI installs before my-coding plugin ([814a88b](https://github.com/andreas-pohl-parloa/plan-executor/commit/814a88b5473ce75ad4fb929be4283a7b5630a608))
 ## [0.4.2] - 2026-04-09
 
 ### Bug Fixes
