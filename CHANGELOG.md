@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.6] - 2026-04-09
+
+### Bug Fixes
+
+- Prevent recursive remote execution on GitHub Actions runner ([dfc1272](https://github.com/andreas-pohl-parloa/plan-executor/commit/dfc1272679b11e074ae984457951158fcc8e9bfc))
 ## [0.4.5] - 2026-04-09
 
 ### Bug Fixes
