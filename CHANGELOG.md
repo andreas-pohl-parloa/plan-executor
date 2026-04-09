@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.0] - 2026-04-09
+
+### Features
+
+- Track remote execution lifecycle via plan headers ([fc958c9](https://github.com/andreas-pohl-parloa/plan-executor/commit/fc958c9434dd4cb69af813118baa47abc2de49f8))
 ## [0.3.4] - 2026-04-09
 
 ### Bug Fixes
