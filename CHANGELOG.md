@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.0] - 2026-04-09
+
+### Features
+
+- Push workflow to execution repo during remote-setup ([bcc3653](https://github.com/andreas-pohl-parloa/plan-executor/commit/bcc3653ee3ca5ede147838790880ee6ac54de03a))
 ## [0.1.19] - 2026-04-08
 
 ### Bug Fixes
