@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.5] - 2026-04-09
+
+### Bug Fixes
+
+- Add libdbus-1-dev to workflow for source compilation fallback ([798955c](https://github.com/andreas-pohl-parloa/plan-executor/commit/798955c6e974a79ecb66cec6e90a609b79eaf014))
 ## [0.4.4] - 2026-04-09
 
 ### Bug Fixes
