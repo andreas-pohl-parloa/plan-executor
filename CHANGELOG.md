@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.1] - 2026-04-09
+
+### Bug Fixes
+
+- Push workflow via JSON stdin to avoid arg length limits ([e495b2f](https://github.com/andreas-pohl-parloa/plan-executor/commit/e495b2f6540807be85081adc39b1a61209f66cd4))
 ## [0.3.0] - 2026-04-09
 
 ### Features
