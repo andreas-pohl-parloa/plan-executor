@@ -42,8 +42,8 @@ jobs:
             echo "::error::Invalid target_branch: $TARGET_BRANCH"
             exit 1
           fi
-          # Validate plan filename (no path traversal or special chars)
-          if echo "$PLAN_FILENAME" | grep -qP '[/\.\.]|[^a-zA-Z0-9._-]'; then
+          # Validate plan filename (no path traversal or directory separators)
+          if echo "$PLAN_FILENAME" | grep -qP '\.\.|/' || ! echo "$PLAN_FILENAME" | grep -qP '^[a-zA-Z0-9._-]+$'; then
             echo "::error::Invalid plan_filename: $PLAN_FILENAME"
             exit 1
           fi
