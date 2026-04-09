@@ -157,6 +157,9 @@ const EXECUTE_PLAN_WORKFLOW: &str = include_str!("../docs/remote-execution/execu
 /// Pushes the execute-plan workflow to `.github/workflows/execute-plan.yml`
 /// on the main branch of the execution repo. Creates or updates the file.
 pub fn push_workflow(remote_repo: &str) -> Result<()> {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
     let path = ".github/workflows/execute-plan.yml";
     let encoded = base64_encode(EXECUTE_PLAN_WORKFLOW.as_bytes());
 
@@ -164,25 +167,41 @@ pub fn push_workflow(remote_repo: &str) -> Result<()> {
     let existing_sha = run_gh(&[
         "api", &format!("repos/{}/contents/{}", remote_repo, path),
         "--jq", ".sha",
-    ]).ok();
+    ]).ok().map(|s| s.trim().trim_matches('"').to_string()).filter(|s| !s.is_empty());
 
-    let mut args = vec![
-        "api".to_string(),
-        format!("repos/{}/contents/{}", remote_repo, path),
-        "-X".to_string(), "PUT".to_string(),
-        "-f".to_string(), "message=chore: update execute-plan workflow".to_string(),
-        "-f".to_string(), format!("content={}", encoded),
-    ];
+    // Build JSON body (avoids shell arg length limits for the base64 content)
+    let mut body = serde_json::json!({
+        "message": "chore: add execute-plan workflow",
+        "content": encoded,
+    });
     if let Some(sha) = existing_sha {
-        let sha = sha.trim().trim_matches('"').to_string();
-        if !sha.is_empty() {
-            args.push("-f".to_string());
-            args.push(format!("sha={}", sha));
-        }
+        body["message"] = serde_json::json!("chore: update execute-plan workflow");
+        body["sha"] = serde_json::json!(sha);
     }
 
-    let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    run_gh(&args_ref)?;
+    let mut child = std::process::Command::new("gh")
+        .args([
+            "api",
+            &format!("repos/{}/contents/{}", remote_repo, path),
+            "-X", "PUT",
+            "--input", "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to run gh: {e}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(body.to_string().as_bytes())?;
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "push workflow failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     Ok(())
 }
 
