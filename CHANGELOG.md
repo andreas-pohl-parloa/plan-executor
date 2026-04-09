@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.0] - 2026-04-09
+
+### Features
+
+- Auto-create execution repo and environment during remote-setup ([a4844b4](https://github.com/andreas-pohl-parloa/plan-executor/commit/a4844b4b1b5c0cb77760e41dd348bdfa763bbbcd))
 ## [0.2.1] - 2026-04-09
 
 ### Bug Fixes
