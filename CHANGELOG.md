@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.2] - 2026-04-09
+
+### Bug Fixes
+
+- Correct plan filename validation regex in workflow ([336119f](https://github.com/andreas-pohl-parloa/plan-executor/commit/336119f65ed8f63515510d37eed211aff4b87740))
+- Update plan status and PR number from CLI trigger_remote path ([eaa2b7d](https://github.com/andreas-pohl-parloa/plan-executor/commit/eaa2b7d067f478466881bfb89a2c064758354757))
 ## [0.4.1] - 2026-04-09
 
 ### Miscellaneous
