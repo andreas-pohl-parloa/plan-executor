@@ -27,7 +27,7 @@ pub enum PlanStatus {
 
 impl PlanStatus {
     fn from_str(s: &str) -> Self {
-        match s.trim() {
+        match s.trim().to_ascii_uppercase().as_str() {
             "READY" => PlanStatus::Ready,
             "WIP" => PlanStatus::Wip,
             "EXECUTING" => PlanStatus::Executing,
@@ -41,7 +41,9 @@ impl PlanStatus {
 pub fn parse_plan_status(path: &Path) -> Result<PlanStatus> {
     let content = std::fs::read_to_string(path)?;
     for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("**Status:**") {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("**status:**") {
+            let rest = &line["**status:**".len()..];
             return Ok(PlanStatus::from_str(rest));
         }
     }
@@ -55,8 +57,10 @@ pub fn parse_execution_mode(path: &Path) -> ExecutionMode {
         return ExecutionMode::Local;
     };
     for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("**execution:**") {
-            return match rest.trim() {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("**execution:**") {
+            let rest = &line["**execution:**".len()..];
+            return match rest.trim().to_ascii_lowercase().as_str() {
                 "remote" => ExecutionMode::Remote,
                 _ => ExecutionMode::Local,
             };
@@ -71,7 +75,7 @@ pub fn is_non_interactive(path: &Path) -> bool {
     let Ok(content) = std::fs::read_to_string(path) else { return false };
     content.lines().any(|line| {
         let l = line.trim();
-        l.starts_with("**non-interactive:**") && l.contains("[x]")
+        l.to_ascii_lowercase().starts_with("**non-interactive:**") && l.to_ascii_lowercase().contains("[x]")
     })
 }
 

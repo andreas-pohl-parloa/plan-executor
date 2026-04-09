@@ -61,6 +61,8 @@ pub enum Commands {
     },
     /// Interactive wizard to configure remote execution secrets
     RemoteSetup,
+    /// Debug: scan and list all discovered plans
+    Scan,
 }
 
 /// Prints a display line to the terminal, coloring plan-executor prefix lines
@@ -89,6 +91,7 @@ pub fn run() {
         Commands::Jobs   => { list_jobs(); return; }
         Commands::Ensure => { ensure_daemon(); return; }
         Commands::RemoteSetup => { remote_setup(); return; }
+        Commands::Scan => { scan_plans(); return; }
         Commands::Kill   { job_id } => { daemon_job_request("kill",    job_id); return; }
         Commands::Pause  { job_id } => { daemon_job_request("pause",   job_id); return; }
         Commands::Unpause{ job_id } => { daemon_job_request("unpause", job_id); return; }
@@ -129,7 +132,7 @@ pub fn run() {
         Commands::Status => rt.block_on(show_status()),
         Commands::Output { job_id, follow } => rt.block_on(output_job(job_id, follow)),
         Commands::Retry { job_id } => rt.block_on(retry_job(job_id)),
-        Commands::Stop | Commands::Jobs | Commands::Ensure | Commands::RemoteSetup
+        Commands::Stop | Commands::Jobs | Commands::Ensure | Commands::RemoteSetup | Commands::Scan
         | Commands::Kill { .. } | Commands::Pause { .. } | Commands::Unpause { .. } => unreachable!(),
     };
 
@@ -852,6 +855,40 @@ async fn show_status() -> Result<()> {
         println!("Daemon not running");
     }
     Ok(())
+}
+
+fn scan_plans() {
+    let config = crate::config::Config::load(None).expect("failed to load config");
+    let dirs = config.expanded_watch_dirs();
+    let patterns = &config.plan_patterns;
+
+    println!("Watch dirs:");
+    for d in &dirs {
+        println!("  {} (exists: {})", d.display(), d.exists());
+    }
+    println!("Patterns: {:?}", patterns);
+    println!();
+
+    // Raw scan — all matching .md files before status/non-interactive filtering
+    for dir in &dirs {
+        for pattern in patterns {
+            let files = crate::plan::scan_for_plans(dir, pattern);
+            println!("scan_for_plans({}, {}) -> {} files", dir.display(), pattern, files.len());
+            for f in &files {
+                let status = crate::plan::parse_plan_status(f).map(|s| format!("{:?}", s)).unwrap_or("?".into());
+                let ni = crate::plan::is_non_interactive(f);
+                let mode = crate::plan::parse_execution_mode(f);
+                println!("  {} [status={}, non-interactive={}, mode={:?}]", f.display(), status, ni, mode);
+            }
+        }
+    }
+
+    println!();
+    let ready = crate::plan::find_ready_plans(&dirs, patterns);
+    println!("find_ready_plans -> {} plans", ready.len());
+    for p in &ready {
+        println!("  {} [{:?}]", p.path.display(), p.status);
+    }
 }
 
 fn remote_setup() {
