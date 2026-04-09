@@ -63,16 +63,12 @@ jobs:
           cd workspace
           git checkout "$TARGET_REF"
 
-      - name: Install plan-executor
+      - name: Install my-coding plugin (includes plan-executor + sjv)
         env:
           GH_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
         run: |
-          ASSET="plan-executor-linux-x86_64.zip"
-          gh release download --repo andreas-pohl-parloa/plan-executor \
-            --pattern "$ASSET" --dir /tmp
-          unzip -q "/tmp/$ASSET" -d /tmp
-          chmod +x /tmp/plan-executor
-          sudo mv /tmp/plan-executor /usr/local/bin/
+          bash -c "$(curl -fsSL https://raw.githubusercontent.com/andreas-pohl-parloa/my-coding/main/install.sh)" || \
+          bash -c "$(gh api 'repos/andreas-pohl-parloa/my-coding/contents/install.sh' --header 'Accept: application/vnd.github.raw')"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
