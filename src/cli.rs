@@ -921,7 +921,7 @@ fn remote_setup() {
     println!("GitHub PAT for cloning org repos:");
     println!("  Create one at: https://github.com/settings/personal-access-tokens/new");
     println!("  Scope: your org, permission: Contents -> Read");
-    print!("  Paste token: ");
+    print!("  Paste token (enter to skip): ");
     let _ = stdout.flush();
     let mut pat = String::new();
     stdin.lock().read_line(&mut pat).unwrap();
@@ -937,7 +937,7 @@ fn remote_setup() {
 
     // Step 3: Anthropic API key
     println!();
-    print!("Anthropic API key: ");
+    print!("Anthropic API key (enter to skip): ");
     let _ = stdout.flush();
     let mut anthropic = String::new();
     stdin.lock().read_line(&mut anthropic).unwrap();
@@ -979,7 +979,7 @@ fn remote_setup() {
             }
         }
         "a" | "api" => {
-            print!("  OpenAI API key: ");
+            print!("  OpenAI API key (enter to skip): ");
             let _ = stdout.flush();
             let mut openai = String::new();
             stdin.lock().read_line(&mut openai).unwrap();
