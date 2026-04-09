@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.3] - 2026-04-09
+
+### Bug Fixes
+
+- Add 'enter to skip' hint to all remote-setup prompts ([7c93507](https://github.com/andreas-pohl-parloa/plan-executor/commit/7c935070a1495e684015a3857a988b86a553d8dc))
 ## [0.3.2] - 2026-04-09
 
 ### Bug Fixes
