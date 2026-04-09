@@ -121,6 +121,36 @@ pub fn push_codex_auth(remote_repo: &str) -> Result<()> {
     gh_secret_set_stdin("CODEX_AUTH", remote_repo, &content)
 }
 
+/// Returns true if the repo exists and is accessible.
+pub fn repo_exists(repo: &str) -> bool {
+    run_gh(&["repo", "view", repo, "--json", "name"]).is_ok()
+}
+
+/// Creates a private repo with an initial README commit.
+/// The `repo` slug must be `owner/name`.
+pub fn create_repo(repo: &str) -> Result<()> {
+    // --add-readme ensures the repo has at least one commit on main,
+    // which is required for the Contents API to push the workflow file.
+    run_gh(&[
+        "repo", "create", repo, "--private",
+        "--description", "Remote plan execution",
+        "--add-readme",
+    ])?;
+    Ok(())
+}
+
+/// Creates the `execution` GitHub Actions environment on the repo.
+/// Idempotent — succeeds if the environment already exists.
+pub fn ensure_environment(repo: &str) -> Result<()> {
+    // GitHub REST API: PUT /repos/{owner}/{repo}/environments/{name}
+    // This creates or updates the environment.
+    run_gh(&[
+        "api", &format!("repos/{}/environments/execution", repo),
+        "-X", "PUT",
+    ])?;
+    Ok(())
+}
+
 /// The embedded workflow YAML for the execution repo.
 const EXECUTE_PLAN_WORKFLOW: &str = include_str!("../docs/remote-execution/execute-plan.yml");
 

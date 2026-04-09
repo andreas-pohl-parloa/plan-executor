@@ -887,6 +887,20 @@ fn remote_setup() {
         std::process::exit(1);
     }
 
+    // Ensure repo exists
+    if crate::remote::repo_exists(&remote_repo) {
+        println!("  Repo exists.");
+    } else {
+        println!("  Repo not found. Creating...");
+        match crate::remote::create_repo(&remote_repo) {
+            Ok(()) => println!("  Created {}", remote_repo),
+            Err(e) => {
+                eprintln!("  Error creating repo: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Save to config
     match crate::config::Config::load(None) {
         Ok(mut config) => {
@@ -996,11 +1010,19 @@ fn remote_setup() {
         println!("  Skipped.");
     }
 
-    // Step 6: Push workflow to execution repo
+    // Step 6: Create GitHub Actions environment
     println!();
-    println!("Pushing execute-plan workflow to {}...", remote_repo);
+    print!("Creating 'execution' environment...");
+    let _ = stdout.flush();
+    match crate::remote::ensure_environment(&remote_repo) {
+        Ok(()) => println!(" done."),
+        Err(e) => eprintln!(" warning: {}", e),
+    }
+
+    // Step 7: Push workflow to execution repo
+    println!("Pushing execute-plan workflow...");
     match crate::remote::push_workflow(&remote_repo) {
-        Ok(()) => println!("  Workflow pushed to .github/workflows/execute-plan.yml"),
+        Ok(()) => println!("  Pushed to .github/workflows/execute-plan.yml"),
         Err(e) => eprintln!("  Error pushing workflow: {}", e),
     }
 
