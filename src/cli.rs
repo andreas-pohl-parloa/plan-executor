@@ -379,8 +379,11 @@ async fn execute_foreground(plan_path: String, config: crate::config::Config) ->
         anyhow::bail!("Plan file not found: {}", plan_path);
     }
 
-    // Remote plans always trigger remotely, even with -f
-    if crate::plan::parse_execution_mode(&resolved_path) == crate::plan::ExecutionMode::Remote {
+    // Remote plans trigger remotely unless PLAN_EXECUTOR_LOCAL=1 is set
+    // (used by the GitHub Actions runner to force local execution).
+    if crate::plan::parse_execution_mode(&resolved_path) == crate::plan::ExecutionMode::Remote
+        && std::env::var("PLAN_EXECUTOR_LOCAL").as_deref() != Ok("1")
+    {
         return trigger_remote(resolved_path, config).await;
     }
 

@@ -116,6 +116,7 @@ jobs:
         id: execute
         env:
           PLAN_FILENAME: ${{ steps.meta.outputs.plan_filename }}
+          PLAN_EXECUTOR_LOCAL: "1"
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
