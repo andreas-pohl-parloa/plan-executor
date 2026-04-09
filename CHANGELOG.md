@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.4] - 2026-04-09
+
+### Bug Fixes
+
+- Make plan header parsing case-insensitive ([ca532ec](https://github.com/andreas-pohl-parloa/plan-executor/commit/ca532ecb230a531009b4b65ec5b292ad694356ba))
 ## [0.3.3] - 2026-04-09
 
 ### Bug Fixes
