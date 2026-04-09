@@ -36,6 +36,8 @@ pub struct DaemonState {
     pub sub_agent_pgids: HashMap<String, Vec<u32>>,
     /// Jobs currently paused at a handoff — sub-agents held until ResumeJob
     pub paused_jobs: std::collections::HashSet<String>,
+    /// Remote executions being monitored: plan_path → (remote_repo, pr_number)
+    pub remote_executions: HashMap<String, (String, u64)>,
     /// broadcast channel for DaemonEvent to all TUI clients
     pub event_tx: broadcast::Sender<DaemonEvent>,
 }
@@ -125,6 +127,7 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
         process_group_ids: HashMap::new(),
         sub_agent_pgids: HashMap::new(),
         paused_jobs: std::collections::HashSet::new(),
+        remote_executions: HashMap::new(),
         event_tx: event_tx.clone(),
     }));
     tracing::info!("job history loaded");
@@ -162,6 +165,29 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
         });
     }
 
+    // Restore remote executions from plan files (daemon restart recovery)
+    {
+        let dirs = config.expanded_watch_dirs();
+        let patterns = config.plan_patterns.clone();
+        if let Some(remote_repo) = config.remote_repo.as_deref() {
+            let plans = crate::plan::scan_all_plans(&dirs, &patterns);
+            let mut st = state.lock().await;
+            for path in plans {
+                if crate::plan::parse_plan_status(&path).ok() == Some(PlanStatus::Executing)
+                    && crate::plan::parse_execution_mode(&path) == crate::plan::ExecutionMode::Remote
+                {
+                    if let Some(pr_str) = crate::plan::get_plan_header(&path, "remote-pr") {
+                        if let Ok(pr_num) = pr_str.parse::<u64>() {
+                            let path_str = path.to_string_lossy().to_string();
+                            tracing::info!(plan = %path_str, pr = pr_num, "restoring remote execution monitor");
+                            st.remote_executions.insert(path_str, (remote_repo.to_string(), pr_num));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Start watcher
     tracing::info!("starting FSEvents watcher");
     let (watcher, mut watch_rx) = start_watcher(watch_dirs.clone())?;
@@ -176,6 +202,9 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
     // Periodic re-scan to pick up plans in repos added while the daemon runs.
     let mut rescan_interval = tokio::time::interval(Duration::from_secs(60));
     rescan_interval.tick().await; // consume the immediate first tick
+    // Remote execution monitor (check every 30 seconds)
+    let mut remote_interval = tokio::time::interval(Duration::from_secs(30));
+    remote_interval.tick().await; // consume immediate tick
 
     loop {
         tokio::select! {
@@ -200,6 +229,11 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
             _ = rescan_interval.tick() => {
                 handle_rescan(&state, &config).await;
             }
+
+            // Monitor remote executions
+            _ = remote_interval.tick() => {
+                poll_remote_executions(&state).await;
+            }
         }
     }
 }
@@ -222,9 +256,10 @@ async fn handle_watch_event(
         return;
     }
 
-    // Skip if already pending or running
+    // Skip if already pending, running, or remotely executing
     if st.pending_plans.contains_key(&path_str) { return }
     if st.running_jobs.values().any(|j| j.plan_path == path) { return }
+    if st.remote_executions.contains_key(&path_str) { return }
 
     let _ = notify_plan_ready(&path_str, config.auto_execute);
     st.pending_plans.insert(path_str.clone(), PendingInfo {
@@ -269,6 +304,7 @@ async fn handle_rescan(state: &Arc<Mutex<DaemonState>>, config: &Config) {
         let path_str = plan.path.to_string_lossy().to_string();
         if st.pending_plans.contains_key(&path_str) { continue; }
         if st.running_jobs.values().any(|j| j.plan_path == plan.path) { continue; }
+        if st.remote_executions.contains_key(&path_str) { continue; }
         tracing::info!("rescan: queueing new plan {}", path_str);
         let _ = notify_plan_ready(&path_str, auto_execute);
         st.pending_plans.insert(path_str.clone(), PendingInfo {
@@ -281,6 +317,43 @@ async fn handle_rescan(state: &Arc<Mutex<DaemonState>>, config: &Config) {
     if changed {
         let event = st.snapshot_state();
         let _ = st.event_tx.send(event);
+    }
+}
+
+/// Polls all tracked remote executions to check if their PRs have closed.
+async fn poll_remote_executions(state: &Arc<Mutex<DaemonState>>) {
+    let executions: Vec<(String, String, u64)> = {
+        let st = state.lock().await;
+        st.remote_executions.iter()
+            .map(|(plan, (repo, pr))| (plan.clone(), repo.clone(), *pr))
+            .collect()
+    };
+
+    if executions.is_empty() { return; }
+
+    for (plan_path, remote_repo, pr_number) in executions {
+        let result = tokio::task::spawn_blocking({
+            let repo = remote_repo.clone();
+            move || crate::remote::get_pr_status(&repo, pr_number)
+        }).await;
+
+        let Ok(Ok((pr_state, labels))) = result else { continue };
+
+        match pr_state.as_str() {
+            "OPEN" => {} // still running
+            "CLOSED" | "MERGED" => {
+                let plan = PathBuf::from(&plan_path);
+                let success = labels.iter().any(|l| l == "succeeded");
+                let new_status = if success { "COMPLETED" } else { "FAILED" };
+
+                tracing::info!(plan = %plan_path, pr = pr_number, status = new_status, "remote execution finished");
+                let _ = crate::plan::set_plan_header(&plan, "status", new_status);
+
+                let mut st = state.lock().await;
+                st.remote_executions.remove(&plan_path);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -307,7 +380,19 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                     };
                     let _ = crate::remote::push_codex_auth(remote_repo);
                     match crate::remote::trigger_remote_execution(remote_repo, &plan, &meta) {
-                        Ok(url) => tracing::info!(url = %url, "remote execution triggered"),
+                        Ok(url) => {
+                            tracing::info!(url = %url, "remote execution triggered");
+                            // Update plan status and store PR number
+                            let _ = crate::plan::set_plan_header(&plan, "status", "EXECUTING");
+                            if let Some(pr_num) = crate::remote::pr_number_from_url(&url) {
+                                let _ = crate::plan::set_plan_header(&plan, "remote-pr", &pr_num.to_string());
+                                let mut st = state.lock().await;
+                                st.remote_executions.insert(
+                                    plan_path.to_string(),
+                                    (remote_repo.to_string(), pr_num),
+                                );
+                            }
+                        }
                         Err(e) => tracing::error!(error = %e, "remote execution failed"),
                     }
                 }

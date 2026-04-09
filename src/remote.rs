@@ -316,6 +316,29 @@ pub struct RemoteJob {
     pub target: String,
 }
 
+/// Queries the state and labels of a PR by number. Returns `(state, labels)`.
+/// `state` is "OPEN", "CLOSED", or "MERGED".
+pub fn get_pr_status(remote_repo: &str, pr_number: u64) -> Result<(String, Vec<String>)> {
+    let output = run_gh(&[
+        "pr", "view",
+        &pr_number.to_string(),
+        "--repo", remote_repo,
+        "--json", "state,labels",
+    ])?;
+    let val: serde_json::Value = serde_json::from_str(&output)?;
+    let state = val["state"].as_str().unwrap_or("UNKNOWN").to_string();
+    let labels: Vec<String> = val["labels"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|l| l["name"].as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    Ok((state, labels))
+}
+
+/// Extracts the PR number from a PR URL like `https://github.com/owner/repo/pull/42`.
+pub fn pr_number_from_url(url: &str) -> Option<u64> {
+    url.rsplit('/').next().and_then(|s| s.parse().ok())
+}
+
 // -- Helpers ------------------------------------------------------------------
 
 fn run_git(dir: &Path, args: &[&str]) -> Result<String> {

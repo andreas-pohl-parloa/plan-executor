@@ -79,6 +79,54 @@ pub fn is_non_interactive(path: &Path) -> bool {
     })
 }
 
+/// Reads a plan header value by key (case-insensitive).
+/// E.g. `get_plan_header(path, "remote-pr")` reads `**remote-pr:** 42`.
+pub fn get_plan_header(path: &Path, key: &str) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let prefix = format!("**{}:**", key.to_ascii_lowercase());
+    for line in content.lines() {
+        if line.trim().to_ascii_lowercase().starts_with(&prefix) {
+            let rest = &line.trim()[prefix.len()..];
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Sets or inserts a plan header value. If the key already exists (case-insensitive),
+/// the line is replaced. Otherwise the header is inserted after the last existing
+/// `**...**` header line.
+pub fn set_plan_header(path: &Path, key: &str, value: &str) -> Result<()> {
+    let content = std::fs::read_to_string(path)?;
+    let prefix_lower = format!("**{}:**", key.to_ascii_lowercase());
+    let new_line = format!("**{}:** {}", key, value);
+
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    let mut replaced = false;
+
+    for line in &mut lines {
+        if line.trim().to_ascii_lowercase().starts_with(&prefix_lower) {
+            *line = new_line.clone();
+            replaced = true;
+            break;
+        }
+    }
+
+    if !replaced {
+        // Insert after the last **...: header line
+        let mut insert_at = 0;
+        for (i, line) in lines.iter().enumerate() {
+            if line.trim().starts_with("**") && line.trim().contains(":**") {
+                insert_at = i + 1;
+            }
+        }
+        lines.insert(insert_at, new_line);
+    }
+
+    std::fs::write(path, lines.join("\n") + "\n")?;
+    Ok(())
+}
+
 // Directories that are never worth descending into when scanning for plans.
 const SKIP_DIRS: &[&str] = &[
     "target", "node_modules", ".git", ".hg", ".svn",
@@ -156,6 +204,17 @@ fn scan_recursive(base_dir: &Path, sub_pattern: &str) -> Vec<PathBuf> {
         // Collect matching files in this directory
         for file in scan_glob(path, file_glob) {
             results.push(file);
+        }
+    }
+    results
+}
+
+/// Scans all watch_dirs with all patterns and returns all discovered plan file paths.
+pub fn scan_all_plans(watch_dirs: &[PathBuf], patterns: &[String]) -> Vec<PathBuf> {
+    let mut results = Vec::new();
+    for dir in watch_dirs {
+        for pattern in patterns {
+            results.extend(scan_for_plans(dir, pattern));
         }
     }
     results
