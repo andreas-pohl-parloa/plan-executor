@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.1] - 2026-04-09
+
+### Miscellaneous
+
+- Update Cargo.lock and stream-json-view submodule ([8ae5653](https://github.com/andreas-pohl-parloa/plan-executor/commit/8ae56536bfb249f25747739f0cd022c82f528d06))
 ## [0.4.0] - 2026-04-09
 
 ### Features
