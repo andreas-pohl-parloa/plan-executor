@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.6.8] - 2026-04-10
+
+### Documentation
+
+- Add README with remote setup instructions ([4135ee1](https://github.com/andreas-pohl-parloa/plan-executor/commit/4135ee15f5ec99e321afd06a41a90435c44dcb06))
 ## [0.6.7] - 2026-04-10
 
 ### Bug Fixes
