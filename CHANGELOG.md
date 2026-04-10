@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.8] - 2026-04-10
+
+### Bug Fixes
+
+- Download binary from any release with matching asset ([ddf490c](https://github.com/andreas-pohl-parloa/plan-executor/commit/ddf490cd675e95f3b50fcab2b27e4ef786c19bd3))
 ## [0.4.7] - 2026-04-10
 
 ### Bug Fixes
