@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.11.1] - 2026-04-10
+
+### Bug Fixes
+
+- Compute TARGET width from data to avoid cutoff ([07ef6ca](https://github.com/andreas-pohl-parloa/plan-executor/commit/07ef6ca8432118f8031926fff42c90906d328b7f))
 ## [0.11.0] - 2026-04-10
 
 ### Features
