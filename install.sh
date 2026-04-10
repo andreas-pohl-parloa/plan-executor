@@ -108,18 +108,15 @@ _install_from_binary() {
 _ensure_config() {
     local config="$BASE_DIR/config.json"
     if [[ ! -f "$config" ]]; then
-        local workspace_dir
-        workspace_dir="$(dirname "$SCRIPT_DIR")"
         mkdir -p "$BASE_DIR"
         cat > "$config" << EOCFG
 {
-  "watch_dirs": ["$workspace_dir", "$HOME/tools"],
-  "plan_patterns": [".my/plans/*.md"],
+  "watch_dirs": ["~/workspace/code", "~/tools"],
+  "plan_patterns": ["**/.my/plans/*.md"],
   "auto_execute": false
 }
 EOCFG
         echo "Created config: $config"
-        echo "  watch_dirs: $workspace_dir, ~/tools"
     fi
 }
 
