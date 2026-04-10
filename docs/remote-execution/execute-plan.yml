@@ -78,7 +78,7 @@ jobs:
         run: npm install -g @openai/codex
 
       - name: Install Gemini CLI
-        run: npm install -g @anthropic-ai/gemini-cli || true
+        run: npm install -g @google/gemini-cli || true
 
       - name: Install my-coding plugin (includes plan-executor + sjv)
         env:
