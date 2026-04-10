@@ -79,31 +79,31 @@ jobs:
       - name: Install Gemini CLI
         run: npm install -g @google/gemini-cli || true
 
-      - name: Install plan-executor binary
+      - name: Install plan-executor and sjv binaries
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          ASSET="plan-executor-linux-x86_64.zip"
-          # Find the latest release that has the Linux binary
-          TAG=$(gh api repos/andreas-pohl-parloa/plan-executor/releases \
-            --jq "[.[] | select(.assets | map(.name) | any(contains(\"linux\")))][0].tag_name")
-          echo "Downloading plan-executor $TAG"
-          gh release download "$TAG" --repo andreas-pohl-parloa/plan-executor \
-            --pattern "$ASSET" --dir /tmp
-          unzip -q "/tmp/$ASSET" -d /tmp
-          chmod +x /tmp/plan-executor
-          sudo mv /tmp/plan-executor /usr/local/bin/
+          for repo_asset in "plan-executor:plan-executor-linux-x86_64.zip" "stream-json-view:sjv-linux-x86_64.zip"; do
+            REPO="andreas-pohl-parloa/${repo_asset%%:*}"
+            ASSET="${repo_asset##*:}"
+            BINARY="${ASSET%%-linux*}"
+            TAG=$(gh api "repos/$REPO/releases" \
+              --jq "[.[] | select(.assets | map(.name) | any(contains(\"linux\")))][0].tag_name")
+            echo "Downloading $BINARY $TAG from $REPO"
+            gh release download "$TAG" --repo "$REPO" --pattern "$ASSET" --dir /tmp
+            unzip -qo "/tmp/$ASSET" -d /tmp
+          done
+          chmod +x /tmp/plan-executor /tmp/sjv
+          sudo mv /tmp/plan-executor /tmp/sjv /usr/local/bin/
 
-      - name: Install my-coding plugin
+      - name: Install my-coding Claude plugin
         env:
-          GH_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          # Configure git to use GH_TOKEN for HTTPS clones (needed for private repos)
           git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
           git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "git@github.com:"
-          PE_SKIP_BINARY=1 bash -c "$(gh api 'repos/andreas-pohl-parloa/my-coding/contents/install.sh?ref=main' --header 'Accept: application/vnd.github.raw')"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          echo "$HOME/bin" >> "$GITHUB_PATH"
+          claude plugin marketplace add andreas-pohl-parloa/my-coding
+          claude plugin install my@my-coding
 
       - name: Restore agent auth
         run: |
