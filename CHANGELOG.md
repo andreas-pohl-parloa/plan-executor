@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.11.0] - 2026-04-10
+
+### Features
+
+- Scale jobs output to terminal width ([d60e6c0](https://github.com/andreas-pohl-parloa/plan-executor/commit/d60e6c00bbe79e8feb9fd6c22e4a96ddd18c44dd))
 ## [0.10.0] - 2026-04-10
 
 ### Features
