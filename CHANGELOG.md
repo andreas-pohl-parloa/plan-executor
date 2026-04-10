@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.6.2] - 2026-04-10
+
+### Bug Fixes
+
+- Copy cargo-built binary to target install dir ([939396b](https://github.com/andreas-pohl-parloa/plan-executor/commit/939396bbcd1b590e30c0fb59df35921e3a2631c4))
 ## [0.6.1] - 2026-04-10
 
 ### Bug Fixes
