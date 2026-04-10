@@ -104,7 +104,7 @@ jobs:
           git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
           git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "git@github.com:"
 
-          PLAN_FILE="workspace/.my/plans/$PLAN_FILENAME"
+          PLAN_FILE="plan.md"
 
           # Always install the base marketplace and plugin
           echo "Adding marketplace: andreas-pohl-parloa/my-coding"
