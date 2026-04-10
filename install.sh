@@ -4,10 +4,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$HOME/.plan-executor"
 LOG_FILE="$BASE_DIR/daemon.log"
-BINARY="$HOME/.cargo/bin/plan-executor"
 MARKER="# plan-executor"
 REPO_SLUG="andreas-pohl-parloa/plan-executor"
 BINARY_NAME="plan-executor"
+
+_get_install_dir() {
+    if [[ -d "$HOME/bin" ]]; then
+        echo "$HOME/bin"
+    else
+        mkdir -p "$HOME/.local/bin"
+        echo "$HOME/.local/bin"
+    fi
+}
+
+BINARY="$(_get_install_dir)/plan-executor"
 
 ACTION="${1:-install}"
 
