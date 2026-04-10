@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.7.0] - 2026-04-10
+
+### Features
+
+- Track remote executions as proper jobs ([2b288c4](https://github.com/andreas-pohl-parloa/plan-executor/commit/2b288c41f1af0718c34c69bf837b042a54310f52))
 ## [0.6.9] - 2026-04-10
 
 ### Documentation
