@@ -106,18 +106,26 @@ jobs:
 
           PLAN_FILE="workspace/.my/plans/$PLAN_FILENAME"
 
-          # Install marketplaces from **add-marketplaces:** header
+          # Always install the base marketplace and plugin
+          echo "Adding marketplace: andreas-pohl-parloa/my-coding"
+          claude plugin marketplace add andreas-pohl-parloa/my-coding || true
+          echo "Installing plugin: plan-executor@my-coding"
+          claude plugin install plan-executor@my-coding || true
+
+          # Install additional marketplaces from **add-marketplaces:** header
           MARKETPLACES=$(grep -i '^\*\*add-marketplaces:\*\*' "$PLAN_FILE" | sed 's/.*\*\*[[:space:]]*//' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
           for mp in $MARKETPLACES; do
             [ -z "$mp" ] && continue
+            [[ "$mp" == "andreas-pohl-parloa/my-coding" ]] && continue
             echo "Adding marketplace: $mp"
             claude plugin marketplace add "$mp" || true
           done
 
-          # Install plugins from **add-plugins:** header
+          # Install additional plugins from **add-plugins:** header
           PLUGINS=$(grep -i '^\*\*add-plugins:\*\*' "$PLAN_FILE" | sed 's/.*\*\*[[:space:]]*//' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
           for pl in $PLUGINS; do
             [ -z "$pl" ] && continue
+            [[ "$pl" == "plan-executor@my-coding" ]] && continue
             echo "Installing plugin: $pl"
             claude plugin install "$pl" || true
           done
