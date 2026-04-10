@@ -1,0 +1,17 @@
+{
+  "skill_version": "validate-execution-plan-non-interactive/v1",
+  "phase": "plan_validation",
+  "validation_attempt": 1,
+  "frozen_reviewer_set": null,
+  "current_batch": 1,
+  "validator_prompt_file": "/Users/andreas.pohl/workspace/code/plan-executor/.tmp-subtask-plan-validation-attempt-1.md",
+  "validator_handoff": "call sub-agent 1 (agent-type: claude): /Users/andreas.pohl/workspace/code/plan-executor/.tmp-subtask-plan-validation-attempt-1.md",
+  "validator_report_status": null,
+  "unresolved_gaps": [],
+  "unresolved_deviations": [],
+  "actionable_fix_items": [],
+  "completed_fix_batches": [],
+  "pending_review_rerun": false,
+  "cap_summary": null,
+  "post_cap_decision": "unset"
+}

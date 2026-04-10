@@ -24,22 +24,6 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# File system watching (macOS FSEvents backend)
-notify = "8"
-
-# Glob pattern matching
-glob = "0.3"
-
-# Directory walking (used for recursive plan scanning, skips target/ etc.)
-walkdir = "2"
-
-# Desktop notifications (D-Bus backend on Linux, system notifications on macOS)
-notify-rust = { version = "4", features = ["d"] }
-
-# TUI
-ratatui = "0.29"
-crossterm = "0.28"
-
 # Error handling
 thiserror = "2"
 anyhow = "1"

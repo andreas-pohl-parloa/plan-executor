@@ -1,0 +1,11 @@
+{
+  "watch_dirs": ["~/workspace/code/plan-executor/mock"],
+  "plan_patterns": ["plan/*.md"],
+  "auto_execute": false,
+  "agents": {
+    "main": "./main-agent-handoff-error.sh",
+    "claude": "./sub-agent.sh",
+    "codex": "./sub-agent.sh",
+    "gemini": "./sub-agent.sh"
+  }
+}

@@ -15,8 +15,6 @@ pub enum TuiRequest {
     Subscribe,
     /// Execute a plan immediately
     Execute { plan_path: String },
-    /// Cancel pending execution (within 15s window)
-    CancelPending { plan_path: String },
     /// Kill a running job
     KillJob { job_id: String },
     /// Pause a running job — handoff sub-agents are held until ResumeJob
@@ -38,7 +36,6 @@ pub enum DaemonEvent {
     /// Full state snapshot (response to Subscribe/GetState)
     State {
         running_jobs: Vec<JobMetadata>,
-        pending_plans: Vec<PendingPlan>,
         history: Vec<JobMetadata>,
         /// IDs of jobs currently paused at a handoff
         #[serde(default)]
@@ -50,18 +47,8 @@ pub enum DaemonEvent {
     JobDisplayLine { job_id: String, line: String },
     /// A job's metadata changed (status, tokens, cost)
     JobUpdated { job: JobMetadata },
-    /// A new READY plan was detected
-    PlanReady { plan_path: String, auto_execute: bool },
     /// Error response
     Error { message: String },
-}
-
-/// A plan detected as READY, pending user action or countdown
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingPlan {
-    pub plan_path: String,
-    /// Seconds remaining before auto-execute (None if manual mode)
-    pub auto_execute_remaining_secs: Option<u64>,
 }
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

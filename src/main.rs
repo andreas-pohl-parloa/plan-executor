@@ -6,10 +6,7 @@ mod handoff;
 mod ipc;
 mod remote;
 mod jobs;
-mod notifications;
 mod plan;
-mod tui;
-mod watcher;
 
 pub use config::Config;
 

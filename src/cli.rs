@@ -34,8 +34,6 @@ pub enum Commands {
     Stop,
     /// Start the daemon if it is not already running (used by shell hook)
     Ensure,
-    /// Attach TUI to running daemon
-    Tui,
     /// Show daemon status
     Status,
     /// List job history
@@ -61,8 +59,6 @@ pub enum Commands {
     },
     /// Interactive wizard to configure remote execution secrets
     RemoteSetup,
-    /// Debug: scan and list all discovered plans
-    Scan,
 }
 
 /// Prints a display line to the terminal, coloring plan-executor prefix lines
@@ -91,7 +87,6 @@ pub fn run() {
         Commands::Jobs   => { list_jobs(); return; }
         Commands::Ensure => { ensure_daemon(); return; }
         Commands::RemoteSetup => { remote_setup(); return; }
-        Commands::Scan => { scan_plans(); return; }
         Commands::Kill   { job_id } => { daemon_job_request("kill",    job_id); return; }
         Commands::Pause  { job_id } => { daemon_job_request("pause",   job_id); return; }
         Commands::Unpause{ job_id } => { daemon_job_request("unpause", job_id); return; }
@@ -128,11 +123,10 @@ pub fn run() {
                 rt.block_on(execute_plan(plan, config))
             }
         }
-        Commands::Tui => rt.block_on(crate::tui::run_tui()),
         Commands::Status => rt.block_on(show_status()),
         Commands::Output { job_id, follow } => rt.block_on(output_job(job_id, follow)),
         Commands::Retry { job_id } => rt.block_on(retry_job(job_id)),
-        Commands::Stop | Commands::Jobs | Commands::Ensure | Commands::RemoteSetup | Commands::Scan
+        Commands::Stop | Commands::Jobs | Commands::Ensure | Commands::RemoteSetup
         | Commands::Kill { .. } | Commands::Pause { .. } | Commands::Unpause { .. } => unreachable!(),
     };
 
@@ -369,16 +363,8 @@ fn resolve_plan_path(arg: &str) -> String {
         let mut reader = BufReader::new(s);
         let mut line = String::new();
         let _ = reader.read_line(&mut line);
-        if let Ok(DaemonEvent::State { running_jobs, history, pending_plans, .. }) = serde_json::from_str(&line) {
-            // 1. Match pending plan by filename or full path prefix
-            if let Some(p) = pending_plans.iter().find(|p| {
-                let fname = std::path::Path::new(&p.plan_path)
-                    .file_name().and_then(|n| n.to_str()).unwrap_or("");
-                fname.starts_with(arg) || p.plan_path.starts_with(arg)
-            }) {
-                return p.plan_path.clone();
-            }
-            // 2. Match job ID prefix (history or running)
+        if let Ok(DaemonEvent::State { running_jobs, history, .. }) = serde_json::from_str(&line) {
+            // Match job ID prefix (history or running)
             if let Some(job) = running_jobs.into_iter().chain(history)
                 .find(|j| j.id.starts_with(arg))
             {
@@ -663,15 +649,15 @@ fn list_jobs() {
     let mut line = String::new();
     let _ = reader.read_line(&mut line);
 
-    let (jobs, pending) = if let Ok(DaemonEvent::State { running_jobs, history, pending_plans, .. }) = serde_json::from_str::<DaemonEvent>(&line) {
+    let jobs = if let Ok(DaemonEvent::State { running_jobs, history, .. }) = serde_json::from_str::<DaemonEvent>(&line) {
         let jobs: Vec<JobMetadata> = running_jobs.into_iter().chain(history).collect();
-        (jobs, pending_plans)
+        jobs
     } else {
         eprintln!("Unexpected response from daemon.");
         std::process::exit(1);
     };
 
-    if jobs.is_empty() && pending.is_empty() {
+    if jobs.is_empty() {
         println!("No jobs found.");
         return;
     }
@@ -687,21 +673,6 @@ fn list_jobs() {
         id_w = id_w, plan_w = plan_w, status_w = status_w, dur_w = dur_w,
     );
     println!("{}", "─".repeat(id_w + 2 + plan_w + 2 + status_w + 2 + dur_w));
-
-    for p in &pending {
-        let plan = std::path::Path::new(&p.plan_path)
-            .file_name().and_then(|n| n.to_str()).unwrap_or(&p.plan_path);
-        let plan_truncated = if plan.len() > plan_w {
-            format!("{}…", &plan[..plan_w - 1])
-        } else {
-            plan.to_string()
-        };
-        println!(
-            "{:<id_w$}  {:<plan_w$}  {:<status_w$}  {:>dur_w$}",
-            "-", plan_truncated, "ready", "-",
-            id_w = id_w, plan_w = plan_w, status_w = status_w, dur_w = dur_w,
-        );
-    }
 
     for job in &jobs {
         let id = &job.id[..job.id.len().min(6)];
@@ -886,40 +857,6 @@ async fn show_status() -> Result<()> {
         println!("Daemon not running");
     }
     Ok(())
-}
-
-fn scan_plans() {
-    let config = crate::config::Config::load(None).expect("failed to load config");
-    let dirs = config.expanded_watch_dirs();
-    let patterns = &config.plan_patterns;
-
-    println!("Watch dirs:");
-    for d in &dirs {
-        println!("  {} (exists: {})", d.display(), d.exists());
-    }
-    println!("Patterns: {:?}", patterns);
-    println!();
-
-    // Raw scan — all matching .md files before status/non-interactive filtering
-    for dir in &dirs {
-        for pattern in patterns {
-            let files = crate::plan::scan_for_plans(dir, pattern);
-            println!("scan_for_plans({}, {}) -> {} files", dir.display(), pattern, files.len());
-            for f in &files {
-                let status = crate::plan::parse_plan_status(f).map(|s| format!("{:?}", s)).unwrap_or("?".into());
-                let ni = crate::plan::is_non_interactive(f);
-                let mode = crate::plan::parse_execution_mode(f);
-                println!("  {} [status={}, non-interactive={}, mode={:?}]", f.display(), status, ni, mode);
-            }
-        }
-    }
-
-    println!();
-    let ready = crate::plan::find_ready_plans(&dirs, patterns);
-    println!("find_ready_plans -> {} plans", ready.len());
-    for p in &ready {
-        println!("  {} [{:?}]", p.path.display(), p.status);
-    }
 }
 
 fn remote_setup() {

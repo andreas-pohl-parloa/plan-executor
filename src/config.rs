@@ -52,12 +52,6 @@ impl Default for AgentConfig {
 /// (or a custom path supplied via `--config`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Directories to watch for plan files (tilde-expanded).
-    pub watch_dirs: Vec<String>,
-    /// Glob patterns relative to each watch_dir, e.g. `[".my/plans/*.md"]`.
-    pub plan_patterns: Vec<String>,
-    /// If true, auto-execute READY plans after 15 s countdown.
-    pub auto_execute: bool,
     /// Agent command overrides. Uses built-in defaults when absent.
     #[serde(default)]
     pub agents: AgentConfig,
@@ -70,9 +64,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            watch_dirs: vec!["~/tools".to_string()],
-            plan_patterns: vec!["**/.my/plans/*.md".to_string()],
-            auto_execute: false,
             agents: AgentConfig::default(),
             remote_repo: None,
         }
@@ -130,11 +121,6 @@ impl Config {
         Ok(config)
     }
 
-    /// Expands tilde in watch_dirs to absolute paths.
-    pub fn expanded_watch_dirs(&self) -> Vec<PathBuf> {
-        self.watch_dirs.iter().map(|d| expand_tilde(d)).collect()
-    }
-
     /// Splits a command template string into (program, leading_args).
     /// Callers append the final argument(s) themselves.
     pub fn parse_cmd(template: &str) -> (String, Vec<String>) {
@@ -176,17 +162,14 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = Config::default();
-        assert!(!config.auto_execute);
-        assert!(!config.watch_dirs.is_empty());
-        assert!(!config.plan_patterns.is_empty());
+        assert!(config.remote_repo.is_none());
     }
 
     #[test]
     fn test_config_serde_roundtrip() {
-        let json = r#"{"watch_dirs": ["~/workspace"], "plan_patterns": [".my/plans/*.md"], "auto_execute": true}"#;
+        let json = r#"{"remote_repo": "owner/plan-executions"}"#;
         let config: Config = serde_json::from_str(json).unwrap();
-        assert!(config.auto_execute);
-        assert_eq!(config.watch_dirs, vec!["~/workspace"]);
+        assert_eq!(config.remote_repo.as_deref(), Some("owner/plan-executions"));
     }
 
     #[test]
@@ -198,9 +181,6 @@ mod tests {
     #[test]
     fn test_config_remote_repo_from_json() {
         let json = r#"{
-            "watch_dirs": ["~/workspace"],
-            "plan_patterns": [".my/plans/*.md"],
-            "auto_execute": false,
             "remote_repo": "owner/plan-executions"
         }"#;
         let config: Config = serde_json::from_str(json).unwrap();
@@ -209,11 +189,7 @@ mod tests {
 
     #[test]
     fn test_config_remote_repo_absent_in_json() {
-        let json = r#"{
-            "watch_dirs": ["~/workspace"],
-            "plan_patterns": [".my/plans/*.md"],
-            "auto_execute": false
-        }"#;
+        let json = r#"{}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.remote_repo.is_none());
     }

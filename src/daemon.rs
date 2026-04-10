@@ -4,17 +4,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, Mutex};
-use tokio::time::{Duration, Instant};
+use tokio::time::Duration;
 use anyhow::Result;
 
 use crate::config::Config;
 use crate::executor::{spawn_execution, ExecEvent};
 use crate::handoff;
-use crate::ipc::{socket_path, DaemonEvent, PendingPlan, TuiRequest};
+use crate::ipc::{socket_path, DaemonEvent, TuiRequest};
 use crate::jobs::{JobMetadata, JobStatus};
-use crate::notifications::{notify_execution_complete, notify_plan_ready};
-use crate::plan::{find_ready_plans, parse_plan_status, PlanStatus};
-use crate::watcher::start_watcher;
 
 /// Shared daemon state
 pub struct DaemonState {
@@ -22,7 +19,6 @@ pub struct DaemonState {
     pub config: Config,
     pub agents: crate::config::AgentConfig,
     pub running_jobs: HashMap<String, JobMetadata>, // job_id -> metadata
-    pub pending_plans: HashMap<String, PendingInfo>, // plan_path -> info
     pub history: Vec<JobMetadata>,
     /// Per-job raw output buffers (last N lines)
     pub job_output: HashMap<String, VecDeque<String>>,
@@ -42,12 +38,6 @@ pub struct DaemonState {
     pub event_tx: broadcast::Sender<DaemonEvent>,
 }
 
-pub struct PendingInfo {
-    pub plan_path: String,
-    pub detected_at: Instant,
-    pub auto_execute: bool,
-}
-
 /// Write a display line to the job's display.log so `plan-executor output` sees it.
 fn append_display(job_id: &str, line: &str) {
     use std::io::Write;
@@ -62,15 +52,6 @@ impl DaemonState {
     pub fn snapshot_state(&self) -> DaemonEvent {
         DaemonEvent::State {
             running_jobs: self.running_jobs.values().cloned().collect(),
-            pending_plans: self.pending_plans.values().map(|p| PendingPlan {
-                plan_path: p.plan_path.clone(),
-                auto_execute_remaining_secs: if p.auto_execute {
-                    let elapsed = p.detected_at.elapsed().as_secs();
-                    Some(15u64.saturating_sub(elapsed))
-                } else {
-                    None
-                },
-            }).collect(),
             history: self.history.clone(),
             paused_job_ids: self.paused_jobs.iter().cloned().collect(),
         }
@@ -80,9 +61,6 @@ impl DaemonState {
 /// Main daemon entry point
 pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
     tracing::info!("daemon starting (pid={})", std::process::id());
-
-    let watch_dirs = config.expanded_watch_dirs();
-    tracing::info!("config loaded, watch_dirs={:?}", watch_dirs);
 
     // Write PID file on every start so restarts always reflect the current PID.
     let pid_path = Config::base_dir().join("daemon.pid");
@@ -119,7 +97,6 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
         config: config.clone(),
         agents: config.agents.clone(),
         running_jobs: HashMap::new(),
-        pending_plans: HashMap::new(),
         history: history_on_start,
         job_output: HashMap::new(),
         job_display_output: HashMap::new(),
@@ -131,39 +108,6 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
         event_tx: event_tx.clone(),
     }));
     tracing::info!("job history loaded");
-
-    // Startup scan runs in the background so the daemon (socket + watcher)
-    // is available immediately. Plans are added to pending_plans when found.
-    {
-        let state_clone = Arc::clone(&state);
-        let patterns = config.plan_patterns.clone();
-        let auto_execute = config.auto_execute;
-        let dirs = watch_dirs.clone();
-        tokio::task::spawn_blocking(move || {
-            tracing::info!("background scan: scanning for ready plans");
-            let ready = find_ready_plans(&dirs, &patterns);
-            tracing::info!("background scan: found {} ready plan(s)", ready.len());
-            // Use block_on to acquire the async mutex from the blocking thread
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
-                let mut st = state_clone.lock().await;
-                for plan in ready {
-                    let path_str = plan.path.to_string_lossy().to_string();
-                    if st.pending_plans.contains_key(&path_str) { continue; }
-                    if st.running_jobs.values().any(|j| j.plan_path == plan.path) { continue; }
-                    tracing::info!("background scan: queueing {}", path_str);
-                    let _ = notify_plan_ready(&path_str, auto_execute);
-                    st.pending_plans.insert(path_str.clone(), PendingInfo {
-                        plan_path: path_str,
-                        detected_at: Instant::now(),
-                        auto_execute,
-                    });
-                }
-                let event = st.snapshot_state();
-                let _ = st.event_tx.send(event);
-            });
-        });
-    }
 
     // Restore remote executions from persisted job metadata
     {
@@ -186,46 +130,20 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
         }
     }
 
-    // Start watcher
-    tracing::info!("starting FSEvents watcher");
-    let (watcher, mut watch_rx) = start_watcher(watch_dirs.clone())?;
-    tracing::info!("watcher started");
-    let _watcher = watcher; // keep alive
-
     // Unix socket listener
     let listener = UnixListener::bind(&sock_path)?;
 
-    // Ticker for auto-execute countdown (check every second)
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
-    // Periodic re-scan to pick up plans in repos added while the daemon runs.
-    let mut rescan_interval = tokio::time::interval(Duration::from_secs(60));
-    rescan_interval.tick().await; // consume the immediate first tick
     // Remote execution monitor (check every 30 seconds)
     let mut remote_interval = tokio::time::interval(Duration::from_secs(30));
     remote_interval.tick().await; // consume immediate tick
 
     loop {
         tokio::select! {
-            // FS event
-            Some(watch_event) = watch_rx.recv() => {
-                handle_watch_event(&state, &config, watch_event.path).await;
-            }
-
-            // New TUI client
+            // New client connection
             Ok((stream, _)) = listener.accept() => {
                 let state_clone = Arc::clone(&state);
                 let rx = event_tx.subscribe();
                 tokio::spawn(handle_tui_client(stream, state_clone, rx));
-            }
-
-            // Auto-execute tick
-            _ = interval.tick() => {
-                handle_auto_execute_tick(&state).await;
-            }
-
-            // Periodic re-scan: catch plans in repos added while running
-            _ = rescan_interval.tick() => {
-                handle_rescan(&state, &config).await;
             }
 
             // Monitor remote executions
@@ -233,88 +151,6 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
                 poll_remote_executions(&state).await;
             }
         }
-    }
-}
-
-async fn handle_watch_event(
-    state: &Arc<Mutex<DaemonState>>,
-    config: &Config,
-    path: PathBuf,
-) {
-    let Ok(status) = parse_plan_status(&path) else { return };
-    let path_str = path.to_string_lossy().to_string();
-    let mut st = state.lock().await;
-
-    if status != PlanStatus::Ready || !crate::plan::is_non_interactive(&path) {
-        // Plan is no longer eligible — remove from pending if it was there.
-        if st.pending_plans.remove(&path_str).is_some() {
-            let event = st.snapshot_state();
-            let _ = st.event_tx.send(event);
-        }
-        return;
-    }
-
-    // Skip if already pending, running, or remotely executing
-    if st.pending_plans.contains_key(&path_str) { return }
-    if st.running_jobs.values().any(|j| j.plan_path == path) { return }
-    if st.remote_executions.contains_key(&path_str) { return }
-
-    let _ = notify_plan_ready(&path_str, config.auto_execute);
-    st.pending_plans.insert(path_str.clone(), PendingInfo {
-        plan_path: path_str.clone(),
-        detected_at: Instant::now(),
-        auto_execute: config.auto_execute,
-    });
-    let event = st.snapshot_state();
-    let _ = st.event_tx.send(event);
-}
-
-async fn handle_auto_execute_tick(state: &Arc<Mutex<DaemonState>>) {
-    let to_execute: Vec<String> = {
-        let mut st = state.lock().await;
-        let to_exec: Vec<String> = st.pending_plans.iter()
-            .filter(|(_, info)| info.auto_execute && info.detected_at.elapsed() >= Duration::from_secs(15))
-            .map(|(path, _)| path.clone())
-            .collect();
-        // Remove them while still holding the lock to prevent double-execution
-        for path in &to_exec {
-            st.pending_plans.remove(path);
-        }
-        to_exec
-    };
-    for path in to_execute {
-        trigger_execution(state, &path).await;
-    }
-}
-
-async fn handle_rescan(state: &Arc<Mutex<DaemonState>>, config: &Config) {
-    let patterns = config.plan_patterns.clone();
-    let dirs = config.expanded_watch_dirs();
-    let auto_execute = config.auto_execute;
-
-    let ready = tokio::task::spawn_blocking(move || find_ready_plans(&dirs, &patterns))
-        .await
-        .unwrap_or_default();
-
-    let mut st = state.lock().await;
-    let mut changed = false;
-    for plan in ready {
-        let path_str = plan.path.to_string_lossy().to_string();
-        if st.pending_plans.contains_key(&path_str) { continue; }
-        if st.running_jobs.values().any(|j| j.plan_path == plan.path) { continue; }
-        if st.remote_executions.contains_key(&path_str) { continue; }
-        tracing::info!("rescan: queueing new plan {}", path_str);
-        let _ = notify_plan_ready(&path_str, auto_execute);
-        st.pending_plans.insert(path_str.clone(), PendingInfo {
-            plan_path: path_str,
-            detected_at: Instant::now(),
-            auto_execute,
-        });
-        changed = true;
-    }
-    if changed {
-        let event = st.snapshot_state();
-        let _ = st.event_tx.send(event);
     }
 }
 
@@ -411,8 +247,7 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                     tracing::error!(plan = %plan_path, error = %e, "remote execution: could not determine git context");
                 }
             }
-            let mut st = state.lock().await;
-            st.pending_plans.remove(plan_path);
+            let st = state.lock().await;
             let event = st.snapshot_state();
             let _ = st.event_tx.send(event);
             return;
@@ -432,11 +267,6 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
         let st = state.lock().await;
         st.agents.main.clone()
     };
-    // Remove from pending before spawning to prevent re-trigger
-    {
-        let mut st = state.lock().await;
-        st.pending_plans.remove(plan_path);
-    }
 
     let Ok((child, pgid, exec_rx)) = spawn_execution(job.clone(), execution_root.clone(), &main_cmd) else {
         tracing::error!("failed to spawn execution for plan: {}", plan_path);
@@ -653,7 +483,7 @@ async fn run_exec_event_loop(
     state: Arc<Mutex<DaemonState>>,
     job_id: String,
     plan: PathBuf,
-    plan_path_owned: String,
+    _plan_path_owned: String,
     execution_root: PathBuf,
     mut exec_rx: tokio::sync::mpsc::Receiver<crate::executor::ExecEvent>,
 ) {
@@ -840,14 +670,12 @@ async fn run_exec_event_loop(
                             .max(0) as u64,
                     );
                     let _ = job.save();
-                    let success = job.status == JobStatus::Success;
                     st.running_children.remove(&job_id);
                     st.process_group_ids.remove(&job_id);
                     st.sub_agent_pgids.remove(&job_id);
                     st.job_output.remove(&job_id);
                     st.job_display_output.remove(&job_id);
                     st.history.insert(0, job.clone());
-                    let _ = notify_execution_complete(&plan_path_owned, success);
                     let _ = st.event_tx.send(DaemonEvent::JobUpdated { job });
                     break 'outer;
                 }
@@ -942,20 +770,6 @@ async fn handle_tui_request(
     match req {
         TuiRequest::Execute { plan_path } => {
             trigger_execution(state, &plan_path).await;
-        }
-        TuiRequest::CancelPending { plan_path } => {
-            // Rewrite **Status:** READY → CANCELLED in the plan file so it
-            // is not re-detected by FSEvents after removal from pending_plans.
-            if let Ok(content) = std::fs::read_to_string(&plan_path) {
-                let updated = content.replacen("**Status:** READY", "**Status:** CANCELLED", 1);
-                if updated != content {
-                    let _ = std::fs::write(&plan_path, updated);
-                }
-            }
-            let mut st = state.lock().await;
-            st.pending_plans.remove(&plan_path);
-            let event = st.snapshot_state();
-            let _ = st.event_tx.send(event);
         }
         TuiRequest::KillJob { job_id } => {
             let mut st = state.lock().await;
