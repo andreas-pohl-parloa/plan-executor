@@ -83,9 +83,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          gh release download --repo andreas-pohl-parloa/plan-executor \
-            --pattern "plan-executor-linux-x86_64.zip" --dir /tmp
-          unzip -q /tmp/plan-executor-linux-x86_64.zip -d /tmp
+          ASSET="plan-executor-linux-x86_64.zip"
+          # Find the latest release that has the Linux binary
+          TAG=$(gh api repos/andreas-pohl-parloa/plan-executor/releases \
+            --jq "[.[] | select(.assets | map(.name) | any(contains(\"linux\")))][0].tag_name")
+          echo "Downloading plan-executor $TAG"
+          gh release download "$TAG" --repo andreas-pohl-parloa/plan-executor \
+            --pattern "$ASSET" --dir /tmp
+          unzip -q "/tmp/$ASSET" -d /tmp
           chmod +x /tmp/plan-executor
           sudo mv /tmp/plan-executor /usr/local/bin/
 
