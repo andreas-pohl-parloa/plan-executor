@@ -81,7 +81,7 @@ jobs:
 
       - name: Install plan-executor and sjv binaries
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
         run: |
           for repo_asset in "plan-executor:plan-executor-linux-x86_64.zip" "stream-json-view:sjv-linux-x86_64.zip"; do
             REPO="andreas-pohl-parloa/${repo_asset%%:*}"
@@ -98,7 +98,7 @@ jobs:
 
       - name: Install my-coding Claude plugin
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
         run: |
           git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
           git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "git@github.com:"
