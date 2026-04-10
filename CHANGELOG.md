@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.10] - 2026-04-10
+
+### Bug Fixes
+
+- Download plan-executor binary directly in workflow ([4e36cbf](https://github.com/andreas-pohl-parloa/plan-executor/commit/4e36cbfa23fe7c8d6306160c6d8137e94024f851))
 ## [0.4.9] - 2026-04-10
 
 ### Bug Fixes
