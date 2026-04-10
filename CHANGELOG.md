@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.5.0] - 2026-04-10
+
+### Features
+
+- Install binaries directly and add my-coding as Claude plugin ([9bbd05f](https://github.com/andreas-pohl-parloa/plan-executor/commit/9bbd05f51e710174ca3dd8fd292f4ad065e1b8df))
 ## [0.4.12] - 2026-04-10
 
 ### Bug Fixes
