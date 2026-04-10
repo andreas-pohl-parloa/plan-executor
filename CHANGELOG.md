@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.9] - 2026-04-10
+
+### Bug Fixes
+
+- Remove environment protection (requires paid plan) ([8d55bb2](https://github.com/andreas-pohl-parloa/plan-executor/commit/8d55bb2391ad4f9ec653187e26d1db979d6a4cfd))
 ## [0.4.8] - 2026-04-10
 
 ### Bug Fixes
