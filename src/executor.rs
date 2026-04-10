@@ -151,7 +151,19 @@ pub fn spawn_execution(
 ) -> Result<(Child, u32, mpsc::Receiver<ExecEvent>)> {
     let plan_path = job.plan_path.to_string_lossy().to_string();
     let quoted_path = plan_path.replace('"', "\\\"");
-    let cmd_arg = format!("/my:execute-plan-non-interactive \"{}\"", quoted_path);
+
+    // When PLAN_EXECUTOR_LOCAL=1 (GitHub Actions runner), give Claude the plan
+    // content directly instead of invoking a skill that may not be available.
+    let cmd_arg = if std::env::var("PLAN_EXECUTOR_LOCAL").as_deref() == Ok("1") {
+        let plan_content = std::fs::read_to_string(&job.plan_path)
+            .unwrap_or_else(|_| String::new());
+        format!(
+            "Execute the following plan. Read the tasks and implement them in the current repository. \
+             Commit your changes when done.\n\n{}", plan_content
+        )
+    } else {
+        format!("/my:execute-plan-non-interactive \"{}\"", quoted_path)
+    };
 
     let (program, mut base_args) = crate::config::Config::parse_cmd(main_cmd);
     base_args.push("-p".to_string());
