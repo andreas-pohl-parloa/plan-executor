@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.5.1] - 2026-04-10
+
+### Bug Fixes
+
+- Pass TARGET_REPO_TOKEN as GH_TOKEN to execute step ([459d5d1](https://github.com/andreas-pohl-parloa/plan-executor/commit/459d5d13274a392d353c0aeb5237b6f6866e179b))
 ## [0.5.0] - 2026-04-10
 
 ### Features
