@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.11] - 2026-04-10
+
+### Bug Fixes
+
+- Use GH_PAT for plan-executor binary download ([7faf8ac](https://github.com/andreas-pohl-parloa/plan-executor/commit/7faf8acc0175b745f25cee15236e7050fc78d220))
 ## [0.4.10] - 2026-04-10
 
 ### Bug Fixes
