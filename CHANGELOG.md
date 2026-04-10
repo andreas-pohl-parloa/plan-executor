@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.6.9] - 2026-04-10
+
+### Documentation
+
+- Add note about my-coding plugin as primary install method ([b6d4952](https://github.com/andreas-pohl-parloa/plan-executor/commit/b6d49524266e56d93e403c6675e5a17eb022a077))
 ## [0.6.8] - 2026-04-10
 
 ### Documentation
