@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.6.3] - 2026-04-10
+
+### Bug Fixes
+
+- Remove local keyword from case block in install.sh ([5b5b620](https://github.com/andreas-pohl-parloa/plan-executor/commit/5b5b620f77a766ab51458f01ded2fe1f795835c7))
 ## [0.6.2] - 2026-04-10
 
 ### Bug Fixes
