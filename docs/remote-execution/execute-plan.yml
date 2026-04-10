@@ -81,7 +81,7 @@ jobs:
 
       - name: Install plan-executor binary
         env:
-          GH_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           gh release download --repo andreas-pohl-parloa/plan-executor \
             --pattern "plan-executor-linux-x86_64.zip" --dir /tmp
