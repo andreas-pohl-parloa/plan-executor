@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.6.7] - 2026-04-10
+
+### Bug Fixes
+
+- Read plan headers from plan.md in execution repo root ([f246d57](https://github.com/andreas-pohl-parloa/plan-executor/commit/f246d577491b1e31466a8af635bddc9106245aff))
 ## [0.6.6] - 2026-04-10
 
 ### Bug Fixes
