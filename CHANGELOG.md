@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.6.1] - 2026-04-10
+
+### Bug Fixes
+
+- Always install my-coding marketplace and plan-executor plugin ([86705ff](https://github.com/andreas-pohl-parloa/plan-executor/commit/86705ff3af38655532cfff3177cddf1eeb792cd8))
 ## [0.6.0] - 2026-04-10
 
 ### Features
