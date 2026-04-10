@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.6.0] - 2026-04-10
+
+### Features
+
+- Read marketplaces and plugins from plan headers ([5da1b58](https://github.com/andreas-pohl-parloa/plan-executor/commit/5da1b581bc7d7474b17fc71f6087657a6d470081))
 ## [0.5.3] - 2026-04-10
 
 ### Bug Fixes
