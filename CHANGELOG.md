@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.6.6] - 2026-04-10
+
+### Bug Fixes
+
+- Always invoke execute-plan-non-interactive skill ([df3744e](https://github.com/andreas-pohl-parloa/plan-executor/commit/df3744e655802832b157edcba0a7aba295afc8ca))
 ## [0.6.5] - 2026-04-10
 
 ### Bug Fixes
