@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.5.3] - 2026-04-10
+
+### Bug Fixes
+
+- Install binary to ~/bin or ~/.local/bin instead of ~/.cargo/bin ([85be81a](https://github.com/andreas-pohl-parloa/plan-executor/commit/85be81a4d3e69f5958451a0babcdafedfa6a5f62))
 ## [0.5.2] - 2026-04-10
 
 ### Bug Fixes
