@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.5.2] - 2026-04-10
+
+### Bug Fixes
+
+- Use TARGET_REPO_TOKEN everywhere, drop GH_PAT dependency ([f2e6c0f](https://github.com/andreas-pohl-parloa/plan-executor/commit/f2e6c0fd5799202c19134cb247ba5cda6e1af245))
 ## [0.5.1] - 2026-04-10
 
 ### Bug Fixes
