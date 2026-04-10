@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.10.0] - 2026-04-10
+
+### Features
+
+- Post execution summary from .tmp-execution-summary.md to PR ([ac4d3a7](https://github.com/andreas-pohl-parloa/plan-executor/commit/ac4d3a73133e705b328847efe4a93f0ee6909506))
 ## [0.9.0] - 2026-04-10
 
 ### Features
