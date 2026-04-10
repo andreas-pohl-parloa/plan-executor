@@ -78,6 +78,25 @@ fn print_display_line(line: &str) {
     }
 }
 
+fn terminal_width() -> usize {
+    #[cfg(unix)]
+    {
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 {
+            return ws.ws_col as usize;
+        }
+    }
+    80 // fallback
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() > max {
+        format!("{}…", &s[..max.saturating_sub(1)])
+    } else {
+        s.to_string()
+    }
+}
+
 pub fn run() {
     let cli = Cli::parse();
 
@@ -662,26 +681,25 @@ fn list_jobs() {
         return;
     }
 
-    let id_w = 8;
-    let plan_w = 34;
-    let status_w = 9;
+    let term_w = terminal_width();
+
+    // Fixed-width columns; PLAN gets all remaining space
+    let id_w = 10;
+    let status_w = 8;
     let dur_w = 10;
+    let gaps = 6; // 3 gaps × 2 spaces each
+    let plan_w = term_w.saturating_sub(id_w + status_w + dur_w + gaps).max(20);
 
     println!(
         "{:<id_w$}  {:<plan_w$}  {:<status_w$}  {:>dur_w$}",
         "ID", "PLAN", "STATUS", "DURATION",
-        id_w = id_w, plan_w = plan_w, status_w = status_w, dur_w = dur_w,
     );
-    println!("{}", "─".repeat(id_w + 2 + plan_w + 2 + status_w + 2 + dur_w));
+    println!("{}", "─".repeat(term_w));
 
     for job in &jobs {
-        let id = &job.id[..job.id.len().min(6)];
+        let id = &job.id[..job.id.len().min(8)];
         let plan = job.plan_path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-        let plan_truncated = if plan.len() > plan_w {
-            format!("{}…", &plan[..plan_w - 1])
-        } else {
-            plan.to_string()
-        };
+        let plan_display = truncate_str(plan, plan_w);
         let status = match job.status {
             JobStatus::Success       => "success",
             JobStatus::Failed        => "failed",
@@ -694,8 +712,7 @@ fn list_jobs() {
             .unwrap_or_else(|| "-".to_string());
         println!(
             "{:<id_w$}  {:<plan_w$}  {:<status_w$}  {:>dur_w$}",
-            id, plan_truncated, status, duration,
-            id_w = id_w, plan_w = plan_w, status_w = status_w, dur_w = dur_w,
+            id, plan_display, status, duration,
         );
     }
 
@@ -707,30 +724,22 @@ fn list_jobs() {
                 println!();
                 println!("Remote ({}):", remote_repo);
                 let pr_w = 6;
-                let r_plan_w = 34;
                 let r_status_w = 10;
-                let target_w = 30;
+                let r_target_w = 30;
+                let r_gaps = 8; // 4 gaps × 2 spaces
+                let r_plan_w = term_w.saturating_sub(pr_w + r_status_w + r_target_w + r_gaps).max(20);
                 println!(
-                    "{:<pr_w$}  {:<r_plan_w$}  {:<r_status_w$}  TARGET",
-                    "PR", "PLAN", "STATUS",
-                    pr_w = pr_w, r_plan_w = r_plan_w, r_status_w = r_status_w,
+                    "{:<pr_w$}  {:<r_plan_w$}  {:<r_status_w$}  {:<r_target_w$}",
+                    "PR", "PLAN", "STATUS", "TARGET",
                 );
-                println!("{}", "─".repeat(pr_w + 2 + r_plan_w + 2 + r_status_w + 2 + target_w));
+                println!("{}", "─".repeat(term_w));
                 for rj in &remote_jobs {
-                    let plan_truncated = if rj.plan_name.len() > r_plan_w {
-                        format!("{}…", &rj.plan_name[..r_plan_w - 1])
-                    } else {
-                        rj.plan_name.clone()
-                    };
-                    let target_truncated = if rj.target.len() > target_w {
-                        format!("{}…", &rj.target[..target_w - 1])
-                    } else {
-                        rj.target.clone()
-                    };
+                    let plan_display = truncate_str(&rj.plan_name, r_plan_w);
+                    let target_display = truncate_str(&rj.target, r_target_w);
                     println!(
                         "#{:<width$}  {:<r_plan_w$}  {:<r_status_w$}  {}",
-                        rj.number, plan_truncated, rj.status, target_truncated,
-                        width = pr_w - 1, r_plan_w = r_plan_w, r_status_w = r_status_w,
+                        rj.number, plan_display, rj.status, target_display,
+                        width = pr_w - 1,
                     );
                 }
             }
