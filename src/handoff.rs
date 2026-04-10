@@ -69,15 +69,24 @@ struct RawState {
     /// Spec: string phase name
     #[serde(default)]
     phase: String,
-    /// Actual skill: integer phase counter
-    #[serde(default)]
-    current_phase: u32,
+    /// Actual skill: integer or string phase counter
+    #[serde(default, deserialize_with = "deserialize_phase")]
+    current_phase: String,
     /// Spec field name
     #[serde(default)]
     handoffs: Vec<RawHandoff>,
     /// Actual skill field name
     #[serde(default)]
     expected_handoffs: Vec<RawHandoff>,
+}
+
+fn deserialize_phase<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<String, D::Error> {
+    let val: serde_json::Value = serde::Deserialize::deserialize(d)?;
+    Ok(match val {
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    })
 }
 
 /// Reads `.tmp-execute-plan-state.json` and returns parsed `HandoffState`.
@@ -91,8 +100,8 @@ pub fn load_state(state_file: &Path) -> Result<HandoffState> {
     // Accept either field name; prefer the non-empty one.
     let phase = if !raw.phase.is_empty() {
         raw.phase.clone()
-    } else if raw.current_phase > 0 {
-        format!("phase-{}", raw.current_phase)
+    } else if !raw.current_phase.is_empty() {
+        raw.current_phase.clone()
     } else {
         "unknown".to_string()
     };
