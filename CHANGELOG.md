@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.6.4] - 2026-04-10
+
+### Bug Fixes
+
+- Pass plan content directly to Claude on remote runner ([bda3e60](https://github.com/andreas-pohl-parloa/plan-executor/commit/bda3e60b8c21914c3f74dbbc39b5b4a0a21825ca))
 ## [0.6.3] - 2026-04-10
 
 ### Bug Fixes
