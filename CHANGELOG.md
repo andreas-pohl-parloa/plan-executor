@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.9.0] - 2026-04-10
+
+### Features
+
+- Include execution log in PR result comment ([da748f2](https://github.com/andreas-pohl-parloa/plan-executor/commit/da748f209da4c64a35a5bc5c2001b111888ea829))
 ## [0.8.1] - 2026-04-10
 
 ### Bug Fixes
