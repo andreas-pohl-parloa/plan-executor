@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.8.0] - 2026-04-10
+
+### Features
+
+- Remove auto-execute, file watcher, TUI, and notifications ([05677d6](https://github.com/andreas-pohl-parloa/plan-executor/commit/05677d627619e1bb19715f2073102bc5c67b4f8a))
 ## [0.7.1] - 2026-04-10
 
 ### Bug Fixes
