@@ -162,7 +162,7 @@ jobs:
           GH_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
         run: |
           cd workspace
-          plan-executor execute -f ".my/plans/$PLAN_FILENAME"
+          plan-executor execute -f ".my/plans/$PLAN_FILENAME" 2>&1 | tee /tmp/execution.log
 
       - name: Post result comment
         if: always()
@@ -182,6 +182,13 @@ jobs:
             STATUS="failed"
           fi
           REF_SHORT="${TARGET_REF:0:12}"
+
+          # Extract execution summary (last 100 lines, truncated to 64KB GitHub limit)
+          SUMMARY=""
+          if [ -f /tmp/execution.log ]; then
+            SUMMARY=$(tail -100 /tmp/execution.log | head -c 60000)
+          fi
+
           gh pr comment "$PR_NUMBER" \
             --repo "$GH_REPO" \
             --body "## Execution Complete
@@ -189,7 +196,16 @@ jobs:
           **Status:** ${STATUS}
           **Target:** ${TARGET_REPO}@${REF_SHORT}
           **Branch:** ${TARGET_BRANCH}
-          **Plan:** ${PLAN_FILENAME}"
+          **Plan:** ${PLAN_FILENAME}
+
+          <details>
+          <summary>Execution Log (last 100 lines)</summary>
+
+          \`\`\`
+          ${SUMMARY}
+          \`\`\`
+
+          </details>"
 
           gh pr close "$PR_NUMBER" \
             --repo "$GH_REPO" || true
