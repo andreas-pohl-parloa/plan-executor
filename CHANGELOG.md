@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.8.1] - 2026-04-10
+
+### Bug Fixes
+
+- Parse current_phase as string or integer for phase display ([e9971ee](https://github.com/andreas-pohl-parloa/plan-executor/commit/e9971eeb7a740158ee20b3e972857fca151f0265))
 ## [0.8.0] - 2026-04-10
 
 ### Features
