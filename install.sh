@@ -237,9 +237,8 @@ restart)
     git -C "$SCRIPT_DIR" submodule update --init --remote stream-json-view
     echo "Building and installing plan-executor..."
     cargo install --path "$SCRIPT_DIR"
-    local cargo_bin="$HOME/.cargo/bin/plan-executor"
-    if [[ "$cargo_bin" != "$BINARY" ]] && [[ -f "$cargo_bin" ]]; then
-        cp "$cargo_bin" "$BINARY"
+    if [[ "$HOME/.cargo/bin/plan-executor" != "$BINARY" ]] && [[ -f "$HOME/.cargo/bin/plan-executor" ]]; then
+        cp "$HOME/.cargo/bin/plan-executor" "$BINARY"
         chmod 755 "$BINARY"
     fi
     echo "Installed: $BINARY"
