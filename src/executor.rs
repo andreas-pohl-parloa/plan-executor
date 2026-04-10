@@ -152,21 +152,7 @@ pub fn spawn_execution(
     let plan_path = job.plan_path.to_string_lossy().to_string();
     let quoted_path = plan_path.replace('"', "\\\"");
 
-    // When PLAN_EXECUTOR_LOCAL=1 (GitHub Actions runner), give Claude the plan
-    // content directly instead of invoking a skill.
-    let cmd_arg = if std::env::var("PLAN_EXECUTOR_LOCAL").as_deref() == Ok("1") {
-        let plan_content = std::fs::read_to_string(&job.plan_path)
-            .unwrap_or_else(|_| String::new());
-        format!(
-            "You are executing a plan on a CI runner. Do NOT use any skills or slash commands. \
-             Do NOT invoke /my:execute-plan or any other skill. \
-             Read the tasks below and implement them directly. \
-             Make the code changes, then commit with a descriptive message. \
-             Do NOT create PRs or branches — just commit to the current branch.\n\n{}", plan_content
-        )
-    } else {
-        format!("/my:execute-plan-non-interactive \"{}\"", quoted_path)
-    };
+    let cmd_arg = format!("/plan-executor:execute-plan-non-interactive \"{}\"", quoted_path);
 
     let (program, mut base_args) = crate::config::Config::parse_cmd(main_cmd);
     base_args.push("-p".to_string());
