@@ -321,14 +321,35 @@ async fn trigger_remote(plan: PathBuf, config: crate::config::Config) -> Result<
     let _ = crate::remote::push_codex_auth(remote_repo);
 
     let pr_url = crate::remote::trigger_remote_execution(remote_repo, &plan, &meta)?;
+    let pr_num = crate::remote::pr_number_from_url(&pr_url);
 
     // Update plan status and store PR number
     let _ = crate::plan::set_plan_header(&plan, "status", "EXECUTING");
-    if let Some(pr_num) = crate::remote::pr_number_from_url(&pr_url) {
-        let _ = crate::plan::set_plan_header(&plan, "remote-pr", &pr_num.to_string());
+    if let Some(n) = pr_num {
+        let _ = crate::plan::set_plan_header(&plan, "remote-pr", &n.to_string());
     }
 
-    println!("Remote execution triggered.");
+    // Create a job entry and persist it
+    if let Some(n) = pr_num {
+        let job = crate::jobs::JobMetadata::new_remote(
+            plan.clone(), remote_repo.to_string(), n,
+        );
+        let short_id = job.id[..job.id.len().min(8)].to_string();
+        let _ = job.save();
+
+        // Notify daemon to start monitoring (if running)
+        if crate::ipc::socket_path().exists() {
+            let _ = notify_daemon_track_remote(
+                plan.to_string_lossy().to_string(),
+                remote_repo.to_string(),
+                n,
+            );
+        }
+
+        println!("Remote execution triggered (job {}).", short_id);
+    } else {
+        println!("Remote execution triggered.");
+    }
     println!("PR: {}", pr_url);
 
     Ok(())
@@ -691,10 +712,11 @@ fn list_jobs() {
             plan.to_string()
         };
         let status = match job.status {
-            JobStatus::Success => "success",
-            JobStatus::Failed  => "failed",
-            JobStatus::Killed  => "killed",
-            JobStatus::Running => "running",
+            JobStatus::Success       => "success",
+            JobStatus::Failed        => "failed",
+            JobStatus::Killed        => "killed",
+            JobStatus::Running       => "running",
+            JobStatus::RemoteRunning => "remote",
         };
         let duration = job.duration_ms
             .map(|ms| format!("{}s", ms / 1000))
@@ -1065,6 +1087,17 @@ fn remote_setup() {
 
     println!();
     println!("Setup complete. Remote execution ready.");
+}
+
+fn notify_daemon_track_remote(plan_path: String, remote_repo: String, pr_number: u64) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    let mut s = UnixStream::connect(crate::ipc::socket_path())?;
+    let req = serde_json::to_string(&crate::ipc::TuiRequest::TrackRemote {
+        plan_path, remote_repo, pr_number,
+    })?;
+    s.write_all(format!("{}\n", req).as_bytes())?;
+    Ok(())
 }
 
 fn gh_secret_set(repo: &str, name: &str, value: &str) -> Result<()> {

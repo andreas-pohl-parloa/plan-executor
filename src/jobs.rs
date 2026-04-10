@@ -11,6 +11,7 @@ pub enum JobStatus {
     Success,
     Failed,
     Killed,
+    RemoteRunning,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +35,12 @@ pub struct JobMetadata {
     pub duration_ms: Option<u64>,
     /// Claude session ID (from stream-json system/init), used for --resume in handoff loop
     pub session_id: Option<String>,
+    /// Remote execution repo (e.g. "owner/plan-executions")
+    #[serde(default)]
+    pub remote_repo: Option<String>,
+    /// Remote execution PR number
+    #[serde(default)]
+    pub remote_pr: Option<u64>,
 }
 
 impl JobMetadata {
@@ -51,7 +58,17 @@ impl JobMetadata {
             cache_read_tokens: None,
             duration_ms: None,
             session_id: None,
+            remote_repo: None,
+            remote_pr: None,
         }
+    }
+
+    pub fn new_remote(plan_path: PathBuf, remote_repo: String, pr_number: u64) -> Self {
+        let mut job = Self::new(plan_path);
+        job.status = JobStatus::RemoteRunning;
+        job.remote_repo = Some(remote_repo);
+        job.remote_pr = Some(pr_number);
+        job
     }
 
     /// Returns the job's directory under ~/.plan-executor/jobs/<id>/

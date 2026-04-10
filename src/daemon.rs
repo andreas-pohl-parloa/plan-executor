@@ -165,25 +165,23 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
         });
     }
 
-    // Restore remote executions from plan files (daemon restart recovery)
+    // Restore remote executions from persisted job metadata
     {
-        let dirs = config.expanded_watch_dirs();
-        let patterns = config.plan_patterns.clone();
-        if let Some(remote_repo) = config.remote_repo.as_deref() {
-            let plans = crate::plan::scan_all_plans(&dirs, &patterns);
+        let st = state.lock().await;
+        let remotes: Vec<(String, String, u64)> = st.history.iter()
+            .filter(|j| j.status == JobStatus::RemoteRunning)
+            .filter_map(|j| {
+                let repo = j.remote_repo.as_ref()?;
+                let pr = j.remote_pr?;
+                Some((j.plan_path.to_string_lossy().to_string(), repo.clone(), pr))
+            })
+            .collect();
+        drop(st);
+        if !remotes.is_empty() {
             let mut st = state.lock().await;
-            for path in plans {
-                if crate::plan::parse_plan_status(&path).ok() == Some(PlanStatus::Executing)
-                    && crate::plan::parse_execution_mode(&path) == crate::plan::ExecutionMode::Remote
-                {
-                    if let Some(pr_str) = crate::plan::get_plan_header(&path, "remote-pr") {
-                        if let Ok(pr_num) = pr_str.parse::<u64>() {
-                            let path_str = path.to_string_lossy().to_string();
-                            tracing::info!(plan = %path_str, pr = pr_num, "restoring remote execution monitor");
-                            st.remote_executions.insert(path_str, (remote_repo.to_string(), pr_num));
-                        }
-                    }
-                }
+            for (path, repo, pr) in remotes {
+                tracing::info!(plan = %path, pr = pr, "restoring remote execution monitor");
+                st.remote_executions.insert(path, (repo, pr));
             }
         }
     }
@@ -348,6 +346,19 @@ async fn poll_remote_executions(state: &Arc<Mutex<DaemonState>>) {
 
                 tracing::info!(plan = %plan_path, pr = pr_number, status = new_status, "remote execution finished");
                 let _ = crate::plan::set_plan_header(&plan, "status", new_status);
+
+                // Update the persisted job metadata
+                let all_jobs = JobMetadata::load_all();
+                if let Some(mut job) = all_jobs.into_iter().find(|j| {
+                    j.remote_pr == Some(pr_number) && j.remote_repo.as_deref() == Some(&remote_repo)
+                }) {
+                    job.status = if success { JobStatus::Success } else { JobStatus::Failed };
+                    job.finished_at = Some(chrono::Utc::now());
+                    job.duration_ms = Some(
+                        (chrono::Utc::now() - job.started_at).num_milliseconds().max(0) as u64,
+                    );
+                    let _ = job.save();
+                }
 
                 let mut st = state.lock().await;
                 st.remote_executions.remove(&plan_path);
@@ -1000,6 +1011,11 @@ async fn handle_tui_request(
         }
         TuiRequest::RetryHandoff { job_id } => {
             retry_handoff_from_state(state, job_id).await;
+        }
+        TuiRequest::TrackRemote { plan_path, remote_repo, pr_number } => {
+            let mut st = state.lock().await;
+            st.remote_executions.insert(plan_path.clone(), (remote_repo, pr_number));
+            tracing::info!(plan = %plan_path, pr = pr_number, "tracking remote execution");
         }
         TuiRequest::Subscribe => {
             // Already subscribed via broadcast channel; no-op

@@ -129,10 +129,11 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
                 let title_style = if i == sel { selected } else { normal };
                 let filename = j.plan_path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
                 let (status_label, st_style) = match j.status {
-                    JobStatus::Success => ("OK",     Style::default().fg(Color::Green)),
-                    JobStatus::Failed  => ("FAILED", Style::default().fg(Color::Red)),
-                    JobStatus::Killed  => ("KILLED", Style::default().fg(Color::Red)),
-                    JobStatus::Running => ("RUN",    Style::default().fg(Color::Cyan)),
+                    JobStatus::Success       => ("OK",     Style::default().fg(Color::Green)),
+                    JobStatus::Failed        => ("FAILED", Style::default().fg(Color::Red)),
+                    JobStatus::Killed        => ("KILLED", Style::default().fg(Color::Red)),
+                    JobStatus::Running       => ("RUN",    Style::default().fg(Color::Cyan)),
+                    JobStatus::RemoteRunning => ("REMOTE", Style::default().fg(Color::Yellow)),
                 };
                 // Line 1: filename right-aligned with duration
                 let time_str = j.duration_ms
