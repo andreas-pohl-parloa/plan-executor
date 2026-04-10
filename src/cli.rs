@@ -725,8 +725,11 @@ fn list_jobs() {
                 println!("Remote ({}):", remote_repo);
                 let pr_w = 6;
                 let r_status_w = 10;
-                let r_target_w = 30;
                 let r_gaps = 8; // 4 gaps × 2 spaces
+                // Compute TARGET width from actual data (min 6 for header)
+                let r_target_w = remote_jobs.iter()
+                    .map(|rj| rj.target.len())
+                    .max().unwrap_or(6).max(6);
                 let r_plan_w = term_w.saturating_sub(pr_w + r_status_w + r_target_w + r_gaps).max(20);
                 println!(
                     "{:<pr_w$}  {:<r_plan_w$}  {:<r_status_w$}  {:<r_target_w$}",
@@ -735,10 +738,9 @@ fn list_jobs() {
                 println!("{}", "─".repeat(term_w));
                 for rj in &remote_jobs {
                     let plan_display = truncate_str(&rj.plan_name, r_plan_w);
-                    let target_display = truncate_str(&rj.target, r_target_w);
                     println!(
                         "#{:<width$}  {:<r_plan_w$}  {:<r_status_w$}  {}",
-                        rj.number, plan_display, rj.status, target_display,
+                        rj.number, plan_display, rj.status, rj.target,
                         width = pr_w - 1,
                     );
                 }
