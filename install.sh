@@ -186,6 +186,13 @@ install)
         git -C "$SCRIPT_DIR" submodule update --init --remote stream-json-view
         echo "Building and installing plan-executor..."
         cargo install --path "$SCRIPT_DIR"
+        # Copy from cargo bin to the target install dir if they differ
+        local cargo_bin="$HOME/.cargo/bin/plan-executor"
+        if [[ "$cargo_bin" != "$BINARY" ]] && [[ -f "$cargo_bin" ]]; then
+            mkdir -p "$(dirname "$BINARY")"
+            cp "$cargo_bin" "$BINARY"
+            chmod 755 "$BINARY"
+        fi
         echo "Installed: $BINARY"
         mkdir -p "$BASE_DIR"
         echo "source" > "$BASE_DIR/install-mode"
@@ -230,8 +237,15 @@ restart)
     git -C "$SCRIPT_DIR" submodule update --init --remote stream-json-view
     echo "Building and installing plan-executor..."
     cargo install --path "$SCRIPT_DIR"
+    local cargo_bin="$HOME/.cargo/bin/plan-executor"
+    if [[ "$cargo_bin" != "$BINARY" ]] && [[ -f "$cargo_bin" ]]; then
+        cp "$cargo_bin" "$BINARY"
+        chmod 755 "$BINARY"
+    fi
     echo "Installed: $BINARY"
-    cp "$SCRIPT_DIR/assets/icon.png" "$BASE_DIR/icon.png"
+    if [[ -f "$SCRIPT_DIR/assets/icon.png" ]]; then
+        cp "$SCRIPT_DIR/assets/icon.png" "$BASE_DIR/icon.png"
+    fi
     "$BINARY" daemon
     echo "Daemon restarted."
     ;;
