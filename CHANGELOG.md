@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.12] - 2026-04-10
+
+### Bug Fixes
+
+- Find latest release with Linux asset before downloading ([616ce60](https://github.com/andreas-pohl-parloa/plan-executor/commit/616ce60dddeed00fa1c808369c881bb06ffd9843))
 ## [0.4.11] - 2026-04-10
 
 ### Bug Fixes
