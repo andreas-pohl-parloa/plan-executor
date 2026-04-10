@@ -47,19 +47,14 @@ _install_from_binary() {
         return 1
     fi
 
-    local latest_tag
-    latest_tag="$(gh release view --repo "$REPO_SLUG" --json tagName --jq '.tagName' 2>/dev/null || echo "")"
-    if [[ -z "$latest_tag" ]]; then
-        echo "  No release found."
-        return 1
-    fi
-
     local asset="plan-executor-${platform}.zip"
     local tmpdir
     tmpdir="$(mktemp -d)"
 
-    echo "  Downloading pre-built binary ($latest_tag, $platform)..."
-    if ! gh release download "$latest_tag" \
+    # Download from the most recent release that has the matching asset
+    # (skips releases where the build hasn't finished yet)
+    echo "  Downloading pre-built binary ($platform)..."
+    if ! gh release download \
             --repo "$REPO_SLUG" \
             --pattern "$asset" \
             --dir "$tmpdir" 2>/dev/null; then
@@ -93,7 +88,10 @@ _install_from_binary() {
 
     mkdir -p "$BASE_DIR"
     echo "binary" > "$BASE_DIR/install-mode"
-    echo "${latest_tag#v}" > "$BASE_DIR/installed-version"
+    # Record installed version from the latest release tag
+    local installed_tag
+    installed_tag="$(gh release view --repo "$REPO_SLUG" --json tagName --jq '.tagName' 2>/dev/null || echo "unknown")"
+    echo "${installed_tag#v}" > "$BASE_DIR/installed-version"
     return 0
 }
 
