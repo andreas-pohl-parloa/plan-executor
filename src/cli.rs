@@ -1056,16 +1056,7 @@ fn remote_setup() {
         println!("  Skipped.");
     }
 
-    // Step 6: Create GitHub Actions environment
-    println!();
-    print!("Creating 'execution' environment...");
-    let _ = stdout.flush();
-    match crate::remote::ensure_environment(&remote_repo) {
-        Ok(()) => println!(" done."),
-        Err(e) => eprintln!(" warning: {}", e),
-    }
-
-    // Step 7: Push workflow to execution repo
+    // Step 6: Push workflow to execution repo
     println!("Pushing execute-plan workflow...");
     match crate::remote::push_workflow(&remote_repo) {
         Ok(()) => println!("  Pushed to .github/workflows/execute-plan.yml"),
