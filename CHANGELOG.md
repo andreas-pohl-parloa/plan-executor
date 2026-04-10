@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.6.5] - 2026-04-10
+
+### Bug Fixes
+
+- Tell Claude to implement directly on CI, not invoke skills ([bd4109b](https://github.com/andreas-pohl-parloa/plan-executor/commit/bd4109b289e2c4ffaa245d6e210e5d9346a77d1e))
 ## [0.6.4] - 2026-04-10
 
 ### Bug Fixes
