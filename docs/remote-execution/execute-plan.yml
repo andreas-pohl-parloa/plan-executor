@@ -96,14 +96,31 @@ jobs:
           chmod +x /tmp/plan-executor /tmp/sjv
           sudo mv /tmp/plan-executor /tmp/sjv /usr/local/bin/
 
-      - name: Install my-coding Claude plugin
+      - name: Install Claude marketplaces and plugins
         env:
           GH_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
+          PLAN_FILENAME: ${{ steps.meta.outputs.plan_filename }}
         run: |
           git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
           git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "git@github.com:"
-          claude plugin marketplace add andreas-pohl-parloa/my-coding
-          claude plugin install my@my-coding
+
+          PLAN_FILE="workspace/.my/plans/$PLAN_FILENAME"
+
+          # Install marketplaces from **add-marketplaces:** header
+          MARKETPLACES=$(grep -i '^\*\*add-marketplaces:\*\*' "$PLAN_FILE" | sed 's/.*\*\*[[:space:]]*//' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          for mp in $MARKETPLACES; do
+            [ -z "$mp" ] && continue
+            echo "Adding marketplace: $mp"
+            claude plugin marketplace add "$mp" || true
+          done
+
+          # Install plugins from **add-plugins:** header
+          PLUGINS=$(grep -i '^\*\*add-plugins:\*\*' "$PLAN_FILE" | sed 's/.*\*\*[[:space:]]*//' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          for pl in $PLUGINS; do
+            [ -z "$pl" ] && continue
+            echo "Installing plugin: $pl"
+            claude plugin install "$pl" || true
+          done
 
       - name: Restore agent auth
         run: |
