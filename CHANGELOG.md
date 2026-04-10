@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.7.1] - 2026-04-10
+
+### Bug Fixes
+
+- Use stable default watch_dirs in config instead of SCRIPT_DIR ([524785d](https://github.com/andreas-pohl-parloa/plan-executor/commit/524785df79e24e431dfd51170f287a7784853ae1))
 ## [0.7.0] - 2026-04-10
 
 ### Features
