@@ -2,6 +2,8 @@
 
 A daemon that monitors, executes, and orchestrates Claude plan files. Supports local foreground execution, daemon-managed background execution, and remote execution via GitHub Actions.
 
+> **Note:** This tool is distributed as part of the `plan-executor` Claude plugin in [andreas-pohl-parloa/my-coding](https://github.com/andreas-pohl-parloa/my-coding). The recommended way to install is via that plugin, which handles binary downloads and plugin registration automatically. The standalone install below is for development or CI use.
+
 ## Install
 
 ```bash
