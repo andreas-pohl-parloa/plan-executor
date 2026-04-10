@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.7] - 2026-04-10
+
+### Bug Fixes
+
+- Correct Gemini CLI package name to @google/gemini-cli ([7dab7ef](https://github.com/andreas-pohl-parloa/plan-executor/commit/7dab7efc748b2960078f129a126f2819c9dd5115))
 ## [0.4.6] - 2026-04-09
 
 ### Bug Fixes
