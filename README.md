@@ -2,7 +2,7 @@
 
 A daemon that monitors, executes, and orchestrates Claude plan files. Supports local foreground execution, daemon-managed background execution, and remote execution via GitHub Actions.
 
-> **Note:** This tool is distributed as part of the `plan-executor` Claude plugin in [andreas-pohl-parloa/my-coding](https://github.com/andreas-pohl-parloa/my-coding). The recommended way to install is via that plugin, which handles binary downloads and plugin registration automatically. The standalone install below is for development or CI use.
+> **Note:** This tool is distributed as part of the `plan-executor` Claude plugin in [andreas-pohl-parloa/plan-executor-plugin](https://github.com/andreas-pohl-parloa/plan-executor-plugin). The recommended way to install is via that plugin, which handles binary downloads and plugin registration automatically. The standalone install below is for development or CI use.
 
 ## Install
 
@@ -87,7 +87,7 @@ Remote plans use these headers:
 | `**add-marketplaces:**` | No | Comma-separated list of Claude plugin marketplace repos to install |
 | `**add-plugins:**` | No | Comma-separated list of Claude plugins to install (`name@marketplace`) |
 
-The `andreas-pohl-parloa/my-coding` marketplace and `plan-executor@my-coding` plugin are always installed automatically.
+The `andreas-pohl-parloa/plan-executor-plugin` marketplace and `plan-executor@plan-executor` plugin are always installed automatically.
 
 ### How It Works
 
