@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.12.0] - 2026-04-11
+
+### Features
+
+- Use plan-executor-plugin marketplace instead of my-coding ([10da706](https://github.com/andreas-pohl-parloa/plan-executor/commit/10da706747e33fec33f3fe688e419a07442169ba))
 ## [0.11.1] - 2026-04-10
 
 ### Bug Fixes
