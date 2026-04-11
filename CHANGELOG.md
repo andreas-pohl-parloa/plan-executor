@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.17.1] - 2026-04-11
+
+### Documentation
+
+- Update README to reflect current CLI and architecture ([36a52cc](https://github.com/andreas-pohl-parloa/plan-executor/commit/36a52cc894f88e5f84b70d65d994efba306369eb))
 ## [0.17.0] - 2026-04-11
 
 ### Features
