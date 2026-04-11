@@ -14,6 +14,7 @@ pub enum AgentType {
     Claude,
     Codex,
     Gemini,
+    Bash,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +119,7 @@ pub fn load_state(state_file: &Path) -> Result<HandoffState> {
             let agent_type = match h.agent_type.as_str() {
                 "codex"  => AgentType::Codex,
                 "gemini" => AgentType::Gemini,
+                "bash"   => AgentType::Bash,
                 other => {
                     if !other.is_empty() && other != "claude" {
                         tracing::warn!("unknown agent-type '{}', defaulting to claude", other);
@@ -149,7 +151,13 @@ pub fn load_state(state_file: &Path) -> Result<HandoffState> {
             .flatten()
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().into_owned();
-                if !name.starts_with(".tmp-subtask-") || !name.ends_with(".md") {
+                if !name.starts_with(".tmp-subtask-") {
+                    return None;
+                }
+                if name.ends_with(".sh") {
+                    return Some(Handoff { index: 0, agent_type: AgentType::Bash, prompt_file: e.path(), can_fail: false });
+                }
+                if !name.ends_with(".md") {
                     return None;
                 }
                 let agent_type = if name.ends_with("-claude.md") { AgentType::Claude }
@@ -250,6 +258,7 @@ pub async fn dispatch_all(
     claude_cmd: &str,
     codex_cmd: &str,
     gemini_cmd: &str,
+    bash_cmd: &str,
 ) -> (Vec<HandoffResult>, Vec<u32>) {
     let handles: Vec<_> = handoffs.into_iter()
         .map(|h| {
@@ -257,6 +266,7 @@ pub async fn dispatch_all(
                 AgentType::Claude => claude_cmd.to_string(),
                 AgentType::Codex  => codex_cmd.to_string(),
                 AgentType::Gemini => gemini_cmd.to_string(),
+                AgentType::Bash   => bash_cmd.to_string(),
             };
             tokio::spawn(dispatch_agent(h, cmd))
         })

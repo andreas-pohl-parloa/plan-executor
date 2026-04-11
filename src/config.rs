@@ -20,6 +20,9 @@ pub struct AgentConfig {
     /// Sub-agent: gemini type. Appended arg: `<prompt_file_path>`.
     #[serde(default = "AgentConfig::default_gemini")]
     pub gemini: String,
+    /// Sub-agent: bash type. Runs `<cmd> <script_file_path>`.
+    #[serde(default = "AgentConfig::default_bash")]
+    pub bash: String,
 }
 
 impl AgentConfig {
@@ -35,6 +38,9 @@ impl AgentConfig {
     fn default_gemini() -> String {
         "gemini --yolo -p".to_string()
     }
+    fn default_bash() -> String {
+        "bash".to_string()
+    }
 }
 
 impl Default for AgentConfig {
@@ -44,6 +50,7 @@ impl Default for AgentConfig {
             claude: Self::default_claude(),
             codex:  Self::default_codex(),
             gemini: Self::default_gemini(),
+            bash:   Self::default_bash(),
         }
     }
 }
@@ -116,6 +123,7 @@ impl Config {
             config.agents.claude = resolve(&config.agents.claude);
             config.agents.codex  = resolve(&config.agents.codex);
             config.agents.gemini = resolve(&config.agents.gemini);
+            config.agents.bash   = resolve(&config.agents.bash);
         }
 
         Ok(config)

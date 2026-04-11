@@ -450,6 +450,7 @@ async fn execute_foreground(plan_path: String, config: crate::config::Config) ->
                         &config.agents.claude,
                         &config.agents.codex,
                         &config.agents.gemini,
+                        &config.agents.bash,
                     ).await;
 
                     for r in &results {

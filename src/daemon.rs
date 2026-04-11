@@ -388,6 +388,7 @@ pub async fn retry_handoff_from_state(
             &agents.claude,
             &agents.codex,
             &agents.gemini,
+            &agents.bash,
         ).await;
 
         {
@@ -567,6 +568,7 @@ async fn run_exec_event_loop(
                         &agents.claude,
                         &agents.codex,
                         &agents.gemini,
+                        &agents.bash,
                     ).await;
 
                     {
