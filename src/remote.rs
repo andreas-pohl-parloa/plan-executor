@@ -154,10 +154,49 @@ pub fn ensure_environment(repo: &str) -> Result<()> {
 /// The embedded workflow YAML for the execution repo.
 const EXECUTE_PLAN_WORKFLOW: &str = include_str!("../docs/remote-execution/execute-plan.yml");
 
-/// Pushes the execute-plan workflow to `.github/workflows/execute-plan.yml`
-/// on the main branch of the execution repo. Uses git clone+commit+push
-/// because the GitHub Contents API blocks writes to `.github/workflows/`
-/// when org-level workflow security policies are active.
+fn execution_repo_readme(repo: &str) -> String {
+    format!(r#"# {repo}
+
+Remote plan execution repo. Plans marked with `**execution:** remote` are
+executed here on GitHub Actions runners instead of locally.
+
+## How it works
+
+1. `plan-executor execute <plan>` detects the `**execution:** remote` header.
+2. It pushes the plan content and metadata to an `exec/` branch in this repo and opens a PR.
+3. The GitHub Actions workflow (`.github/workflows/execute-plan.yml`) triggers on the PR:
+   - Clones the **target repo** at the specified commit.
+   - Downloads pre-built `plan-executor` and `sjv` binaries.
+   - Installs Claude Code, Codex, and Gemini CLIs.
+   - Installs Claude plugin marketplaces and plugins declared in the plan headers.
+   - Runs the plan via Claude.
+   - Posts an execution summary as a PR comment.
+   - Closes the PR with a `succeeded` or `failed` label.
+4. The local daemon monitors the PR and updates the plan status to `COMPLETED` or `FAILED`.
+
+## Secrets
+
+Configured via `plan-executor remote-setup`:
+
+| Secret | Purpose |
+|--------|---------|
+| `TARGET_REPO_TOKEN` | GitHub PAT (classic, `repo` scope) for cloning target repos and accessing releases |
+| `ANTHROPIC_API_KEY` | Claude API key |
+| `OPENAI_API_KEY` | Codex API key (optional) |
+| `CODEX_AUTH` | Codex OAuth token JSON (optional, alternative to API key) |
+| `GEMINI_API_KEY` | Gemini API key (optional) |
+
+## References
+
+- [plan-executor](https://github.com/andreas-pohl-parloa/plan-executor) — the CLI daemon and execution engine
+- [plan-executor-plugin](https://github.com/andreas-pohl-parloa/plan-executor-plugin) — Claude Code plugin with orchestration skills
+"#, repo = repo)
+}
+
+/// Pushes the execute-plan workflow and README to the execution repo.
+/// Uses git clone+commit+push because the GitHub Contents API blocks
+/// writes to `.github/workflows/` when org-level workflow security
+/// policies are active.
 pub fn push_workflow(remote_repo: &str) -> Result<()> {
     let tmp = std::env::temp_dir().join("plan-executor-setup");
     let _ = std::fs::remove_dir_all(&tmp);
@@ -170,10 +209,13 @@ pub fn push_workflow(remote_repo: &str) -> Result<()> {
     std::fs::create_dir_all(&wf_dir)?;
     std::fs::write(wf_dir.join("execute-plan.yml"), EXECUTE_PLAN_WORKFLOW)?;
 
-    // Commit and push
-    run_git(&tmp, &["add", ".github/workflows/execute-plan.yml"])?;
+    // Write README
+    std::fs::write(tmp.join("README.md"), execution_repo_readme(remote_repo))?;
 
-    // Check if there's anything to commit (file might already be up to date)
+    // Commit and push
+    run_git(&tmp, &["add", ".github/workflows/execute-plan.yml", "README.md"])?;
+
+    // Check if there's anything to commit (files might already be up to date)
     let status = run_git(&tmp, &["status", "--porcelain"])?;
     if status.trim().is_empty() {
         let _ = std::fs::remove_dir_all(&tmp);
@@ -183,7 +225,7 @@ pub fn push_workflow(remote_repo: &str) -> Result<()> {
     run_git(&tmp, &[
         "-c", "user.name=plan-executor",
         "-c", "user.email=plan-executor@noreply",
-        "commit", "-m", "chore: update execute-plan workflow",
+        "commit", "-m", "chore: update workflow and README",
     ])?;
     run_git(&tmp, &["push"])?;
 
