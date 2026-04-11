@@ -488,6 +488,7 @@ async fn run_exec_event_loop(
     mut exec_rx: tokio::sync::mpsc::Receiver<crate::executor::ExecEvent>,
 ) {
     let mut last_display_blank = false;
+    let mut completion_retried = false;
     'outer: loop {
         while let Some(event) = exec_rx.recv().await {
             match event {
@@ -645,6 +646,72 @@ async fn run_exec_event_loop(
                     }
                 }
                 ExecEvent::Finished(finished_job) => {
+                    // If the agent returned success but the plan is still
+                    // EXECUTING, the skill bailed out mid-execution (e.g.
+                    // after a handoff resume it completed the triage but
+                    // didn't continue to the remaining phases). Resume the
+                    // session once with an explicit instruction to finish.
+                    let plan_still_executing = finished_job.status == JobStatus::Success
+                        && crate::plan::parse_plan_status(&plan)
+                            .map(|s| matches!(s, crate::plan::PlanStatus::Executing))
+                            .unwrap_or(false);
+
+                    if plan_still_executing && !completion_retried {
+                        completion_retried = true;
+                        let session_id = {
+                            let st = state.lock().await;
+                            st.running_jobs.get(&job_id)
+                                .and_then(|j| j.session_id.clone())
+                                .or_else(|| finished_job.session_id.clone())
+                        };
+
+                        if let Some(sid) = session_id {
+                            let line = "⏺ [plan-executor] plan still EXECUTING after agent returned success — resuming to complete remaining phases";
+                            append_display(&job_id, line);
+                            {
+                                let mut st = state.lock().await;
+                                st.job_display_output.entry(job_id.clone()).or_default().push_back(line.to_string());
+                                let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: job_id.clone(), line: line.to_string() });
+                                let _ = st.event_tx.send(DaemonEvent::JobOutput { job_id: job_id.clone(), line: line.to_string() });
+                            }
+
+                            let agents = { state.lock().await.agents.clone() };
+                            let continuation = "The plan execution is incomplete — the plan status is still EXECUTING. \
+                                You returned from a handoff resume but did not complete the remaining execution phases. \
+                                Continue from where you left off. Complete all remaining phases (plan validation, \
+                                cleanup/PR, execution summary) until the plan status is set to COMPLETED.";
+
+                            match handoff::resume_execution(
+                                &sid,
+                                continuation,
+                                execution_root.clone(),
+                                Some(job_id.clone()),
+                                Some(plan.clone()),
+                                &agents.main,
+                            ).await {
+                                Ok((new_child, new_pgid, new_rx)) => {
+                                    let mut st = state.lock().await;
+                                    st.running_children.insert(job_id.clone(), new_child);
+                                    st.process_group_ids.insert(job_id.clone(), new_pgid);
+                                    exec_rx = new_rx;
+                                    continue 'outer;
+                                }
+                                Err(e) => {
+                                    let line = format!("⏺ [plan-executor] completion retry failed to resume: {}", e);
+                                    append_display(&job_id, &line);
+                                    let mut st = state.lock().await;
+                                    st.job_display_output.entry(job_id.clone()).or_default().push_back(line.clone());
+                                    let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: job_id.clone(), line: line.clone() });
+                                    // Fall through to finish as failed
+                                }
+                            }
+                        }
+                    }
+
+                    // After the retry (or if no retry was needed), finalize the job.
+                    // If plan is still EXECUTING after a retry, force fail.
+                    let force_fail = plan_still_executing;
+
                     let mut st = state.lock().await;
                     // Merge result fields from the resume placeholder into
                     // the original running job (which has the correct
@@ -654,7 +721,7 @@ async fn run_exec_event_loop(
                     } else {
                         finished_job.clone()
                     };
-                    job.status = finished_job.status;
+                    job.status = if force_fail { JobStatus::Failed } else { finished_job.status };
                     job.model = job.model.or(finished_job.model);
                     job.session_id = job.session_id.or(finished_job.session_id);
                     job.input_tokens = finished_job.input_tokens.or(job.input_tokens);
@@ -669,6 +736,12 @@ async fn run_exec_event_loop(
                             .num_milliseconds()
                             .max(0) as u64,
                     );
+                    if force_fail {
+                        let line = "⏺ [plan-executor] plan still EXECUTING after completion retry — marking job FAILED";
+                        append_display(&job_id, line);
+                        st.job_display_output.entry(job_id.clone()).or_default().push_back(line.to_string());
+                        let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: job_id.clone(), line: line.to_string() });
+                    }
                     let _ = job.save();
                     st.running_children.remove(&job_id);
                     st.process_group_ids.remove(&job_id);
