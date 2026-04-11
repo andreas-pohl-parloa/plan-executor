@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.17.0] - 2026-04-11
+
+### Features
+
+- Restore desktop notifications for job start/finish ([a2041a9](https://github.com/andreas-pohl-parloa/plan-executor/commit/a2041a9bb28f4f87a32c70b78da853f932e85ff7))
 ## [0.16.0] - 2026-04-11
 
 ### Features
