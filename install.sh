@@ -205,15 +205,7 @@ install)
 
     echo "Starting daemon..."
     "$BINARY" daemon
-
-    echo ""
-    echo "Done. Daemon is running. It will auto-start in new shell sessions."
-    echo ""
-    echo "  Logs:      tail -f $LOG_FILE"
-    echo "  Stop:      $0 stop"
-    echo "  Start:     $0 start"
-    echo "  Restart:   $0 restart"
-    echo "  Uninstall: $0 uninstall"
+    echo "Done"
     ;;
 
 # ── stop ──────────────────────────────────────────────────────────────────
