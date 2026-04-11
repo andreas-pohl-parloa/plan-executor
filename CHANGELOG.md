@@ -1,10 +1,19 @@
 # Changelog
 
+## [0.13.0] - 2026-04-11
+
+### Features
+
+- Generate execution repo README during remote-setup ([ab4e9b9](https://github.com/andreas-pohl-parloa/plan-executor/commit/ab4e9b94ab5eea1467ea3037cc432cb688f20896))
 ## [0.12.0] - 2026-04-11
 
 ### Features
 
 - Use plan-executor-plugin marketplace instead of my-coding ([10da706](https://github.com/andreas-pohl-parloa/plan-executor/commit/10da706747e33fec33f3fe688e419a07442169ba))
+
+### Miscellaneous
+
+- Cleanup install output ([176dab4](https://github.com/andreas-pohl-parloa/plan-executor/commit/176dab43c970e3ca779d9c86a52fa01089e578b9))
 ## [0.11.1] - 2026-04-10
 
 ### Bug Fixes
