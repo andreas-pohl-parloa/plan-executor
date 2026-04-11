@@ -424,35 +424,13 @@ pub async fn resume_execution(
             }
         }
 
-        // Check for another handoff pause (check repo root AND worktree paths).
-        if let Some(state_file) = crate::executor::find_state_file(&execution_root) {
-            let _ = tx.send(ExecEvent::HandoffRequired {
-                session_id: resumed_session_id,
-                state_file,
-            }).await;
-            return;
-        } else if !handoff_calls.is_empty() {
-            // Relaxed fallback: state file may exist but lack the handoffs
-            // array (protocol drift after many resumes). Inject the parsed
-            // handoff lines into the state file so load_state finds the
-            // correct batch instead of auto-detecting all prompt files.
-            if let Some(relaxed_file) = crate::executor::find_state_file_any(&execution_root) {
-                tracing::warn!(
-                    "resume: state file at {:?} missing handoffs — injecting {} from output lines",
-                    relaxed_file, handoff_calls.len()
-                );
-                crate::executor::inject_handoffs_into_state_file(&relaxed_file, &handoff_calls);
-                let warn = format!(
-                    "⏺ [plan-executor] state file missing handoffs array — injected {} handoff(s) from output ({})",
-                    handoff_calls.len(), relaxed_file.display()
-                );
-                if let Some(ref mut f) = disp_file {
-                    let _ = f.write_all(format!("{}\n", warn).as_bytes()).await;
-                }
-                let _ = tx.send(ExecEvent::DisplayLine(warn)).await;
+        // Primary transport: output lines. Same logic as spawn_execution.
+        if !handoff_calls.is_empty() {
+            if let Some(state_file) = crate::executor::find_state_file(&execution_root) {
+                crate::executor::inject_handoffs_into_state_file(&state_file, &handoff_calls);
                 let _ = tx.send(ExecEvent::HandoffRequired {
                     session_id: resumed_session_id,
-                    state_file: relaxed_file,
+                    state_file,
                 }).await;
                 return;
             }

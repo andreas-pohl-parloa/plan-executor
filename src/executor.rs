@@ -127,37 +127,18 @@ const STATE_FILE_NAMES: &[&str] = &[
     ".tmp-review-state.json",
 ];
 
-/// Returns true if the state file contains pending handoffs that the daemon
-/// should dispatch. A file with an empty or absent handoffs array is not a
-/// pending handoff — the orchestrator is just using it for state tracking.
-fn has_pending_handoffs(path: &std::path::Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(path) else { return false };
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) else { return false };
-    // Check both field names used by different skill versions.
-    for key in &["handoffs", "expected_handoffs"] {
-        if let Some(arr) = val.get(key).and_then(|v| v.as_array()) {
-            if !arr.is_empty() {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Finds a handoff state file by searching:
+/// Searches for a state file by existence across all known locations:
 /// 1. The execution root directly
 /// 2. `.my/worktrees/*/` subdirectories
 /// 3. Git worktrees (via `git worktree list`)
-/// 4. Sibling directories of the execution root (agent may create worktrees as siblings)
-///
-/// Only returns files that contain pending handoffs.
+/// 4. Sibling directories of the execution root
 pub fn find_state_file(execution_root: &Path) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
     // 1. Direct placement (non-worktree execution)
     for name in STATE_FILE_NAMES {
         let candidate = execution_root.join(name);
-        if candidate.exists() && has_pending_handoffs(&candidate) {
+        if candidate.exists() {
             return Some(candidate); // fast path
         }
     }
@@ -169,7 +150,7 @@ pub fn find_state_file(execution_root: &Path) -> Option<PathBuf> {
             if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
             for name in STATE_FILE_NAMES {
                 let candidate = entry.path().join(name);
-                if candidate.exists() && has_pending_handoffs(&candidate) {
+                if candidate.exists() {
                     candidates.push(candidate);
                     break;
                 }
@@ -192,7 +173,7 @@ pub fn find_state_file(execution_root: &Path) -> Option<PathBuf> {
                         if wt == execution_root { continue; }
                         for name in STATE_FILE_NAMES {
                             let candidate = wt.join(name);
-                            if candidate.exists() && has_pending_handoffs(&candidate) {
+                            if candidate.exists() {
                                 candidates.push(candidate);
                                 break;
                             }
@@ -213,7 +194,7 @@ pub fn find_state_file(execution_root: &Path) -> Option<PathBuf> {
                     if path == execution_root { continue; }
                     for name in STATE_FILE_NAMES {
                         let candidate = path.join(name);
-                        if candidate.exists() && has_pending_handoffs(&candidate) {
+                        if candidate.exists() {
                             candidates.push(candidate);
                             break;
                         }
@@ -236,74 +217,6 @@ pub fn find_state_file(execution_root: &Path) -> Option<PathBuf> {
             None
         }
     }
-}
-
-/// Like `find_state_file` but only checks existence — no `has_pending_handoffs`
-/// filter. Used as a fallback when the agent output `call sub-agent` lines but
-/// wrote a state file without a proper `handoffs` array (protocol drift after
-/// many resumes). The caller should try `handoff::load_state` which has
-/// auto-detection from co-located `.tmp-subtask-*.md` files.
-pub fn find_state_file_any(execution_root: &Path) -> Option<PathBuf> {
-    // Same search order as find_state_file but existence-only.
-    for name in STATE_FILE_NAMES {
-        let candidate = execution_root.join(name);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-
-    let worktrees = execution_root.join(".my").join("worktrees");
-    if let Ok(entries) = std::fs::read_dir(&worktrees) {
-        for entry in entries.flatten() {
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
-            for name in STATE_FILE_NAMES {
-                let candidate = entry.path().join(name);
-                if candidate.exists() {
-                    return Some(candidate);
-                }
-            }
-        }
-    }
-
-    if let Ok(output) = std::process::Command::new("git")
-        .arg("-C").arg(execution_root)
-        .args(["worktree", "list", "--porcelain"])
-        .output()
-    {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if let Some(wt_path) = line.strip_prefix("worktree ") {
-                    let wt = PathBuf::from(wt_path);
-                    if wt == execution_root { continue; }
-                    for name in STATE_FILE_NAMES {
-                        let candidate = wt.join(name);
-                        if candidate.exists() {
-                            return Some(candidate);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(parent) = execution_root.parent() {
-        if let Ok(entries) = std::fs::read_dir(parent) {
-            for entry in entries.flatten() {
-                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
-                let path = entry.path();
-                if path == execution_root { continue; }
-                for name in STATE_FILE_NAMES {
-                    let candidate = path.join(name);
-                    if candidate.exists() {
-                        return Some(candidate);
-                    }
-                }
-            }
-        }
-    }
-
-    None
 }
 
 /// Clears the handoffs array in the state file so it won't re-trigger dispatch,
@@ -429,52 +342,31 @@ pub fn spawn_execution(
             let _ = tx.send(ExecEvent::OutputLine(line)).await;
         }
 
-        // stdout closed — check for handoff pause before declaring finished.
-        // The state file may be in the repo root (no-worktree case) OR inside
-        // a worktree the agent created at .my/worktrees/<slug>/.
-        let state_file = find_state_file(&execution_root);
-        tracing::debug!("executor: stdout EOF — state_file={:?} session_id={:?}",
-            state_file, job.session_id);
-        if let Some(state_file) = state_file {
-            if let Some(sid) = job.session_id.clone() {
-                // Note: intentionally not saving here — the daemon handles state persistence
-                // during the handoff loop. Saving Running state here would leave a stale record
-                // on crash before the handoff completes.
-                let _ = tx.send(ExecEvent::HandoffRequired {
-                    session_id: sid,
-                    state_file,
-                }).await;
-                return; // caller loop will resume; do NOT emit Finished here
-            }
-        } else if !handoff_calls.is_empty() {
-            // Agent output "call sub-agent" lines but find_state_file (which
-            // requires a non-empty handoffs array) returned None. Try a relaxed
-            // search — the file may exist but lack the handoffs field (protocol
-            // drift after many resumes). Inject the parsed handoff lines into
-            // the state file so load_state finds the correct batch.
-            if let Some(relaxed_file) = find_state_file_any(&execution_root) {
-                tracing::warn!(
-                    "executor: state file at {:?} missing handoffs — injecting {} from output lines",
-                    relaxed_file, handoff_calls.len()
-                );
-                inject_handoffs_into_state_file(&relaxed_file, &handoff_calls);
-                let warn = format!(
-                    "⏺ [plan-executor] state file missing handoffs array — injected {} handoff(s) from output ({})",
-                    handoff_calls.len(), relaxed_file.display()
-                );
-                if let Some(ref mut f) = display_file {
-                    let _ = f.write_all(format!("{}\n", warn).as_bytes()).await;
-                }
-                let _ = tx.send(ExecEvent::DisplayLine(warn)).await;
+        // stdout closed — determine if the agent paused for handoffs.
+        //
+        // Primary transport: `call sub-agent` output lines captured above.
+        // The state file is the skill's persistence store — the executor
+        // only needs it for consume_handoffs (skill resume signal) and
+        // crash recovery (retry_handoff_from_state).
+        tracing::debug!("executor: stdout EOF — handoff_calls={} session_id={:?}",
+            handoff_calls.len(), job.session_id);
+
+        if !handoff_calls.is_empty() {
+            // Agent requested sub-agent dispatch via output lines.
+            if let Some(state_file) = find_state_file(&execution_root) {
+                // Inject handoffs from output lines into the state file so
+                // load_state always finds the correct batch regardless of
+                // whether the skill wrote the handoffs array properly.
+                inject_handoffs_into_state_file(&state_file, &handoff_calls);
                 if let Some(sid) = job.session_id.clone() {
                     let _ = tx.send(ExecEvent::HandoffRequired {
                         session_id: sid,
-                        state_file: relaxed_file,
+                        state_file,
                     }).await;
                     return;
                 }
             }
-            // State file truly doesn't exist — protocol violation.
+            // State file doesn't exist — protocol violation.
             let err = "⏺ [plan-executor] handoff protocol error: agent requested sub-agent calls but did not write the state file (.tmp-execute-plan-state.json)";
             if let Some(ref mut f) = display_file {
                 let _ = f.write_all(format!("{}\n", err).as_bytes()).await;
