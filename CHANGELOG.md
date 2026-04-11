@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.18.0] - 2026-04-11
+
+### Features
+
+- Embed notification icon in binary, use JXA for macOS notifications ([9dab646](https://github.com/andreas-pohl-parloa/plan-executor/commit/9dab646c96e10420136a65dc250b45a6a7e119d3))
 ## [0.17.2] - 2026-04-11
 
 ### Bug Fixes
