@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.15.3] - 2026-04-11
+
+### Refactoring
+
+- Make output lines the primary handoff transport ([dfc112e](https://github.com/andreas-pohl-parloa/plan-executor/commit/dfc112e66146bd9c19cea13db47af2791f37315d))
 ## [0.15.2] - 2026-04-11
 
 ### Bug Fixes
