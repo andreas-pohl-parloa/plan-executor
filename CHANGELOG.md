@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.14.0] - 2026-04-11
+
+### Features
+
+- Prompt for remote-setup during install if not configured ([7c45c8c](https://github.com/andreas-pohl-parloa/plan-executor/commit/7c45c8cac5ddb51adc7851f3d246f8682153dc82))
 ## [0.13.0] - 2026-04-11
 
 ### Features
