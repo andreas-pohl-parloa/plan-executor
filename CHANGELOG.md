@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.17.2] - 2026-04-11
+
+### Bug Fixes
+
+- Use osascript/notify-send instead of notify-rust for notifications ([b24d117](https://github.com/andreas-pohl-parloa/plan-executor/commit/b24d117ba64e718d609adc16efb83441d14b99c2))
 ## [0.17.1] - 2026-04-11
 
 ### Documentation
