@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.15.0] - 2026-04-11
+
+### Features
+
+- Retry execution when plan is still EXECUTING after agent returns success ([24ac40f](https://github.com/andreas-pohl-parloa/plan-executor/commit/24ac40fb8ded7d30902aa8f91cec05bc6bfaf972))
 ## [0.14.1] - 2026-04-11
 
 ### Bug Fixes
