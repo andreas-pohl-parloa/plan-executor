@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.14.1] - 2026-04-11
+
+### Bug Fixes
+
+- Search git worktrees and sibling dirs for handoff state file ([dc02831](https://github.com/andreas-pohl-parloa/plan-executor/commit/dc028318ea3af8280f7cf8c0d99847e8ceea56bd))
 ## [0.14.0] - 2026-04-11
 
 ### Features
