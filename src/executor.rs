@@ -58,6 +58,69 @@ pub fn is_visually_blank(s: &str) -> bool {
     true
 }
 
+/// Parses a `call sub-agent N (agent-type: <type>[, can-fail: true]): <path>` line
+/// into an (index, agentType, promptFile, canFail) tuple. Returns None if the
+/// line doesn't match the handoff format. Strips ANSI escapes before matching.
+pub fn parse_handoff_line(raw: &str) -> Option<(usize, String, String, bool)> {
+    // Strip ANSI escape sequences first.
+    let mut s = String::with_capacity(raw.len());
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j] != b'm' { j += 1; }
+            i = j + 1;
+        } else {
+            s.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+
+    let s = s.trim();
+    let rest = s.strip_prefix("call sub-agent ")?;
+    // Parse index: "N (agent-type: ...): path"
+    let (idx_str, rest) = rest.split_once(' ')?;
+    let index: usize = idx_str.parse().ok()?;
+    // Parse metadata block: "(agent-type: claude[, can-fail: true]): path"
+    let rest = rest.strip_prefix('(')?;
+    let (meta, path) = rest.split_once("): ")?;
+    let mut agent_type = "claude".to_string();
+    let mut can_fail = false;
+    for part in meta.split(',') {
+        let part = part.trim();
+        if let Some(at) = part.strip_prefix("agent-type:") {
+            agent_type = at.trim().to_string();
+        } else if part == "can-fail: true" {
+            can_fail = true;
+        }
+    }
+    Some((index, agent_type, path.trim().to_string(), can_fail))
+}
+
+/// Injects a `handoffs` array into a state file JSON from parsed `call sub-agent`
+/// lines, then rewrites the file. This patches protocol-drifted state files that
+/// exist but lack the handoffs array.
+pub fn inject_handoffs_into_state_file(
+    state_file: &std::path::Path,
+    handoff_lines: &[(usize, String, String, bool)],
+) {
+    let Ok(content) = std::fs::read_to_string(state_file) else { return };
+    let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&content) else { return };
+    let arr: Vec<serde_json::Value> = handoff_lines.iter().map(|(idx, at, pf, cf)| {
+        serde_json::json!({
+            "index": idx,
+            "agentType": at,
+            "promptFile": pf,
+            "canFail": cf,
+        })
+    }).collect();
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("handoffs".to_string(), serde_json::Value::Array(arr));
+    }
+    let _ = std::fs::write(state_file, serde_json::to_string_pretty(&val).unwrap_or_default());
+}
+
 /// Known state file names, checked in priority order.
 const STATE_FILE_NAMES: &[&str] = &[
     ".tmp-execute-plan-state.json",
@@ -304,8 +367,9 @@ pub fn spawn_execution(
             .create(true).append(true).open(&display_path).await.ok();
         // Collapse consecutive blank display lines at the source.
         let mut last_display_blank = false;
-        // Detect when the agent output handoff instructions but forgot the state file.
-        let mut saw_handoff_call = false;
+        // Capture parsed handoff lines so we can inject them into the state file
+        // if the agent wrote it without a proper handoffs array.
+        let mut handoff_calls: Vec<(usize, String, String, bool)> = Vec::new();
 
         while let Ok(Some(line)) = reader.next_line().await {
             // Write to output file
@@ -353,7 +417,9 @@ pub fn spawn_execution(
                 }
                 last_display_blank = is_blank;
                 if display_line.contains("call sub-agent") {
-                    saw_handoff_call = true;
+                    if let Some(parsed) = parse_handoff_line(display_line) {
+                        handoff_calls.push(parsed);
+                    }
                 }
                 if let Some(ref mut f) = display_file {
                     let _ = f.write_all(format!("{}\n", display_line).as_bytes()).await;
@@ -380,17 +446,21 @@ pub fn spawn_execution(
                 }).await;
                 return; // caller loop will resume; do NOT emit Finished here
             }
-        } else if saw_handoff_call {
+        } else if !handoff_calls.is_empty() {
             // Agent output "call sub-agent" lines but find_state_file (which
             // requires a non-empty handoffs array) returned None. Try a relaxed
             // search — the file may exist but lack the handoffs field (protocol
-            // drift after many resumes). load_state has auto-detection from
-            // co-located .tmp-subtask-*.md files.
+            // drift after many resumes). Inject the parsed handoff lines into
+            // the state file so load_state finds the correct batch.
             if let Some(relaxed_file) = find_state_file_any(&execution_root) {
-                tracing::warn!("executor: state file exists at {:?} but has no pending handoffs — using auto-detection fallback", relaxed_file);
+                tracing::warn!(
+                    "executor: state file at {:?} missing handoffs — injecting {} from output lines",
+                    relaxed_file, handoff_calls.len()
+                );
+                inject_handoffs_into_state_file(&relaxed_file, &handoff_calls);
                 let warn = format!(
-                    "⏺ [plan-executor] state file missing handoffs array — falling back to prompt-file auto-detection ({})",
-                    relaxed_file.display()
+                    "⏺ [plan-executor] state file missing handoffs array — injected {} handoff(s) from output ({})",
+                    handoff_calls.len(), relaxed_file.display()
                 );
                 if let Some(ref mut f) = display_file {
                     let _ = f.write_all(format!("{}\n", warn).as_bytes()).await;

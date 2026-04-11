@@ -370,7 +370,7 @@ pub async fn resume_execution(
         };
 
         let mut last_display_blank = false;
-        let mut saw_handoff_call = false;
+        let mut handoff_calls: Vec<(usize, String, String, bool)> = Vec::new();
         while let Ok(Some(line)) = reader.next_line().await {
             // Append raw line to output file (same as initial turn).
             if let Some(ref mut f) = out_file {
@@ -385,7 +385,9 @@ pub async fn resume_execution(
                 }
                 last_display_blank = is_blank;
                 if display_line.contains("call sub-agent") {
-                    saw_handoff_call = true;
+                    if let Some(parsed) = crate::executor::parse_handoff_line(display_line) {
+                        handoff_calls.push(parsed);
+                    }
                 }
                 if let Some(ref mut f) = disp_file {
                     let _ = f.write_all(format!("{}\n", display_line).as_bytes()).await;
@@ -429,15 +431,20 @@ pub async fn resume_execution(
                 state_file,
             }).await;
             return;
-        } else if saw_handoff_call {
+        } else if !handoff_calls.is_empty() {
             // Relaxed fallback: state file may exist but lack the handoffs
-            // array (protocol drift after many resumes). load_state has
-            // auto-detection from co-located .tmp-subtask-*.md files.
+            // array (protocol drift after many resumes). Inject the parsed
+            // handoff lines into the state file so load_state finds the
+            // correct batch instead of auto-detecting all prompt files.
             if let Some(relaxed_file) = crate::executor::find_state_file_any(&execution_root) {
-                tracing::warn!("resume: state file exists at {:?} but has no pending handoffs — using auto-detection fallback", relaxed_file);
+                tracing::warn!(
+                    "resume: state file at {:?} missing handoffs — injecting {} from output lines",
+                    relaxed_file, handoff_calls.len()
+                );
+                crate::executor::inject_handoffs_into_state_file(&relaxed_file, &handoff_calls);
                 let warn = format!(
-                    "⏺ [plan-executor] state file missing handoffs array — falling back to prompt-file auto-detection ({})",
-                    relaxed_file.display()
+                    "⏺ [plan-executor] state file missing handoffs array — injected {} handoff(s) from output ({})",
+                    handoff_calls.len(), relaxed_file.display()
                 );
                 if let Some(ref mut f) = disp_file {
                     let _ = f.write_all(format!("{}\n", warn).as_bytes()).await;
