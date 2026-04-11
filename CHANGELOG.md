@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.15.1] - 2026-04-11
+
+### Bug Fixes
+
+- Fall back to prompt-file auto-detection when state file lacks handoffs array ([0e6cbc1](https://github.com/andreas-pohl-parloa/plan-executor/commit/0e6cbc1d98830f7ea6be782eddb64f7ef1ce0bb8))
 ## [0.15.0] - 2026-04-11
 
 ### Features
