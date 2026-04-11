@@ -205,7 +205,20 @@ install)
 
     echo "Starting daemon..."
     "$BINARY" daemon
-    echo "Done"
+
+    # Offer remote setup if not configured
+    local config="$BASE_DIR/config.json"
+    if [[ -f "$config" ]] && grep -q '"remote_repo"' "$config"; then
+        echo "Done."
+    else
+        echo ""
+        read -p "Remote execution not configured. Run remote-setup now? [y/N] " -r answer
+        if [[ "$answer" =~ ^[Yy]$ ]]; then
+            "$BINARY" remote-setup
+        else
+            echo "Done. Run 'plan-executor remote-setup' later to configure remote execution."
+        fi
+    fi
     ;;
 
 # ── stop ──────────────────────────────────────────────────────────────────
