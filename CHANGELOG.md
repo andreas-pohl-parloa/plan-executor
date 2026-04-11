@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.16.0] - 2026-04-11
+
+### Features
+
+- Add bash agent type for shell script handoffs ([8b998f8](https://github.com/andreas-pohl-parloa/plan-executor/commit/8b998f83e40941d30c34211421aa54055f14cd24))
 ## [0.15.4] - 2026-04-11
 
 ### Bug Fixes
