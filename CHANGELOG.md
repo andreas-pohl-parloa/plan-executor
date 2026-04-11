@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.15.4] - 2026-04-11
+
+### Bug Fixes
+
+- Reset handoff_calls when new batch starts (index 1 reappears) ([9ca0441](https://github.com/andreas-pohl-parloa/plan-executor/commit/9ca0441f660e274d90befcbdc8580b3f1c430b82))
 ## [0.15.3] - 2026-04-11
 
 ### Refactoring
