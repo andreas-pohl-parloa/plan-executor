@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.19.0] - 2026-04-11
+
+### Features
+
+- Stream bash sub-agent output live instead of capturing silently ([14918f9](https://github.com/andreas-pohl-parloa/plan-executor/commit/14918f9a386a772a7848f6b42fd500baf9225478))
 ## [0.18.0] - 2026-04-11
 
 ### Features
