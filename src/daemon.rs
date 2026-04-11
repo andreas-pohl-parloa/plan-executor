@@ -38,16 +38,36 @@ pub struct DaemonState {
     pub event_tx: broadcast::Sender<DaemonEvent>,
 }
 
-/// Sends a desktop notification. Runs in a background thread to avoid blocking.
+/// Sends a desktop notification using OS-native tools.
+/// macOS: osascript (always available). Linux: notify-send (best-effort).
 fn notify(title: &str, body: &str) {
-    let icon_path = Config::base_dir().join("icon.png");
-    let mut n = notify_rust::Notification::new();
-    n.summary(title).body(body);
-    if icon_path.exists() {
+    let title = title.to_string();
+    let body = body.to_string();
+    std::thread::spawn(move || {
         #[cfg(target_os = "macos")]
-        n.appname("plan-executor");
-    }
-    let _ = n.show();
+        {
+            // osascript display notification — works from daemons, no deps.
+            let escaped_body = body.replace('\\', "\\\\").replace('"', "\\\"");
+            let escaped_title = title.replace('\\', "\\\\").replace('"', "\\\"");
+            let script = format!(
+                "display notification \"{}\" with title \"{}\"",
+                escaped_body, escaped_title
+            );
+            let _ = std::process::Command::new("osascript")
+                .args(["-e", &script])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = std::process::Command::new("notify-send")
+                .args([&title, &body])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    });
 }
 
 /// Sends a notification for a plan filename with the given title.
