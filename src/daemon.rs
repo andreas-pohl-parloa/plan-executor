@@ -38,6 +38,29 @@ pub struct DaemonState {
     pub event_tx: broadcast::Sender<DaemonEvent>,
 }
 
+/// Sends a desktop notification. Runs in a background thread to avoid blocking.
+fn notify(title: &str, body: &str) {
+    let icon_path = Config::base_dir().join("icon.png");
+    let mut n = notify_rust::Notification::new();
+    n.summary(title).body(body);
+    if icon_path.exists() {
+        #[cfg(target_os = "macos")]
+        n.appname("plan-executor");
+    }
+    let _ = n.show();
+}
+
+/// Sends a notification for a plan filename with the given title.
+fn notify_plan(title: &str, plan: &Path, detail: &str) {
+    let name = plan.file_name().and_then(|n| n.to_str()).unwrap_or("plan");
+    let body = if detail.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}\n{}", name, detail)
+    };
+    notify(title, &body);
+}
+
 /// Write a display line to the job's display.log so `plan-executor output` sees it.
 fn append_display(job_id: &str, line: &str) {
     use std::io::Write;
@@ -181,6 +204,8 @@ async fn poll_remote_executions(state: &Arc<Mutex<DaemonState>>) {
                 let new_status = if success { "COMPLETED" } else { "FAILED" };
 
                 tracing::info!(plan = %plan_path, pr = pr_number, status = new_status, "remote execution finished");
+                let status_label = if success { "succeeded" } else { "failed" };
+                notify_plan(&format!("Remote execution {}", status_label), &plan, "");
                 let _ = crate::plan::set_plan_header(&plan, "status", new_status);
 
                 // Update the persisted job metadata
@@ -229,6 +254,7 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                     match crate::remote::trigger_remote_execution(remote_repo, &plan, &meta) {
                         Ok(url) => {
                             tracing::info!(url = %url, "remote execution triggered");
+                            notify_plan("Remote execution started", &plan, "");
                             // Update plan status and store PR number
                             let _ = crate::plan::set_plan_header(&plan, "status", "EXECUTING");
                             if let Some(pr_num) = crate::remote::pr_number_from_url(&url) {
@@ -272,6 +298,8 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
         tracing::error!("failed to spawn execution for plan: {}", plan_path);
         return;
     };
+
+    notify_plan("Execution started", &plan, "");
 
     {
         let mut st = state.lock().await;
@@ -751,6 +779,13 @@ async fn run_exec_event_loop(
                     st.job_output.remove(&job_id);
                     st.job_display_output.remove(&job_id);
                     st.history.insert(0, job.clone());
+                    let status_str = match job.status {
+                        JobStatus::Success => "succeeded",
+                        JobStatus::Failed => "failed",
+                        JobStatus::Killed => "killed",
+                        _ => "finished",
+                    };
+                    notify_plan(&format!("Execution {}", status_str), &job.plan_path, "");
                     let _ = st.event_tx.send(DaemonEvent::JobUpdated { job });
                     break 'outer;
                 }
@@ -767,6 +802,7 @@ async fn run_exec_event_loop(
                 job.status = JobStatus::Failed;
                 job.finished_at = Some(chrono::Utc::now());
                 let _ = job.save();
+                notify_plan("Execution failed", &job.plan_path, "");
                 st.history.insert(0, job.clone());
                 st.running_children.remove(&job_id);
                 st.process_group_ids.remove(&job_id);
