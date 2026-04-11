@@ -425,6 +425,7 @@ async fn execute_foreground(plan_path: String, config: crate::config::Config) ->
 
     let mut last_display_blank = false;
     let mut final_status = None;
+    let mut completion_retried = false;
 
     'outer: loop {
         while let Some(event) = exec_rx.recv().await {
@@ -497,7 +498,54 @@ async fn execute_foreground(plan_path: String, config: crate::config::Config) ->
                     }
                 }
                 ExecEvent::Finished(finished_job) => {
-                    final_status = Some(finished_job.status == crate::jobs::JobStatus::Success);
+                    let is_success = finished_job.status == crate::jobs::JobStatus::Success;
+
+                    // If the agent returned success but the plan is still
+                    // EXECUTING, the skill bailed out mid-execution. Resume
+                    // the session once with an explicit instruction to finish.
+                    let plan_still_executing = is_success
+                        && crate::plan::parse_plan_status(&resolved_path)
+                            .map(|s| matches!(s, crate::plan::PlanStatus::Executing))
+                            .unwrap_or(false);
+
+                    if plan_still_executing && !completion_retried {
+                        completion_retried = true;
+                        let session_id = finished_job.session_id.clone();
+
+                        if let Some(sid) = session_id {
+                            println!("\x1b[33m\u{23fa} [plan-executor]\x1b[0m plan still EXECUTING after agent returned success — resuming to complete remaining phases");
+
+                            let continuation = "The plan execution is incomplete — the plan status is still EXECUTING. \
+                                You returned from a handoff resume but did not complete the remaining execution phases. \
+                                Continue from where you left off. Complete all remaining phases (plan validation, \
+                                cleanup/PR, execution summary) until the plan status is set to COMPLETED.";
+
+                            match handoff::resume_execution(
+                                &sid,
+                                continuation,
+                                execution_root.clone(),
+                                Some(job_id.clone()),
+                                Some(resolved_path.clone()),
+                                &config.agents.main,
+                            ).await {
+                                Ok((new_child, _new_pgid, new_rx)) => {
+                                    child = new_child;
+                                    exec_rx = new_rx;
+                                    continue 'outer;
+                                }
+                                Err(e) => {
+                                    eprintln!("\x1b[31m\u{23fa} [plan-executor] completion retry failed to resume: {}\x1b[0m", e);
+                                }
+                            }
+                        }
+                    }
+
+                    if plan_still_executing {
+                        eprintln!("\x1b[31m\u{23fa} [plan-executor] plan still EXECUTING after completion retry — marking FAILED\x1b[0m");
+                        final_status = Some(false);
+                    } else {
+                        final_status = Some(is_success);
+                    }
                     break 'outer;
                 }
             }
