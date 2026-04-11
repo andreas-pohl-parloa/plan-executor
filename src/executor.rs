@@ -81,43 +81,91 @@ fn has_pending_handoffs(path: &std::path::Path) -> bool {
     false
 }
 
-/// Finds a handoff state file in either the repo root (non-worktree case) or
-/// inside any `.my/worktrees/<slug>/` subdirectory (worktree case).
-/// Checks all known state file names in priority order.
+/// Finds a handoff state file by searching:
+/// 1. The execution root directly
+/// 2. `.my/worktrees/*/` subdirectories
+/// 3. Git worktrees (via `git worktree list`)
+/// 4. Sibling directories of the execution root (agent may create worktrees as siblings)
+///
 /// Only returns files that contain pending handoffs.
 pub fn find_state_file(execution_root: &Path) -> Option<PathBuf> {
-    // Direct placement (non-worktree execution)
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // 1. Direct placement (non-worktree execution)
     for name in STATE_FILE_NAMES {
         let candidate = execution_root.join(name);
         if candidate.exists() && has_pending_handoffs(&candidate) {
-            return Some(candidate);
+            return Some(candidate); // fast path
         }
     }
-    // Worktree placement: <repo>/.my/worktrees/*/<state-file>
-    // Collect ALL matching state files across all worktrees to avoid non-deterministic
-    // selection when multiple concurrent plans run in different worktrees of the same repo.
+
+    // 2. .my/worktrees/*/ subdirectories
     let worktrees = execution_root.join(".my").join("worktrees");
-    let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&worktrees) {
         for entry in entries.flatten() {
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
             for name in STATE_FILE_NAMES {
                 let candidate = entry.path().join(name);
                 if candidate.exists() && has_pending_handoffs(&candidate) {
                     candidates.push(candidate);
-                    break; // highest-priority name wins for this worktree
+                    break;
                 }
             }
         }
     }
+
+    // 3. Git worktrees (handles worktrees created anywhere on disk)
+    if candidates.is_empty() {
+        if let Ok(output) = std::process::Command::new("git")
+            .arg("-C").arg(execution_root)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    if let Some(wt_path) = line.strip_prefix("worktree ") {
+                        let wt = PathBuf::from(wt_path);
+                        if wt == execution_root { continue; }
+                        for name in STATE_FILE_NAMES {
+                            let candidate = wt.join(name);
+                            if candidate.exists() && has_pending_handoffs(&candidate) {
+                                candidates.push(candidate);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Sibling directories (agent may create worktrees as siblings like workspace-foo/)
+    if candidates.is_empty() {
+        if let Some(parent) = execution_root.parent() {
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
+                    let path = entry.path();
+                    if path == execution_root { continue; }
+                    for name in STATE_FILE_NAMES {
+                        let candidate = path.join(name);
+                        if candidate.exists() && has_pending_handoffs(&candidate) {
+                            candidates.push(candidate);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     match candidates.len() {
         1 => candidates.into_iter().next(),
         0 => None,
         n => {
             tracing::warn!(
-                "find_state_file: {} worktrees have a state file — ambiguous, returning None. \
+                "find_state_file: {} locations have a state file — ambiguous, returning None. \
                  Candidates: {:?}",
                 n,
                 candidates
