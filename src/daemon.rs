@@ -458,13 +458,28 @@ pub async fn retry_handoff_from_state(
             let _ = st.event_tx.send(DaemonEvent::JobOutput { job_id: job_id_full.clone(), line });
         }
 
+        // Channel for bash agents to stream live output (retry path).
+        let (live_tx, mut live_rx) = tokio::sync::mpsc::channel::<(usize, String)>(256);
+        let live_state = Arc::clone(&state_clone);
+        let live_jid = job_id_full.clone();
+        let live_task = tokio::spawn(async move {
+            while let Some((_idx, line)) = live_rx.recv().await {
+                append_display(&live_jid, &line);
+                let mut st = live_state.lock().await;
+                st.job_display_output.entry(live_jid.clone()).or_default().push_back(line.clone());
+                let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: live_jid.clone(), line });
+            }
+        });
+
         let (results, sub_pgids) = handoff::dispatch_all(
             state_data.handoffs,
             &agents.claude,
             &agents.codex,
             &agents.gemini,
             &agents.bash,
+            Some(live_tx),
         ).await;
+        let _ = live_task.await;
 
         {
             let mut st = state_clone.lock().await;
@@ -638,13 +653,29 @@ async fn run_exec_event_loop(
                     }
 
                     let agents = { state.lock().await.agents.clone() };
+
+                    // Channel for bash agents to stream live output.
+                    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel::<(usize, String)>(256);
+                    let live_state = Arc::clone(&state);
+                    let live_job_id = job_id.clone();
+                    let live_task = tokio::spawn(async move {
+                        while let Some((_idx, line)) = live_rx.recv().await {
+                            append_display(&live_job_id, &line);
+                            let mut st = live_state.lock().await;
+                            st.job_display_output.entry(live_job_id.clone()).or_default().push_back(line.clone());
+                            let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: live_job_id.clone(), line });
+                        }
+                    });
+
                     let (results, sub_pgids) = handoff::dispatch_all(
                         state_data.handoffs,
                         &agents.claude,
                         &agents.codex,
                         &agents.gemini,
                         &agents.bash,
+                        Some(live_tx),
                     ).await;
+                    let _ = live_task.await;
 
                     {
                         let mut st = state.lock().await;

@@ -190,14 +190,23 @@ pub fn load_state(state_file: &Path) -> Result<HandoffState> {
 
 // ── Sub-agent dispatch ─────────────────────────────────────────────────────
 
-async fn dispatch_agent(handoff: Handoff, cmd: String) -> (HandoffResult, u32) {
+/// Dispatches a single agent. For bash agents with a `live_tx`, stdout/stderr
+/// are streamed line-by-line through the channel for live display instead of
+/// being captured silently.
+async fn dispatch_agent(
+    handoff: Handoff,
+    cmd: String,
+    live_tx: Option<mpsc::Sender<(usize, String)>>,
+) -> (HandoffResult, u32) {
     let path = handoff.prompt_file.to_string_lossy().into_owned();
     let can_fail = handoff.can_fail;
+    let index = handoff.index;
+    let is_bash = matches!(handoff.agent_type, AgentType::Bash);
 
     // Verify the prompt file exists before attempting to dispatch.
     if !handoff.prompt_file.exists() {
         return (HandoffResult {
-            index: handoff.index,
+            index,
             stdout: String::new(),
             stderr: format!("prompt file not found: {}", path),
             success: false,
@@ -218,10 +227,10 @@ async fn dispatch_agent(handoff: Handoff, cmd: String) -> (HandoffResult, u32) {
          .spawn()
     };
 
-    let child = match child_result {
+    let mut child = match child_result {
         Ok(c) => c,
         Err(e) => return (HandoffResult {
-            index: handoff.index,
+            index,
             stdout: String::new(),
             stderr: format!("failed to spawn agent: {}", e),
             success: false,
@@ -231,18 +240,62 @@ async fn dispatch_agent(handoff: Handoff, cmd: String) -> (HandoffResult, u32) {
 
     let pgid = child.id().unwrap_or(0);
 
+    // Bash agents with a live channel: stream stdout/stderr in real-time.
+    // The continuation payload for bash is just the exit status.
+    if is_bash && live_tx.is_some() {
+        let tx = live_tx.unwrap();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        let tx_out = tx.clone();
+        let stdout_handle = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = Vec::new();
+            if let Some(out) = stdout {
+                let mut reader = BufReader::new(out).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    let _ = tx_out.send((index, line.clone())).await;
+                    lines.push(line);
+                }
+            }
+            lines.join("\n")
+        });
+
+        let tx_err = tx;
+        let stderr_handle = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = Vec::new();
+            if let Some(err) = stderr {
+                let mut reader = BufReader::new(err).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    let _ = tx_err.send((index, line.clone())).await;
+                    lines.push(line);
+                }
+            }
+            lines.join("\n")
+        });
+
+        let status = child.wait().await;
+        let stdout_str = stdout_handle.await.unwrap_or_default();
+        let stderr_str = stderr_handle.await.unwrap_or_default();
+        let success = status.map(|s| s.success()).unwrap_or(false);
+
+        return (HandoffResult { index, stdout: stdout_str, stderr: stderr_str, success, can_fail }, pgid);
+    }
+
+    // Default path: capture stdout/stderr silently.
     let output = child.wait_with_output().await;
 
     let result = match output {
         Ok(out) => HandoffResult {
-            index: handoff.index,
+            index,
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             success: out.status.success(),
             can_fail,
         },
         Err(e) => HandoffResult {
-            index: handoff.index,
+            index,
             stdout: String::new(),
             stderr: format!("failed waiting for agent: {}", e),
             success: false,
@@ -253,12 +306,14 @@ async fn dispatch_agent(handoff: Handoff, cmd: String) -> (HandoffResult, u32) {
 }
 
 /// Dispatches all handoffs in a batch concurrently. Returns results sorted by index and PGIDs.
+/// `live_tx` streams (agent_index, line) for bash agents' live output.
 pub async fn dispatch_all(
     handoffs: Vec<Handoff>,
     claude_cmd: &str,
     codex_cmd: &str,
     gemini_cmd: &str,
     bash_cmd: &str,
+    live_tx: Option<mpsc::Sender<(usize, String)>>,
 ) -> (Vec<HandoffResult>, Vec<u32>) {
     let handles: Vec<_> = handoffs.into_iter()
         .map(|h| {
@@ -268,7 +323,8 @@ pub async fn dispatch_all(
                 AgentType::Gemini => gemini_cmd.to_string(),
                 AgentType::Bash   => bash_cmd.to_string(),
             };
-            tokio::spawn(dispatch_agent(h, cmd))
+            let tx = if matches!(h.agent_type, AgentType::Bash) { live_tx.clone() } else { None };
+            tokio::spawn(dispatch_agent(h, cmd, tx))
         })
         .collect();
     let mut results = Vec::new();

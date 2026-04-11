@@ -445,13 +445,23 @@ async fn execute_foreground(plan_path: String, config: crate::config::Config) ->
                     println!("\x1b[33m\u{23fa} [plan-executor]\x1b[0m dispatching {} sub-agent(s) (phase: {})",
                         state_data.handoffs.len(), state_data.phase);
 
+                    // Channel for bash agents to stream live output to terminal.
+                    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel::<(usize, String)>(256);
+                    let live_task = tokio::spawn(async move {
+                        while let Some((_idx, line)) = live_rx.recv().await {
+                            println!("{}", line);
+                        }
+                    });
+
                     let (results, _pgids) = handoff::dispatch_all(
                         state_data.handoffs,
                         &config.agents.claude,
                         &config.agents.codex,
                         &config.agents.gemini,
                         &config.agents.bash,
+                        Some(live_tx),
                     ).await;
+                    let _ = live_task.await;
 
                     for r in &results {
                         if r.success {
