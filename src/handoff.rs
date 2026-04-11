@@ -430,6 +430,25 @@ pub async fn resume_execution(
             }).await;
             return;
         } else if saw_handoff_call {
+            // Relaxed fallback: state file may exist but lack the handoffs
+            // array (protocol drift after many resumes). load_state has
+            // auto-detection from co-located .tmp-subtask-*.md files.
+            if let Some(relaxed_file) = crate::executor::find_state_file_any(&execution_root) {
+                tracing::warn!("resume: state file exists at {:?} but has no pending handoffs — using auto-detection fallback", relaxed_file);
+                let warn = format!(
+                    "⏺ [plan-executor] state file missing handoffs array — falling back to prompt-file auto-detection ({})",
+                    relaxed_file.display()
+                );
+                if let Some(ref mut f) = disp_file {
+                    let _ = f.write_all(format!("{}\n", warn).as_bytes()).await;
+                }
+                let _ = tx.send(ExecEvent::DisplayLine(warn)).await;
+                let _ = tx.send(ExecEvent::HandoffRequired {
+                    session_id: resumed_session_id,
+                    state_file: relaxed_file,
+                }).await;
+                return;
+            }
             let err = "⏺ [plan-executor] handoff protocol error: agent requested sub-agent calls but did not write the state file (.tmp-execute-plan-state.json)";
             if let Some(ref mut f) = disp_file {
                 let _ = f.write_all(format!("{}\n", err).as_bytes()).await;

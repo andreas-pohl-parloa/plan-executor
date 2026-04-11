@@ -175,6 +175,74 @@ pub fn find_state_file(execution_root: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Like `find_state_file` but only checks existence — no `has_pending_handoffs`
+/// filter. Used as a fallback when the agent output `call sub-agent` lines but
+/// wrote a state file without a proper `handoffs` array (protocol drift after
+/// many resumes). The caller should try `handoff::load_state` which has
+/// auto-detection from co-located `.tmp-subtask-*.md` files.
+pub fn find_state_file_any(execution_root: &Path) -> Option<PathBuf> {
+    // Same search order as find_state_file but existence-only.
+    for name in STATE_FILE_NAMES {
+        let candidate = execution_root.join(name);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    let worktrees = execution_root.join(".my").join("worktrees");
+    if let Ok(entries) = std::fs::read_dir(&worktrees) {
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
+            for name in STATE_FILE_NAMES {
+                let candidate = entry.path().join(name);
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    if let Ok(output) = std::process::Command::new("git")
+        .arg("-C").arg(execution_root)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if let Some(wt_path) = line.strip_prefix("worktree ") {
+                    let wt = PathBuf::from(wt_path);
+                    if wt == execution_root { continue; }
+                    for name in STATE_FILE_NAMES {
+                        let candidate = wt.join(name);
+                        if candidate.exists() {
+                            return Some(candidate);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(parent) = execution_root.parent() {
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
+                let path = entry.path();
+                if path == execution_root { continue; }
+                for name in STATE_FILE_NAMES {
+                    let candidate = path.join(name);
+                    if candidate.exists() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Clears the handoffs array in the state file so it won't re-trigger dispatch,
 /// while preserving all other orchestrator state (phase, wave, etc.).
 pub fn consume_handoffs(state_file: &std::path::Path) {
@@ -313,8 +381,30 @@ pub fn spawn_execution(
                 return; // caller loop will resume; do NOT emit Finished here
             }
         } else if saw_handoff_call {
-            // Agent output "call sub-agent" instructions but never wrote the state file.
-            // This is a handoff protocol violation — fail the job with a clear error.
+            // Agent output "call sub-agent" lines but find_state_file (which
+            // requires a non-empty handoffs array) returned None. Try a relaxed
+            // search — the file may exist but lack the handoffs field (protocol
+            // drift after many resumes). load_state has auto-detection from
+            // co-located .tmp-subtask-*.md files.
+            if let Some(relaxed_file) = find_state_file_any(&execution_root) {
+                tracing::warn!("executor: state file exists at {:?} but has no pending handoffs — using auto-detection fallback", relaxed_file);
+                let warn = format!(
+                    "⏺ [plan-executor] state file missing handoffs array — falling back to prompt-file auto-detection ({})",
+                    relaxed_file.display()
+                );
+                if let Some(ref mut f) = display_file {
+                    let _ = f.write_all(format!("{}\n", warn).as_bytes()).await;
+                }
+                let _ = tx.send(ExecEvent::DisplayLine(warn)).await;
+                if let Some(sid) = job.session_id.clone() {
+                    let _ = tx.send(ExecEvent::HandoffRequired {
+                        session_id: sid,
+                        state_file: relaxed_file,
+                    }).await;
+                    return;
+                }
+            }
+            // State file truly doesn't exist — protocol violation.
             let err = "⏺ [plan-executor] handoff protocol error: agent requested sub-agent calls but did not write the state file (.tmp-execute-plan-state.json)";
             if let Some(ref mut f) = display_file {
                 let _ = f.write_all(format!("{}\n", err).as_bytes()).await;
