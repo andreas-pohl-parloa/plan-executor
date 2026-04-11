@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.15.2] - 2026-04-11
+
+### Bug Fixes
+
+- Inject handoffs from output lines instead of auto-detecting all prompt files ([f50f872](https://github.com/andreas-pohl-parloa/plan-executor/commit/f50f872e8974ffa5e40bd64b39d1a5515707bcea))
 ## [0.15.1] - 2026-04-11
 
 ### Bug Fixes
