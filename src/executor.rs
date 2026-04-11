@@ -331,6 +331,12 @@ pub fn spawn_execution(
                 last_display_blank = is_blank;
                 if display_line.contains("call sub-agent") {
                     if let Some(parsed) = parse_handoff_line(display_line) {
+                        // Index 1 with existing entries = new batch (agent
+                        // continued from one phase to the next in the same
+                        // session). Keep only the latest batch.
+                        if parsed.0 == 1 && !handoff_calls.is_empty() {
+                            handoff_calls.clear();
+                        }
                         handoff_calls.push(parsed);
                     }
                 }

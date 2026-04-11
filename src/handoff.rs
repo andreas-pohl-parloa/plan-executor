@@ -386,6 +386,9 @@ pub async fn resume_execution(
                 last_display_blank = is_blank;
                 if display_line.contains("call sub-agent") {
                     if let Some(parsed) = crate::executor::parse_handoff_line(display_line) {
+                        if parsed.0 == 1 && !handoff_calls.is_empty() {
+                            handoff_calls.clear();
+                        }
                         handoff_calls.push(parsed);
                     }
                 }
