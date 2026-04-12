@@ -184,9 +184,10 @@ jobs:
           fi
           REF_SHORT="${TARGET_REF:0:12}"
 
-          # Read execution summary written by the skill (may be in a worktree)
+          # Read execution summary written by the skill (may be in a worktree
+          # created as a sibling of workspace/, not inside it)
           SUMMARY=""
-          SUMMARY_FILE=$(find workspace/ -maxdepth 4 -name .tmp-execution-summary.md -print -quit 2>/dev/null)
+          SUMMARY_FILE=$(find . -maxdepth 4 -name .tmp-execution-summary.md -not -path './.git/*' -print -quit 2>/dev/null)
           if [ -n "$SUMMARY_FILE" ]; then
             SUMMARY=$(head -c 60000 "$SUMMARY_FILE")
           fi
