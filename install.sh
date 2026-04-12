@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-${0:-.}}")" && pwd)"
+_src="${BASH_SOURCE[0]:-}"
+[ -z "$_src" ] && _src="."
+SCRIPT_DIR="$(cd "$(dirname "$_src")" && pwd)"
 BASE_DIR="$HOME/.plan-executor"
 LOG_FILE="$BASE_DIR/daemon.log"
 MARKER="# plan-executor"
