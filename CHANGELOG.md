@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.19.6] - 2026-04-12
+
+### Bug Fixes
+
+- Route remote executions through daemon for jobs/notifications ([dc28cc3](https://github.com/andreas-pohl-parloa/plan-executor/commit/dc28cc34c50430035c22ac0fc00665c8ecd5c8a2))
 ## [0.19.5] - 2026-04-12
 
 ### Bug Fixes
