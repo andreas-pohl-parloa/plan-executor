@@ -789,23 +789,21 @@ fn list_jobs() {
                 println!("Remote ({}):", remote_repo);
                 let pr_w = 6;
                 let r_status_w = 10;
-                // Compute column widths from actual data
-                let r_plan_w = remote_jobs.iter()
-                    .map(|rj| rj.plan_name.len())
-                    .max().unwrap_or(4).max(4);
+                let r_gaps = 8; // 4 gaps × 2 spaces
                 let r_target_w = remote_jobs.iter()
                     .map(|rj| rj.target.len())
                     .max().unwrap_or(6).max(6);
-                let header_w = pr_w + 2 + r_plan_w + 2 + r_status_w + 2 + r_target_w;
+                let r_plan_w = term_w.saturating_sub(pr_w + r_status_w + r_target_w + r_gaps).max(20);
                 println!(
                     "{:<pr_w$}  {:<r_plan_w$}  {:<r_status_w$}  {}",
                     "PR", "PLAN", "STATUS", "TARGET",
                 );
-                println!("{}", "─".repeat(header_w));
+                println!("{}", "─".repeat(term_w));
                 for rj in &remote_jobs {
+                    let plan_display = truncate_str(&rj.plan_name, r_plan_w);
                     println!(
                         "#{:<width$}  {:<r_plan_w$}  {:<r_status_w$}  {}",
-                        rj.number, rj.plan_name, rj.status, rj.target,
+                        rj.number, plan_display, rj.status, rj.target,
                         width = pr_w - 1,
                     );
                 }

@@ -7,6 +7,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  issues: write
 
 jobs:
   execute:
@@ -183,10 +184,11 @@ jobs:
           fi
           REF_SHORT="${TARGET_REF:0:12}"
 
-          # Read execution summary written by the skill
+          # Read execution summary written by the skill (may be in a worktree)
           SUMMARY=""
-          if [ -f workspace/.tmp-execution-summary.md ]; then
-            SUMMARY=$(head -c 60000 workspace/.tmp-execution-summary.md)
+          SUMMARY_FILE=$(find workspace/ -maxdepth 4 -name .tmp-execution-summary.md -print -quit 2>/dev/null)
+          if [ -n "$SUMMARY_FILE" ]; then
+            SUMMARY=$(head -c 60000 "$SUMMARY_FILE")
           fi
 
           BODY="## Execution Complete
@@ -210,6 +212,7 @@ jobs:
 
           gh pr close "$PR_NUMBER" \
             --repo "$GH_REPO" || true
+          gh label create "${STATUS}" --repo "$GH_REPO" 2>/dev/null || true
           gh pr edit "$PR_NUMBER" \
             --repo "$GH_REPO" \
             --add-label "${STATUS}" || true
