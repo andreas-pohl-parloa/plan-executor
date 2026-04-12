@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.19.1] - 2026-04-12
+
+### Bug Fixes
+
+- Support bash -c invocation and symlinked rc files in install.sh ([4ba1bc6](https://github.com/andreas-pohl-parloa/plan-executor/commit/4ba1bc602a7aa4549c4cc607d37f7c9c18fd827f))
 ## [0.19.0] - 2026-04-11
 
 ### Features
