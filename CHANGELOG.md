@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.19.2] - 2026-04-12
+
+### Bug Fixes
+
+- Silence dirname warning when $0 is empty under bash -c ([396d018](https://github.com/andreas-pohl-parloa/plan-executor/commit/396d01888ca711509ce691f7891d70ab7b4099e5))
 ## [0.19.1] - 2026-04-12
 
 ### Bug Fixes
