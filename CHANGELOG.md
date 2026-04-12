@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.19.7] - 2026-04-12
+
+### Bug Fixes
+
+- Prune old completed jobs on daemon startup (keep 50) ([0db94a4](https://github.com/andreas-pohl-parloa/plan-executor/commit/0db94a491edde4f72d967587129beed539bc7e95))
 ## [0.19.6] - 2026-04-12
 
 ### Bug Fixes
