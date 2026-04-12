@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.19.4] - 2026-04-12
+
+### Bug Fixes
+
+- Avoid dirname warning when BASH_SOURCE is empty ([de460ac](https://github.com/andreas-pohl-parloa/plan-executor/commit/de460ac0fdf6c55fa0735cae7a0fd4df4450f9f9))
 ## [0.19.3] - 2026-04-12
 
 ### Bug Fixes
