@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.19.9] - 2026-04-12
+
+### Bug Fixes
+
+- Create labels before adding, search worktrees for execution summary ([53ee717](https://github.com/andreas-pohl-parloa/plan-executor/commit/53ee717c451217b2c4239172a5282165a42683f6))
 ## [0.19.8] - 2026-04-12
 
 ### Bug Fixes
