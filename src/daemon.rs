@@ -69,20 +69,14 @@ fn notify(title: &str, body: &str) {
 fn send_notification(title: &str, body: &str, icon: &Path) -> std::result::Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let icon_path = icon.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
         let escaped_title = title.replace('\\', "\\\\").replace('"', "\\\"");
         let escaped_body = body.replace('\\', "\\\\").replace('"', "\\\"");
         let script = format!(
-            r#"ObjC.import("Foundation");ObjC.import("AppKit");
-var n=$.NSUserNotification.alloc.init;
-n.title=$("{}");n.informativeText=$("{}");
-var img=$.NSImage.alloc.initWithContentsOfFile($("{}"));
-n.contentImage=img;
-$.NSUserNotificationCenter.defaultUserNotificationCenter.deliverNotification(n);"#,
-            escaped_title, escaped_body, icon_path
+            "display notification \"{}\" with title \"{}\"",
+            escaped_body, escaped_title
         );
         let output = std::process::Command::new("osascript")
-            .args(["-l", "JavaScript", "-e", &script])
+            .args(["-e", &script])
             .output()
             .map_err(|e| format!("osascript spawn: {}", e))?;
         if !output.status.success() {
