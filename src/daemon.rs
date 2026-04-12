@@ -302,11 +302,16 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                         Ok(url) => {
                             tracing::info!(url = %url, "remote execution triggered");
                             notify_plan("Remote execution started", &plan, "");
-                            // Update plan status and store PR number
                             let _ = crate::plan::set_plan_header(&plan, "status", "EXECUTING");
                             if let Some(pr_num) = crate::remote::pr_number_from_url(&url) {
                                 let _ = crate::plan::set_plan_header(&plan, "remote-pr", &pr_num.to_string());
+                                // Create and persist a job entry so `jobs` shows it.
+                                let job = JobMetadata::new_remote(
+                                    plan.clone(), remote_repo.to_string(), pr_num,
+                                );
+                                let _ = job.save();
                                 let mut st = state.lock().await;
+                                st.history.insert(0, job);
                                 st.remote_executions.insert(
                                     plan_path.to_string(),
                                     (remote_repo.to_string(), pr_num),

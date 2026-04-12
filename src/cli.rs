@@ -294,12 +294,7 @@ async fn execute_plan(plan_path: String, config: crate::config::Config) -> Resul
         anyhow::bail!("Plan file not found: {}", resolved_path);
     }
 
-    // Remote plans don't need the daemon — trigger directly.
-    if crate::plan::parse_execution_mode(&plan) == crate::plan::ExecutionMode::Remote {
-        return trigger_remote(plan, config).await;
-    }
-
-    // Local execution requires the daemon.
+    // Both local and remote execution go through the daemon.
     if !crate::ipc::socket_path().exists() {
         anyhow::bail!("Daemon not running. Start with: plan-executor daemon");
     }
@@ -606,8 +601,8 @@ async fn execute_via_daemon(plan: PathBuf, _config: crate::config::Config) -> Re
 
     let mut existing_ids = std::collections::HashSet::<String>::new();
     if let Ok(Some(line)) = reader.next_line().await {
-        if let Ok(DaemonEvent::State { running_jobs, .. }) = serde_json::from_str(&line) {
-            existing_ids = running_jobs.iter().map(|j| j.id.clone()).collect();
+        if let Ok(DaemonEvent::State { running_jobs, history, .. }) = serde_json::from_str(&line) {
+            existing_ids = running_jobs.iter().chain(history.iter()).map(|j| j.id.clone()).collect();
         }
     }
 
@@ -629,11 +624,21 @@ async fn execute_via_daemon(plan: PathBuf, _config: crate::config::Config) -> Re
                 let Ok(Some(line)) = line else { break };
                 if let Ok(event) = serde_json::from_str::<DaemonEvent>(&line) {
                     match event {
-                        DaemonEvent::State { running_jobs, .. } => {
-                            if let Some(j) = running_jobs.iter().find(|j| !existing_ids.contains(&j.id)) {
+                        DaemonEvent::State { running_jobs, history, .. } => {
+                            // Check both running_jobs (local) and history (remote)
+                            // for a newly created job.
+                            let new_job = running_jobs.iter().chain(history.iter())
+                                .find(|j| !existing_ids.contains(&j.id));
+                            if let Some(j) = new_job {
                                 let short_id = &j.id[..j.id.len().min(8)];
-                                println!("Queued {} (job {})", filename, short_id);
-                                println!("Watch: plan-executor output -f {}", short_id);
+                                let is_remote = j.remote_repo.is_some();
+                                if is_remote {
+                                    let pr_info = j.remote_pr.map(|n| format!(" PR #{}", n)).unwrap_or_default();
+                                    println!("Remote execution triggered (job {}).{}", short_id, pr_info);
+                                } else {
+                                    println!("Queued {} (job {})", filename, short_id);
+                                    println!("Watch: plan-executor output -f {}", short_id);
+                                }
                                 return Ok(());
                             }
                         }
