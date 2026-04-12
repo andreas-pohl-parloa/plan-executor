@@ -104,7 +104,16 @@ impl Config {
             return Ok(cfg);
         }
         let content = std::fs::read_to_string(&p)?;
-        let mut config: Self = serde_json::from_str(&content)?;
+        // Parse leniently: unknown fields are ignored by serde default behavior,
+        // and all fields have #[serde(default)] so missing fields get defaults.
+        // Fall back to full defaults only on truly broken JSON (syntax errors).
+        let mut config: Self = match serde_json::from_str(&content) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("config at {} could not be parsed ({}), using defaults", p.display(), e);
+                Self::default()
+            }
+        };
 
         // Resolve relative agent command paths against the config file's directory
         // so that `./main-agent.sh` works correctly after daemonize changes CWD to `/`.
