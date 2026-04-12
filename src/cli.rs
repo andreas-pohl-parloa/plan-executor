@@ -945,7 +945,20 @@ fn remote_setup() {
     let current_repo = crate::config::Config::load(None)
         .ok()
         .and_then(|c| c.remote_repo);
-    let default_display = current_repo.as_deref().unwrap_or("owner/plan-executions");
+    let default_display = current_repo.unwrap_or_else(|| {
+        // Use the current gh account as the default owner.
+        let gh_user = std::process::Command::new("gh")
+            .args(["api", "user", "--jq", ".login"])
+            .output()
+            .ok()
+            .and_then(|o| if o.status.success() {
+                String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
+            } else { None });
+        match gh_user {
+            Some(user) if !user.is_empty() => format!("{}/plan-executions", user),
+            _ => "owner/plan-executions".to_string(),
+        }
+    });
     print!("Execution repo [{}]: ", default_display);
     let _ = stdout.flush();
     let mut repo_input = String::new();
