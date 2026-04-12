@@ -149,6 +149,8 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
     let (event_tx, _) = broadcast::channel::<DaemonEvent>(256);
 
     tracing::info!("loading job history");
+    // Prune old completed jobs, keeping the 50 most recent.
+    JobMetadata::prune(50);
     // Any job that was Running when the daemon last died was interrupted.
     // Mark it Failed now so it shows up in history with the correct status.
     let history_on_start: Vec<JobMetadata> = JobMetadata::load_all()

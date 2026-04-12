@@ -117,7 +117,7 @@ impl JobMetadata {
         None
     }
 
-    /// Loads all jobs from ~/.plan-executor/jobs/
+    /// Loads all jobs from ~/.plan-executor/jobs/, sorted by started_at descending.
     pub fn load_all() -> Vec<Self> {
         let jobs_dir = Config::base_dir().join("jobs");
         let Ok(entries) = std::fs::read_dir(&jobs_dir) else {
@@ -135,5 +135,23 @@ impl JobMetadata {
         // Sort by started_at descending
         jobs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
         jobs
+    }
+
+    /// Removes completed job directories beyond `keep` most recent.
+    /// Only prunes terminal jobs (Success, Failed, Killed). Running and
+    /// RemoteRunning jobs are never pruned.
+    pub fn prune(keep: usize) {
+        let all = Self::load_all();
+        let pruneable: Vec<&Self> = all.iter()
+            .filter(|j| matches!(j.status, JobStatus::Success | JobStatus::Failed | JobStatus::Killed))
+            .collect();
+        if pruneable.len() <= keep { return; }
+        for job in &pruneable[keep..] {
+            let dir = job.job_dir();
+            if dir.exists() {
+                let _ = std::fs::remove_dir_all(&dir);
+                tracing::debug!("pruned job {}", job.id);
+            }
+        }
     }
 }
