@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.19.13] - 2026-04-12
+
+### Bug Fixes
+
+- Correct remote table gap count and status width ([29f1c9a](https://github.com/andreas-pohl-parloa/plan-executor/commit/29f1c9a04b19543e7fafce1aa3635e6c955ff36a))
 ## [0.19.12] - 2026-04-12
 
 ### Bug Fixes
