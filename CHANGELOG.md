@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.19.3] - 2026-04-12
+
+### Bug Fixes
+
+- Fall back to default config on parse errors instead of panicking ([21327b3](https://github.com/andreas-pohl-parloa/plan-executor/commit/21327b3dd4eb0841b623087e07c1aa1fde14383a))
 ## [0.19.2] - 2026-04-12
 
 ### Bug Fixes
