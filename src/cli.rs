@@ -800,15 +800,16 @@ fn list_jobs() {
                     .max().unwrap_or(6).max(6);
                 let r_plan_w = term_w.saturating_sub(pr_w + r_status_w + r_target_w + r_gaps).max(20);
                 println!(
-                    "{:<pr_w$}  {:<r_plan_w$}  {:<r_status_w$}  {}",
+                    "{:<pr_w$}  {:<r_plan_w$}  {:<r_status_w$}  {:<r_target_w$}",
                     "PR", "PLAN", "STATUS", "TARGET",
                 );
                 println!("{}", "─".repeat(term_w));
                 for rj in &remote_jobs {
                     let plan_display = truncate_str(&rj.plan_name, r_plan_w);
+                    let target_display = truncate_str(&rj.target, r_target_w);
                     println!(
-                        "#{:<width$}  {:<r_plan_w$}  {:<r_status_w$}  {}",
-                        rj.number, plan_display, rj.status, rj.target,
+                        "#{:<width$}  {:<r_plan_w$}  {:<r_status_w$}  {:<r_target_w$}",
+                        rj.number, plan_display, rj.status, target_display,
                         width = pr_w - 1,
                     );
                 }
