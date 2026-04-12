@@ -51,8 +51,8 @@ fn ensure_icon() -> PathBuf {
     path
 }
 
-/// Sends a desktop notification using OS-native tools.
-/// macOS: osascript. Linux: notify-send.
+/// Sends a desktop notification.
+/// macOS: alerter (custom icon) with osascript fallback. Linux: notify-send.
 fn notify(title: &str, body: &str) {
     tracing::info!("notification: {} — {}", title, body);
     let title = title.to_string();
@@ -69,32 +69,31 @@ fn notify(title: &str, body: &str) {
 fn send_notification(title: &str, body: &str, icon: &Path) -> std::result::Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let escaped_title = title.replace('\\', "\\\\").replace('"', "\\\"");
-        let escaped_body = body.replace('\\', "\\\\").replace('"', "\\\"");
-        let script = format!(
-            "display notification \"{}\" with title \"{}\"",
-            escaped_body, escaped_title
-        );
-        let output = std::process::Command::new("osascript")
-            .args(["-e", &script])
+        let output = std::process::Command::new("alerter")
+            .args([
+                "--title", title,
+                "--message", body,
+                "--app-icon", &icon.to_string_lossy(),
+                "--timeout", "10",
+            ])
             .output()
-            .map_err(|e| format!("osascript spawn: {}", e))?;
+            .map_err(|e| format!("alerter not found: {}", e))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("osascript exit {}: {}", output.status, stderr.trim()));
+            return Err(format!("alerter exit {}: {}", output.status, stderr.trim()));
         }
     }
     #[cfg(not(target_os = "macos"))]
     {
         let icon_str = icon.to_string_lossy().to_string();
-        let mut args = vec![title, body];
-        if icon.exists() {
-            args.push("-i");
-            args.push(&icon_str);
+        let output = std::process::Command::new("notify-send")
+            .args(["-i", &icon_str, title, body])
+            .output()
+            .map_err(|e| format!("notify-send not found: {}", e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("notify-send exit {}: {}", output.status, stderr.trim()));
         }
-        let _ = std::process::Command::new("notify-send")
-            .args(&args)
-            .output();
     }
     Ok(())
 }
