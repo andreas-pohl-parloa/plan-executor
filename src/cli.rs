@@ -127,6 +127,11 @@ pub fn run() {
         }
     }
 
+    // Default to info-level logging when RUST_LOG is not set.
+    // After daemonize(), stderr points to ~/.plan-executor/daemon.log.
+    if std::env::var("RUST_LOG").is_err() {
+        unsafe { std::env::set_var("RUST_LOG", "plan_executor=info"); }
+    }
     tracing_subscriber::fmt::init();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
 
