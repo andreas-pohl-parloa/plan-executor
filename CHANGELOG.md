@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.19.15] - 2026-04-12
+
+### Bug Fixes
+
+- Use alerter for macOS notifications, remove Notifier.app/osascript ([be28b72](https://github.com/andreas-pohl-parloa/plan-executor/commit/be28b72b0934cff3c26cac661c930d0ed1bdf05d))
 ## [0.19.14] - 2026-04-12
 
 ### Bug Fixes
