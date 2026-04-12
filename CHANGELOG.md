@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.19.5] - 2026-04-12
+
+### Bug Fixes
+
+- Use current gh account as default owner in remote-setup ([f2ef78f](https://github.com/andreas-pohl-parloa/plan-executor/commit/f2ef78f604b0610f283361d063857009ba60607d))
 ## [0.19.4] - 2026-04-12
 
 ### Bug Fixes
