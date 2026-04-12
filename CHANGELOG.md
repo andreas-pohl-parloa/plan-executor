@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.19.12] - 2026-04-12
+
+### Bug Fixes
+
+- Pad remote job rows to full terminal width for consistency ([e2b6b33](https://github.com/andreas-pohl-parloa/plan-executor/commit/e2b6b330643a9d0a33ac7f36b3b261955aac53c7))
 ## [0.19.11] - 2026-04-12
 
 ### Bug Fixes
