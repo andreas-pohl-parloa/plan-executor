@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.19.17] - 2026-04-12
+
+### Bug Fixes
+
+- Search entire working directory for execution summary file ([9afafef](https://github.com/andreas-pohl-parloa/plan-executor/commit/9afafef4766bd4e1eacd40a4f4007c32b067bdb4))
 ## [0.19.16] - 2026-04-12
 
 ### Bug Fixes
