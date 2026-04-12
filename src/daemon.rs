@@ -52,49 +52,57 @@ fn ensure_icon() -> PathBuf {
 }
 
 /// Sends a desktop notification using OS-native tools.
-/// macOS: JXA via osascript with custom icon. Linux: notify-send with icon.
+/// macOS: osascript. Linux: notify-send.
 fn notify(title: &str, body: &str) {
+    tracing::info!("notification: {} — {}", title, body);
     let title = title.to_string();
     let body = body.to_string();
     let icon = ensure_icon();
     std::thread::spawn(move || {
-        #[cfg(target_os = "macos")]
-        {
-            // JXA (JavaScript for Automation) supports NSUserNotification
-            // with a custom contentImage — works from daemons.
-            let icon_path = icon.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
-            let escaped_title = title.replace('\\', "\\\\").replace('"', "\\\"");
-            let escaped_body = body.replace('\\', "\\\\").replace('"', "\\\"");
-            let script = format!(
-                r#"ObjC.import("Foundation");ObjC.import("AppKit");
+        let result = send_notification(&title, &body, &icon);
+        if let Err(e) = result {
+            tracing::warn!("notification failed: {}", e);
+        }
+    });
+}
+
+fn send_notification(title: &str, body: &str, icon: &Path) -> std::result::Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let icon_path = icon.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped_title = title.replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped_body = body.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!(
+            r#"ObjC.import("Foundation");ObjC.import("AppKit");
 var n=$.NSUserNotification.alloc.init;
 n.title=$("{}");n.informativeText=$("{}");
 var img=$.NSImage.alloc.initWithContentsOfFile($("{}"));
 n.contentImage=img;
 $.NSUserNotificationCenter.defaultUserNotificationCenter.deliverNotification(n);"#,
-                escaped_title, escaped_body, icon_path
-            );
-            let _ = std::process::Command::new("osascript")
-                .args(["-l", "JavaScript", "-e", &script])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            escaped_title, escaped_body, icon_path
+        );
+        let output = std::process::Command::new("osascript")
+            .args(["-l", "JavaScript", "-e", &script])
+            .output()
+            .map_err(|e| format!("osascript spawn: {}", e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("osascript exit {}: {}", output.status, stderr.trim()));
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let mut args = vec![title.as_str(), body.as_str()];
-            let icon_str = icon.to_string_lossy().to_string();
-            if icon.exists() {
-                args.push("-i");
-                args.push(&icon_str);
-            }
-            let _ = std::process::Command::new("notify-send")
-                .args(&args)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let icon_str = icon.to_string_lossy().to_string();
+        let mut args = vec![title, body];
+        if icon.exists() {
+            args.push("-i");
+            args.push(&icon_str);
         }
-    });
+        let _ = std::process::Command::new("notify-send")
+            .args(&args)
+            .output();
+    }
+    Ok(())
 }
 
 /// Sends a notification for a plan filename with the given title.
