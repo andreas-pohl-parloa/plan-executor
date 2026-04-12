@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.19.16] - 2026-04-12
+
+### Bug Fixes
+
+- Send error events to CLI when remote execution fails ([fb01224](https://github.com/andreas-pohl-parloa/plan-executor/commit/fb012244eab89ae8659065d3702032a1da2043d0))
 ## [0.19.15] - 2026-04-12
 
 ### Bug Fixes
