@@ -793,8 +793,8 @@ fn list_jobs() {
                 println!();
                 println!("Remote ({}):", remote_repo);
                 let pr_w = 6;
-                let r_status_w = 10;
-                let r_gaps = 8; // 4 gaps × 2 spaces
+                let r_status_w = 8;
+                let r_gaps = 6; // 3 gaps × 2 spaces
                 let r_target_w = remote_jobs.iter()
                     .map(|rj| rj.target.len())
                     .max().unwrap_or(6).max(6);
