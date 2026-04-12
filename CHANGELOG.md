@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.19.14] - 2026-04-12
+
+### Bug Fixes
+
+- Use display notification instead of NSUserNotification ([68b2fc3](https://github.com/andreas-pohl-parloa/plan-executor/commit/68b2fc3395bcc7cd88d020d339e4d9b8b5b07e02))
 ## [0.19.13] - 2026-04-12
 
 ### Bug Fixes
