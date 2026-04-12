@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.19.8] - 2026-04-12
+
+### Bug Fixes
+
+- Size remote jobs columns from data, not terminal width ([cd29da1](https://github.com/andreas-pohl-parloa/plan-executor/commit/cd29da10ca06b436fe01ba20ccff37dffbbabc71))
 ## [0.19.7] - 2026-04-12
 
 ### Bug Fixes
