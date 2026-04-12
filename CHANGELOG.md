@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.19.11] - 2026-04-12
+
+### Bug Fixes
+
+- Log notification attempts and capture osascript errors ([2e15b25](https://github.com/andreas-pohl-parloa/plan-executor/commit/2e15b2504aafbdeb5e5a582af3a66bd2034170c2))
 ## [0.19.10] - 2026-04-12
 
 ### Bug Fixes
