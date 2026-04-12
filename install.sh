@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 BASE_DIR="$HOME/.plan-executor"
 LOG_FILE="$BASE_DIR/daemon.log"
 MARKER="# plan-executor"
@@ -155,13 +155,17 @@ _add_shell_hook() {
 
 _remove_shell_hook() {
     for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
-        [[ -f "$rc" ]] || continue
-        if grep -qF "plan-executor" "$rc" 2>/dev/null; then
+        [[ -e "$rc" ]] || continue
+        # Resolve symlinks so sed -i works
+        local real_rc
+        real_rc="$(readlink -f "$rc" 2>/dev/null || realpath "$rc" 2>/dev/null || echo "$rc")"
+        [[ -f "$real_rc" ]] || continue
+        if grep -qF "plan-executor" "$real_rc" 2>/dev/null; then
             sed -i.bak \
                 -e "/^$MARKER$/d" \
                 -e '/plan-executor ensure/d' \
-                "$rc"
-            rm -f "${rc}.bak"
+                "$real_rc"
+            rm -f "${real_rc}.bak"
             echo "Removed hook from $rc"
         fi
     done
