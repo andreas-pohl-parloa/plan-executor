@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.19.10] - 2026-04-12
+
+### Bug Fixes
+
+- Default RUST_LOG to plan_executor=info for daemon logging ([cc6b3b2](https://github.com/andreas-pohl-parloa/plan-executor/commit/cc6b3b289e21e521759703e4aa5badd93d603806))
 ## [0.19.9] - 2026-04-12
 
 ### Bug Fixes
