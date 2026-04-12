@@ -321,11 +321,21 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
                                 );
                             }
                         }
-                        Err(e) => tracing::error!(error = %e, "remote execution failed"),
+                        Err(e) => {
+                            tracing::error!(error = %e, "remote execution failed");
+                            let st = state.lock().await;
+                            let _ = st.event_tx.send(DaemonEvent::Error {
+                                message: format!("remote execution failed: {}", e),
+                            });
+                        }
                     }
                 }
                 Err(e) => {
                     tracing::error!(plan = %plan_path, error = %e, "remote execution: could not determine git context");
+                    let st = state.lock().await;
+                    let _ = st.event_tx.send(DaemonEvent::Error {
+                        message: format!("remote execution: could not determine git context: {}", e),
+                    });
                 }
             }
             let st = state.lock().await;
@@ -334,6 +344,10 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
             return;
         } else {
             tracing::error!("remote execution: remote_repo not configured");
+            let st = state.lock().await;
+            let _ = st.event_tx.send(DaemonEvent::Error {
+                message: "remote execution requires remote_repo — run 'plan-executor remote-setup'".to_string(),
+            });
         }
         return;
     }
