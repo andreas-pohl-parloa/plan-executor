@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.19.18] - 2026-04-15
+
+### Bug Fixes
+
+- Support SSH config aliases in git remote URL parsing ([26f4182](https://github.com/andreas-pohl-parloa/plan-executor/commit/26f4182c3d92d9e274a77585e8d2bea59e15cd8a))
 ## [0.19.17] - 2026-04-12
 
 ### Bug Fixes
