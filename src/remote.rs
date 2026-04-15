@@ -62,12 +62,20 @@ pub fn gather_git_context(repo_dir: &Path) -> Result<(String, String, String)> {
 /// Extracts `owner/repo` from a git remote URL.
 /// Supports HTTPS (`https://github.com/owner/repo.git`) and
 /// SSH (`git@github.com:owner/repo.git`) formats.
+/// Also handles SSH config aliases like `git@github.com-priv:owner/repo.git`
+/// (common for multi-key SSH setups via `~/.ssh/config` Host entries).
 pub fn parse_repo_slug(url: &str) -> Option<String> {
     let url = url.trim();
     let slug = if let Some(path) = url.strip_prefix("https://github.com/") {
         path.trim_end_matches(".git").to_string()
-    } else if let Some(path) = url.strip_prefix("git@github.com:") {
-        path.trim_end_matches(".git").to_string()
+    } else if let Some(rest) = url.strip_prefix("git@") {
+        // Match git@github.com:owner/repo or git@github.com-alias:owner/repo
+        let colon_pos = rest.find(':')?;
+        let host = &rest[..colon_pos];
+        if host != "github.com" && !host.starts_with("github.com-") {
+            return None;
+        }
+        rest[colon_pos + 1..].trim_end_matches(".git").to_string()
     } else {
         return None;
     };
@@ -516,6 +524,64 @@ mod tests {
         assert_eq!(parsed.target_repo, "owner/repo");
         assert_eq!(parsed.target_ref, "abc123");
         assert_eq!(parsed.plan_filename, "plan-foo.md");
+    }
+
+    #[test]
+    fn test_parse_repo_slug_https() {
+        assert_eq!(
+            parse_repo_slug("https://github.com/owner/repo.git"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_repo_slug_https_no_git_suffix() {
+        assert_eq!(
+            parse_repo_slug("https://github.com/owner/repo"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_repo_slug_ssh() {
+        assert_eq!(
+            parse_repo_slug("git@github.com:owner/repo.git"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_repo_slug_ssh_alias() {
+        assert_eq!(
+            parse_repo_slug("git@github.com-priv:apohl79/cycle-maps.git"),
+            Some("apohl79/cycle-maps".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_repo_slug_ssh_alias_no_git_suffix() {
+        assert_eq!(
+            parse_repo_slug("git@github.com-work:org/repo"),
+            Some("org/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_repo_slug_non_github_rejected() {
+        assert_eq!(parse_repo_slug("git@gitlab.com:owner/repo.git"), None);
+    }
+
+    #[test]
+    fn test_parse_repo_slug_traversal_rejected() {
+        assert_eq!(parse_repo_slug("git@github.com:../etc/passwd.git"), None);
+    }
+
+    #[test]
+    fn test_parse_repo_slug_whitespace_trimmed() {
+        assert_eq!(
+            parse_repo_slug("  git@github.com:owner/repo.git\n"),
+            Some("owner/repo".to_string())
+        );
     }
 
     #[test]
