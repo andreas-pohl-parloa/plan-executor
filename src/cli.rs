@@ -589,11 +589,13 @@ fn find_repo_root(path: &std::path::Path) -> Option<std::path::PathBuf> {
 
 /// Sends Execute to the daemon, waits just long enough to identify the new
 /// job ID, prints it, and returns immediately.  Use `plan-executor output -f
-/// <job-id>` to watch the live output.
+/// <job-id>` to watch the live output of local jobs.
 async fn execute_via_daemon(plan: PathBuf, _config: crate::config::Config) -> Result<()> {
     use crate::ipc::{DaemonEvent, TuiRequest};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
+
+    let is_remote = crate::plan::parse_execution_mode(&plan) == crate::plan::ExecutionMode::Remote;
 
     let stream = UnixStream::connect(crate::ipc::socket_path()).await
         .context("Daemon not reachable")?;
@@ -618,9 +620,10 @@ async fn execute_via_daemon(plan: PathBuf, _config: crate::config::Config) -> Re
 
     let filename = plan.file_name().and_then(|n| n.to_str()).unwrap_or("?");
 
-    // Wait briefly for the State event that includes the new job, so we can
-    // print the job ID.  Time-box to ~2 seconds to avoid hanging.
-    let timeout = tokio::time::sleep(std::time::Duration::from_secs(2));
+    // Remote plans need longer: creating branch + pushing files + opening PR via
+    // the GitHub API can take 10-20 seconds.  Local plans resolve in <1 second.
+    let timeout_secs = if is_remote { 30 } else { 2 };
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
     tokio::pin!(timeout);
 
     loop {
@@ -635,12 +638,10 @@ async fn execute_via_daemon(plan: PathBuf, _config: crate::config::Config) -> Re
                             let new_job = running_jobs.iter().chain(history.iter())
                                 .find(|j| !existing_ids.contains(&j.id));
                             if let Some(j) = new_job {
-                                let short_id = &j.id[..j.id.len().min(8)];
-                                let is_remote = j.remote_repo.is_some();
-                                if is_remote {
-                                    let pr_info = j.remote_pr.map(|n| format!(" PR #{}", n)).unwrap_or_default();
-                                    println!("Remote execution triggered (job {}).{}", short_id, pr_info);
+                                if let (Some(repo), Some(pr)) = (&j.remote_repo, j.remote_pr) {
+                                    println!("https://github.com/{}/pull/{}", repo, pr);
                                 } else {
+                                    let short_id = &j.id[..j.id.len().min(8)];
                                     println!("Queued {} (job {})", filename, short_id);
                                     println!("Watch: plan-executor output -f {}", short_id);
                                 }
@@ -656,8 +657,12 @@ async fn execute_via_daemon(plan: PathBuf, _config: crate::config::Config) -> Re
                 }
             }
             _ = &mut timeout => {
-                println!("Queued {}", filename);
-                println!("Watch: plan-executor output -f <job-id>");
+                if is_remote {
+                    eprintln!("Timed out waiting for PR creation. Check: plan-executor jobs");
+                } else {
+                    println!("Queued {}", filename);
+                    println!("Watch: plan-executor output -f <job-id>");
+                }
                 return Ok(());
             }
         }
