@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.19.20] - 2026-04-15
+
+### Miscellaneous
+
+- Remove leftover tmp execution files ([1f2b33f](https://github.com/andreas-pohl-parloa/plan-executor/commit/1f2b33fecd22bffafa973a05fe9c065e33d15f6c))
 ## [0.19.19] - 2026-04-15
 
 ### Bug Fixes
