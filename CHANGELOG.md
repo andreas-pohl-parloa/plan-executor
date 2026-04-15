@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.19.19] - 2026-04-15
+
+### Bug Fixes
+
+- Show PR URL instead of useless watch command for remote executions ([300e792](https://github.com/andreas-pohl-parloa/plan-executor/commit/300e7921864e3f70f686d128a682b34fcdcad98a))
 ## [0.19.18] - 2026-04-15
 
 ### Bug Fixes
