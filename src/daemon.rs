@@ -282,6 +282,25 @@ async fn poll_remote_executions(state: &Arc<Mutex<DaemonState>>) {
 pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str) {
     let plan = PathBuf::from(plan_path);
 
+    // Fail fast if the plan is not in READY state.
+    match crate::plan::parse_plan_status(&plan) {
+        Ok(status) if status != crate::plan::PlanStatus::Ready => {
+            let msg = format!("Plan status is {}, expected READY", status);
+            tracing::error!(plan = %plan_path, "{}", msg);
+            let st = state.lock().await;
+            let _ = st.event_tx.send(DaemonEvent::Error { message: msg });
+            return;
+        }
+        Err(e) => {
+            let msg = format!("Could not read plan status: {}", e);
+            tracing::error!(plan = %plan_path, "{}", msg);
+            let st = state.lock().await;
+            let _ = st.event_tx.send(DaemonEvent::Error { message: msg });
+            return;
+        }
+        _ => {} // READY — proceed
+    }
+
     // Route remote plans to GitHub PR trigger instead of local execution.
     if crate::plan::parse_execution_mode(&plan) == crate::plan::ExecutionMode::Remote {
         let config = { state.lock().await.config.clone() };
