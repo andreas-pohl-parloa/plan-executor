@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.20.1] - 2026-04-16
+
+### Bug Fixes
+
+- Add READY status check in daemon trigger_execution path ([0bb948d](https://github.com/andreas-pohl-parloa/plan-executor/commit/0bb948de0491d8a59611690356d9b30307a408e8))
 ## [0.20.0] - 2026-04-16
 
 ### Features
