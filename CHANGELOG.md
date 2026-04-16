@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.20.0] - 2026-04-16
+
+### Features
+
+- Fail fast on execute if plan status is not READY ([57f41c9](https://github.com/andreas-pohl-parloa/plan-executor/commit/57f41c99dc342a51a8194548598295d2623b5cd6))
 ## [0.19.20] - 2026-04-15
 
 ### Miscellaneous
