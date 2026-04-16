@@ -419,6 +419,12 @@ async fn execute_foreground(plan_path: String, config: crate::config::Config) ->
         return trigger_remote(resolved_path, config).await;
     }
 
+    // Fail fast if the plan is not in READY state.
+    let status = crate::plan::parse_plan_status(&resolved_path)?;
+    if status != crate::plan::PlanStatus::Ready {
+        anyhow::bail!("Plan status is {}, expected READY", status);
+    }
+
     let execution_root = find_repo_root(&resolved_path)
         .unwrap_or_else(|| resolved_path.parent().unwrap_or(&resolved_path).to_path_buf());
 
