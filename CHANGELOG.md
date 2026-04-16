@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.20.2] - 2026-04-16
+
+### Bug Fixes
+
+- Add READY status check to foreground execution path ([e276650](https://github.com/andreas-pohl-parloa/plan-executor/commit/e27665010bebd0230ee59450ee05706950436447))
 ## [0.20.1] - 2026-04-16
 
 ### Bug Fixes
