@@ -17,6 +17,18 @@ pub enum PlanStatus {
     Unknown(String),
 }
 
+impl std::fmt::Display for PlanStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PlanStatus::Ready => write!(f, "READY"),
+            PlanStatus::Wip => write!(f, "WIP"),
+            PlanStatus::Executing => write!(f, "EXECUTING"),
+            PlanStatus::Completed => write!(f, "COMPLETED"),
+            PlanStatus::Unknown(s) => write!(f, "{}", s),
+        }
+    }
+}
+
 impl PlanStatus {
     fn from_str(s: &str) -> Self {
         match s.trim().to_ascii_uppercase().as_str() {

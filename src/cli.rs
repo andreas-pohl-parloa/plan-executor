@@ -299,6 +299,12 @@ async fn execute_plan(plan_path: String, config: crate::config::Config) -> Resul
         anyhow::bail!("Plan file not found: {}", resolved_path);
     }
 
+    // Fail fast if the plan is not in READY state.
+    let status = crate::plan::parse_plan_status(&plan)?;
+    if status != crate::plan::PlanStatus::Ready {
+        anyhow::bail!("Plan status is {}, expected READY", status);
+    }
+
     // Both local and remote execution go through the daemon.
     if !crate::ipc::socket_path().exists() {
         anyhow::bail!("Daemon not running. Start with: plan-executor daemon");
