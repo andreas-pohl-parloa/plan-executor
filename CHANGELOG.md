@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.25.0] - 2026-04-17
+
+### Features
+
+- Show dimmed process sub-tree under running jobs ([a7c81e8](https://github.com/andreas-pohl-parloa/plan-executor/commit/a7c81e8e0016f95ef001a2a66858ba4f1bafa36b))
 ## [0.24.0] - 2026-04-17
 
 ### Features
