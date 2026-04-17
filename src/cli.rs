@@ -820,10 +820,16 @@ fn list_jobs() {
         let duration = job.duration_ms
             .map(|ms| format_duration(ms / 1000))
             .unwrap_or_else(|| "-".to_string());
-        println!(
+        let line = format!(
             "{:<id_w$}  {:<plan_w$}  {:<status_w$}  {:>dur_w$}",
             id, plan_display, status, duration,
         );
+        let is_running = matches!(job.status, JobStatus::Running | JobStatus::RemoteRunning);
+        if is_running {
+            println!("\x1b[33m{}\x1b[0m", line);
+        } else {
+            println!("{}", line);
+        }
     }
 
     // Show remote executions if remote_repo is configured
@@ -862,11 +868,16 @@ fn list_jobs() {
                         .duration_seconds
                         .map(format_duration)
                         .unwrap_or_else(|| "-".to_string());
-                    println!(
+                    let line = format!(
                         "#{:<width$}  {:<r_plan_w$}  {:<r_status_w$}  {:<r_target_w$}  {:>r_dur_w$}",
                         rj.number, plan_display, rj.status, target_display, duration,
                         width = pr_w - 1,
                     );
+                    if rj.status == "running" {
+                        println!("\x1b[33m{}\x1b[0m", line);
+                    } else {
+                        println!("{}", line);
+                    }
                 }
             }
             Ok(_) => {} // no remote jobs, don't print header
