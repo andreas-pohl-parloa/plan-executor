@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.29.0] - 2026-04-17
+
+### Features
+
+- Stream sub-agent output live in `output -f` ([e5edb5c](https://github.com/andreas-pohl-parloa/plan-executor/commit/e5edb5c6d7d2814ddaeded6dba8a2e9bf7fca973))
 ## [0.28.0] - 2026-04-17
 
 ### Features
