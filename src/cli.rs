@@ -78,15 +78,19 @@ fn print_display_line(line: &str) {
     }
 }
 
-/// Dim-indented prefix used to nest sub-agent output under the main
-/// agent's display. Keeps the context visible at a glance — any line
-/// wearing this prefix is coming from a spawned sub-agent.
-const SUBAGENT_PREFIX: &str = "\x1b[2m│  \x1b[0m";
+/// Dim-indented prefix used to nest one sub-agent's output under the
+/// main agent's display. The agent index is embedded in the prefix so
+/// that concurrent sub-agents (common on reviewer-team batches) are
+/// visually distinguishable at a glance.
+fn subagent_prefix(index: usize) -> String {
+    format!("\x1b[2m│{}│ \x1b[0m", index)
+}
 
 /// Renders one sub-agent's persisted JSONL output via sjv and prints
-/// each resulting visible line with `SUBAGENT_PREFIX`. Best-effort: if
-/// no file is found or reading fails, the function silently skips
-/// (sub-agent output is optional context, not critical signal).
+/// each resulting visible line with an indent prefix that carries the
+/// sub-agent index. Best-effort: if no file is found or reading fails,
+/// the function silently skips (sub-agent output is optional context,
+/// not critical signal).
 fn render_subagent_output(job_id: &str, dispatch: u32, index: usize) {
     use std::path::PathBuf;
     let base: PathBuf = crate::config::Config::base_dir()
@@ -95,6 +99,7 @@ fn render_subagent_output(job_id: &str, dispatch: u32, index: usize) {
         .join("sub-agents");
     let Ok(entries) = std::fs::read_dir(&base) else { return };
 
+    let prefix = subagent_prefix(index);
     let prefix_stdout = format!("dispatch-{}-agent-{}-", dispatch, index);
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
@@ -110,12 +115,12 @@ fn render_subagent_output(job_id: &str, dispatch: u32, index: usize) {
         let header = if is_stderr {
             format!(
                 "{}\x1b[2m─── sub-agent {} stderr ───\x1b[0m",
-                SUBAGENT_PREFIX, index,
+                prefix, index,
             )
         } else {
             format!(
                 "{}\x1b[2m─── sub-agent {} output ───\x1b[0m",
-                SUBAGENT_PREFIX, index,
+                prefix, index,
             )
         };
         println!("{}", header);
@@ -135,7 +140,7 @@ fn render_subagent_output(job_id: &str, dispatch: u32, index: usize) {
                 if visual.is_empty() {
                     continue;
                 }
-                println!("{}{}", SUBAGENT_PREFIX, visual);
+                println!("{}{}", prefix, visual);
             }
         }
     }
@@ -427,11 +432,13 @@ async fn output_job(job_id_prefix: String, follow: bool) -> Result<()> {
 }
 
 /// Renders one streamed sub-agent line in follow mode, using the same
-/// sjv pipeline and dim `│  ` indent prefix as the batch replay.
-fn render_subagent_live(_index: usize, is_stderr: bool, line: &str) {
+/// sjv pipeline and agent-indexed dim prefix as the batch replay so
+/// concurrent sub-agents interleave without losing attribution.
+fn render_subagent_live(index: usize, is_stderr: bool, line: &str) {
     if line.is_empty() {
         return;
     }
+    let prefix = subagent_prefix(index);
     let rendered = if is_stderr {
         format!("\x1b[2m{}\x1b[0m", line)
     } else {
@@ -441,7 +448,7 @@ fn render_subagent_live(_index: usize, is_stderr: bool, line: &str) {
         if visual.is_empty() {
             continue;
         }
-        println!("{}{}", SUBAGENT_PREFIX, visual);
+        println!("{}{}", prefix, visual);
     }
 }
 
