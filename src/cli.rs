@@ -97,6 +97,78 @@ fn truncate_str(s: &str, max: usize) -> String {
     }
 }
 
+/// Lists `(pid, command)` pairs for every process in `pgid`. Uses
+/// `ps -g <pgid> -o pid=,command=` which works on both macOS and Linux.
+/// Returns an empty vec on any ps failure.
+fn processes_in_pgid(pgid: u32) -> Vec<(u32, String)> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "pid=,command=", "-g", &pgid.to_string()])
+        .output();
+    let Ok(output) = output else { return Vec::new() };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|l| {
+            let trimmed = l.trim_start();
+            let (pid_str, cmd) = trimmed.split_once(char::is_whitespace)?;
+            let pid = pid_str.parse::<u32>().ok()?;
+            Some((pid, cmd.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Prints a dimmed sub-tree of process groups and PIDs under a running
+/// job. Emits nothing if the job has no tracked pgids or no live processes.
+fn render_job_process_tree(procs: &crate::ipc::JobProcesses, term_w: usize) {
+    const DIM: &str = "\x1b[2m";
+    const RESET: &str = "\x1b[0m";
+
+    let mut groups: Vec<(&str, u32)> = Vec::new();
+    if let Some(pgid) = procs.main_pgid {
+        groups.push(("main", pgid));
+    }
+    for pgid in &procs.sub_agent_pgids {
+        groups.push(("sub-agent", *pgid));
+    }
+    if groups.is_empty() {
+        return;
+    }
+
+    let resolved: Vec<(&str, u32, Vec<(u32, String)>)> = groups
+        .into_iter()
+        .map(|(label, pgid)| (label, pgid, processes_in_pgid(pgid)))
+        .filter(|(_, _, procs)| !procs.is_empty())
+        .collect();
+    if resolved.is_empty() {
+        return;
+    }
+
+    for (gi, (label, pgid, processes)) in resolved.iter().enumerate() {
+        let is_last_group = gi == resolved.len() - 1;
+        let group_branch = if is_last_group { "└─" } else { "├─" };
+        println!(
+            "{}  {} {} pgroup {}{}",
+            DIM, group_branch, label, pgid, RESET
+        );
+        let spine = if is_last_group { " " } else { "│" };
+        for (pi, (pid, cmd)) in processes.iter().enumerate() {
+            let is_last_proc = pi == processes.len() - 1;
+            let proc_branch = if is_last_proc { "└─" } else { "├─" };
+            // 2 spaces + spine + 2 spaces + branch (2) + space + pid + space
+            let pid_str = pid.to_string();
+            let fixed = 2 + 1 + 2 + 2 + 1 + pid_str.len() + 1;
+            let max_cmd = term_w.saturating_sub(fixed).max(20);
+            let cmd_display = truncate_str(cmd, max_cmd);
+            println!(
+                "{}  {}  {} {} {}{}",
+                DIM, spine, proc_branch, pid_str, cmd_display, RESET
+            );
+        }
+    }
+}
+
 /// Formats a duration in seconds as a compact two-unit string:
 ///   <60s     → "45s"
 ///   <60m     → "12m34s"
@@ -778,13 +850,20 @@ fn list_jobs() {
     let mut line = String::new();
     let _ = reader.read_line(&mut line);
 
-    let jobs = if let Ok(DaemonEvent::State { running_jobs, history, .. }) = serde_json::from_str::<DaemonEvent>(&line) {
-        let jobs: Vec<JobMetadata> = running_jobs.into_iter().chain(history).collect();
-        jobs
-    } else {
-        eprintln!("Unexpected response from daemon.");
-        std::process::exit(1);
-    };
+    let (jobs, job_processes): (Vec<JobMetadata>, std::collections::HashMap<String, crate::ipc::JobProcesses>) =
+        if let Ok(DaemonEvent::State { running_jobs, history, running_processes, .. }) =
+            serde_json::from_str::<DaemonEvent>(&line)
+        {
+            let jobs: Vec<JobMetadata> = running_jobs.into_iter().chain(history).collect();
+            let map: std::collections::HashMap<_, _> = running_processes
+                .into_iter()
+                .map(|p| (p.job_id.clone(), p))
+                .collect();
+            (jobs, map)
+        } else {
+            eprintln!("Unexpected response from daemon.");
+            std::process::exit(1);
+        };
 
     if jobs.is_empty() {
         println!("No jobs found.");
@@ -829,6 +908,11 @@ fn list_jobs() {
             println!("\x1b[33m{}\x1b[0m", line);
         } else {
             println!("{}", line);
+        }
+        if matches!(job.status, JobStatus::Running) {
+            if let Some(procs) = job_processes.get(&job.id) {
+                render_job_process_tree(procs, term_w);
+            }
         }
     }
 

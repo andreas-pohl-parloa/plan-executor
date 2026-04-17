@@ -29,6 +29,18 @@ pub enum TuiRequest {
     TrackRemote { plan_path: String, remote_repo: String, pr_number: u64 },
 }
 
+/// Live process-group info for a locally running job. Empty for remote jobs.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct JobProcesses {
+    pub job_id: String,
+    /// Main orchestrator agent's PGID; `None` if not tracked.
+    #[serde(default)]
+    pub main_pgid: Option<u32>,
+    /// PGIDs for every currently-dispatched sub-agent.
+    #[serde(default)]
+    pub sub_agent_pgids: Vec<u32>,
+}
+
 /// Messages sent from Daemon → TUI
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -40,6 +52,10 @@ pub enum DaemonEvent {
         /// IDs of jobs currently paused at a handoff
         #[serde(default)]
         paused_job_ids: Vec<String>,
+        /// Live process-group info for each running local job. Defaulted
+        /// to empty for backwards-compat with older daemons.
+        #[serde(default)]
+        running_processes: Vec<JobProcesses>,
     },
     /// A job's output line arrived
     JobOutput { job_id: String, line: String },

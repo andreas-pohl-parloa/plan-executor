@@ -132,10 +132,24 @@ fn append_display(job_id: &str, line: &str) {
 
 impl DaemonState {
     pub fn snapshot_state(&self) -> DaemonEvent {
+        let running_processes = self
+            .running_jobs
+            .keys()
+            .map(|job_id| crate::ipc::JobProcesses {
+                job_id: job_id.clone(),
+                main_pgid: self.process_group_ids.get(job_id).copied(),
+                sub_agent_pgids: self
+                    .sub_agent_pgids
+                    .get(job_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect();
         DaemonEvent::State {
             running_jobs: self.running_jobs.values().cloned().collect(),
             history: self.history.clone(),
             paused_job_ids: self.paused_jobs.iter().cloned().collect(),
+            running_processes,
         }
     }
 }
