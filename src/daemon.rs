@@ -267,21 +267,20 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
     }
 }
 
-/// Spawns a background heartbeat task that bumps `job_last_activity` for
-/// `job_id` every 30 seconds until the job leaves `running_jobs` or the
-/// task is aborted. Used to cover the gap when a non-bash sub-agent
-/// (Claude/Codex/Gemini) is running and produces no event stream. Bash
-/// sub-agents stream via `live_task`, so heartbeats there are redundant
-/// but harmless.
-fn spawn_sub_agent_heartbeat(
+/// Consumes per-line activity ticks from `handoff::dispatch_all` and
+/// stamps `job_last_activity` on each one. The channel closes when the
+/// last sender is dropped (after `dispatch_all` returns and every
+/// streaming reader finishes), at which point the task exits. A truly
+/// hung sub-agent emits no lines → no ticks → stall timer is free to
+/// run. This replaces the earlier blind 30-second heartbeat, which
+/// masked hangs by stamping regardless of actual sub-agent progress.
+fn spawn_activity_receiver(
     state: Arc<Mutex<DaemonState>>,
     job_id: String,
+    mut activity_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        interval.tick().await; // consume immediate tick
-        loop {
-            interval.tick().await;
+        while activity_rx.recv().await.is_some() {
             let mut st = state.lock().await;
             if !st.running_jobs.contains_key(&job_id) {
                 break;
@@ -776,11 +775,6 @@ pub async fn retry_handoff_from_state(
             }
         });
 
-        let heartbeat = spawn_sub_agent_heartbeat(
-            Arc::clone(&state_clone),
-            job_id_full.clone(),
-        );
-
         // Reset sub_agent_pgids for this batch and start a registration
         // task so each sub-agent's pgid lands in DaemonState the instant
         // it spawns. A KillJob arriving mid-dispatch can then SIGKILL
@@ -797,6 +791,16 @@ pub async fn retry_handoff_from_state(
             pgid_rx,
         );
 
+        // Activity receiver stamps job_last_activity once per sub-agent
+        // JSONL line. Replaces the old blind 30s heartbeat so a hung
+        // sub-agent actually trips the stall timer.
+        let (activity_tx, activity_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let act_task = spawn_activity_receiver(
+            Arc::clone(&state_clone),
+            job_id_full.clone(),
+            activity_rx,
+        );
+
         let (results, sub_pgids) = handoff::dispatch_all(
             state_data.handoffs,
             &agents.claude,
@@ -805,10 +809,11 @@ pub async fn retry_handoff_from_state(
             &agents.bash,
             Some(live_tx),
             Some(pgid_tx),
+            Some(activity_tx),
         ).await;
-        heartbeat.abort();
         let _ = live_task.await;
         let _ = reg_task.await;
+        let _ = act_task.await;
 
         // If the job was killed while dispatch_all was suspended, bail
         // out now instead of proceeding to resume_execution (which would
@@ -1029,11 +1034,6 @@ async fn run_exec_event_loop(
                         }
                     });
 
-                    let heartbeat = spawn_sub_agent_heartbeat(
-                        Arc::clone(&state),
-                        job_id.clone(),
-                    );
-
                     // Reset sub_agent_pgids for this batch and start a
                     // registration task so a KillJob arriving mid-dispatch
                     // can SIGKILL every sub-agent pgroup.
@@ -1048,6 +1048,16 @@ async fn run_exec_event_loop(
                         pgid_rx,
                     );
 
+                    // Activity receiver stamps job_last_activity per
+                    // sub-agent JSONL line. Replaces the old heartbeat
+                    // so a hung sub-agent trips the stall timer.
+                    let (activity_tx, activity_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                    let act_task = spawn_activity_receiver(
+                        Arc::clone(&state),
+                        job_id.clone(),
+                        activity_rx,
+                    );
+
                     let (results, sub_pgids) = handoff::dispatch_all(
                         state_data.handoffs,
                         &agents.claude,
@@ -1056,10 +1066,11 @@ async fn run_exec_event_loop(
                         &agents.bash,
                         Some(live_tx),
                         Some(pgid_tx),
+                        Some(activity_tx),
                     ).await;
-                    heartbeat.abort();
                     let _ = live_task.await;
                     let _ = reg_task.await;
+                    let _ = act_task.await;
 
                     // If the job was killed during dispatch, bail out.
                     {

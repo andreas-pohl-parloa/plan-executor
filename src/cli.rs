@@ -567,7 +567,8 @@ async fn execute_foreground(plan_path: String, config: crate::config::Config) ->
                         &config.agents.gemini,
                         &config.agents.bash,
                         Some(live_tx),
-                        None, // CLI foreground path has no daemon state to register pgids into
+                        None, // no pgid tracking in foreground path
+                        None, // no watchdog in foreground path
                     ).await;
                     let _ = live_task.await;
 

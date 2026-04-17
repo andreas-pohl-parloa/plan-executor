@@ -193,11 +193,105 @@ pub fn load_state(state_file: &Path) -> Result<HandoffState> {
 /// Dispatches a single agent. For bash agents with a `live_tx`, stdout/stderr
 /// are streamed line-by-line through the channel for live display instead of
 /// being captured silently.
+/// Injects the per-agent flag that turns on line-by-line JSONL output so
+/// the daemon watchdog can observe true sub-agent liveness. No-op when
+/// the flag is already present (operator override via config). Called by
+/// `dispatch_agent` before the prompt-file path is appended to `args`.
+///
+/// Placement is agent-specific:
+///  * Claude / Gemini — `--output-format stream-json` is a top-level flag,
+///    inserted before `-p`/`--prompt` (which consumes the next arg).
+///    Claude additionally needs `--verbose` to emit full events under
+///    stream-json.
+///  * Codex           — `--json` is a subcommand flag on `exec`, appended
+///    after the existing template so it sits right before the prompt
+///    path.
+///  * Bash            — no-op; bash sub-agents already stream raw stdout.
+fn inject_streaming_flags(agent_type: &AgentType, args: &mut Vec<String>) {
+    match agent_type {
+        AgentType::Claude => {
+            let has_output_format = args.iter().any(|a| a == "--output-format");
+            let has_verbose = args.iter().any(|a| a == "--verbose");
+            // Insert before any `-p`/`--prompt` so it doesn't get consumed
+            // by the prompt flag as its value.
+            let pos = args
+                .iter()
+                .position(|a| a == "-p" || a == "--prompt")
+                .unwrap_or(args.len());
+            let mut insert_at = pos;
+            if !has_output_format {
+                args.insert(insert_at, "--output-format".to_string());
+                insert_at += 1;
+                args.insert(insert_at, "stream-json".to_string());
+                insert_at += 1;
+            }
+            if !has_verbose {
+                args.insert(insert_at, "--verbose".to_string());
+            }
+        }
+        AgentType::Codex => {
+            if !args.iter().any(|a| a == "--json") {
+                args.push("--json".to_string());
+            }
+        }
+        AgentType::Gemini => {
+            let has_output_format = args
+                .iter()
+                .any(|a| a == "-o" || a == "--output-format");
+            if !has_output_format {
+                let pos = args
+                    .iter()
+                    .position(|a| a == "-p" || a == "--prompt")
+                    .unwrap_or(args.len());
+                args.insert(pos, "stream-json".to_string());
+                args.insert(pos, "-o".to_string());
+            }
+        }
+        AgentType::Bash => {}
+    }
+}
+
+/// Scans a JSONL stream (Claude `--output-format stream-json`, Codex
+/// `--json`, Gemini `-o stream-json`) for the agent's terminal result
+/// message and returns its text. Returns `None` when no recognizable
+/// result event is found — caller should fall back to the raw stdout
+/// concatenation.
+///
+/// Recognized shapes (newest-to-oldest, first match wins):
+///  * Claude / Gemini stream-json — `{"type":"result","result":"..."}`.
+///  * Codex `--json`              — `{"msg":{"type":"agent_message",
+///    "message":"..."}}`. The final agent_message event contains the
+///    model's last text response.
+fn extract_result_text(lines: &[String]) -> Option<String> {
+    for line in lines.iter().rev() {
+        let parsed: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // Claude / Gemini stream-json terminal event.
+        if parsed.get("type").and_then(|v| v.as_str()) == Some("result") {
+            if let Some(text) = parsed.get("result").and_then(|v| v.as_str()) {
+                return Some(text.to_string());
+            }
+        }
+        // Codex --json terminal event.
+        if let Some(msg) = parsed.get("msg") {
+            if msg.get("type").and_then(|v| v.as_str()) == Some("agent_message") {
+                if let Some(text) = msg.get("message").and_then(|v| v.as_str()) {
+                    return Some(text.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 async fn dispatch_agent(
     handoff: Handoff,
     cmd: String,
     live_tx: Option<mpsc::Sender<(usize, String)>>,
     pgid_tx: Option<mpsc::UnboundedSender<u32>>,
+    activity_tx: Option<mpsc::UnboundedSender<()>>,
 ) -> (HandoffResult, u32) {
     let path = handoff.prompt_file.to_string_lossy().into_owned();
     let can_fail = handoff.can_fail;
@@ -216,6 +310,7 @@ async fn dispatch_agent(
     }
 
     let (program, mut args) = crate::config::Config::parse_cmd(&cmd);
+    inject_streaming_flags(&handoff.agent_type, &mut args);
     args.push(path.clone());
 
     let child_result = {
@@ -252,20 +347,23 @@ async fn dispatch_agent(
         }
     }
 
-    // Bash agents with a live channel: stream stdout/stderr in real-time.
-    // The continuation payload for bash is just the exit status.
+    // Bash agents with a live channel: stream stdout/stderr in real-time
+    // for display. The continuation payload for bash is just the exit
+    // status.
     if is_bash && live_tx.is_some() {
         let tx = live_tx.unwrap();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
         let tx_out = tx.clone();
+        let act_out = activity_tx.clone();
         let stdout_handle = tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
             let mut lines = Vec::new();
             if let Some(out) = stdout {
                 let mut reader = BufReader::new(out).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
+                    if let Some(ref a) = act_out { let _ = a.send(()); }
                     let _ = tx_out.send((index, line.clone())).await;
                     lines.push(line);
                 }
@@ -274,12 +372,14 @@ async fn dispatch_agent(
         });
 
         let tx_err = tx;
+        let act_err = activity_tx.clone();
         let stderr_handle = tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
             let mut lines = Vec::new();
             if let Some(err) = stderr {
                 let mut reader = BufReader::new(err).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
+                    if let Some(ref a) = act_err { let _ = a.send(()); }
                     let _ = tx_err.send((index, line.clone())).await;
                     lines.push(line);
                 }
@@ -295,35 +395,67 @@ async fn dispatch_agent(
         return (HandoffResult { index, stdout: stdout_str, stderr: stderr_str, success, can_fail }, pgid);
     }
 
-    // Default path: capture stdout/stderr silently.
-    let output = child.wait_with_output().await;
+    // Non-bash JSONL streaming path. Every stdout/stderr line is read as
+    // it arrives so the daemon can stamp `job_last_activity` per tick —
+    // that's what the watchdog now relies on instead of the old blind
+    // heartbeat. The final continuation payload is extracted from the
+    // JSONL `result` event (see extract_result_text); raw stdout
+    // concatenation is the fallback when no recognizable result event
+    // appears (non-JSONL agent, malformed stream, etc.).
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
 
-    let result = match output {
-        Ok(out) => HandoffResult {
-            index,
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-            success: out.status.success(),
-            can_fail,
-        },
-        Err(e) => HandoffResult {
-            index,
-            stdout: String::new(),
-            stderr: format!("failed waiting for agent: {}", e),
-            success: false,
-            can_fail,
-        },
-    };
-    (result, pgid)
+    let act_out = activity_tx.clone();
+    let stdout_handle = tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut lines: Vec<String> = Vec::new();
+        if let Some(out) = stdout {
+            let mut reader = BufReader::new(out).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                if let Some(ref a) = act_out { let _ = a.send(()); }
+                lines.push(line);
+            }
+        }
+        lines
+    });
+
+    let act_err = activity_tx.clone();
+    let stderr_handle = tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut lines: Vec<String> = Vec::new();
+        if let Some(err) = stderr {
+            let mut reader = BufReader::new(err).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                if let Some(ref a) = act_err { let _ = a.send(()); }
+                lines.push(line);
+            }
+        }
+        lines
+    });
+
+    let status = child.wait().await;
+    let stdout_lines = stdout_handle.await.unwrap_or_default();
+    let stderr_lines = stderr_handle.await.unwrap_or_default();
+    let success = status.map(|s| s.success()).unwrap_or(false);
+
+    let stdout_str = extract_result_text(&stdout_lines)
+        .unwrap_or_else(|| stdout_lines.join("\n"));
+    let stderr_str = stderr_lines.join("\n");
+
+    (HandoffResult { index, stdout: stdout_str, stderr: stderr_str, success, can_fail }, pgid)
 }
 
 /// Dispatches all handoffs in a batch concurrently. Returns results sorted by index and PGIDs.
 ///
-/// `live_tx` streams (agent_index, line) for bash agents' live output.
+/// `live_tx` streams (agent_index, line) for bash agents' live output to
+/// the daemon's display buffer.
 /// `pgid_tx` (if provided) receives each sub-agent's pgid the instant it is
-/// spawned — before the await on child output. This lets the daemon track
-/// in-flight sub-agents and SIGKILL their process groups if a KillJob
-/// arrives while this function is still suspended.
+/// spawned — before the await on child output — so an in-flight KillJob
+/// can SIGKILL the sub-agent process groups.
+/// `activity_tx` (if provided) receives one tick per stdout/stderr line
+/// from any sub-agent. The daemon uses this to stamp `job_last_activity`
+/// so the watchdog treats each emitted JSONL event as liveness — real
+/// sub-agent progress rather than a blind timer.
 pub async fn dispatch_all(
     handoffs: Vec<Handoff>,
     claude_cmd: &str,
@@ -332,6 +464,7 @@ pub async fn dispatch_all(
     bash_cmd: &str,
     live_tx: Option<mpsc::Sender<(usize, String)>>,
     pgid_tx: Option<mpsc::UnboundedSender<u32>>,
+    activity_tx: Option<mpsc::UnboundedSender<()>>,
 ) -> (Vec<HandoffResult>, Vec<u32>) {
     let handles: Vec<_> = handoffs.into_iter()
         .map(|h| {
@@ -343,7 +476,8 @@ pub async fn dispatch_all(
             };
             let tx = if matches!(h.agent_type, AgentType::Bash) { live_tx.clone() } else { None };
             let pg_tx = pgid_tx.clone();
-            tokio::spawn(dispatch_agent(h, cmd, tx, pg_tx))
+            let act_tx = activity_tx.clone();
+            tokio::spawn(dispatch_agent(h, cmd, tx, pg_tx, act_tx))
         })
         .collect();
     let mut results = Vec::new();
@@ -625,5 +759,107 @@ mod tests {
         assert!(matches!(state.handoffs[0].agent_type, AgentType::Claude));
         assert!(matches!(state.handoffs[1].agent_type, AgentType::Codex));
         assert!(matches!(state.handoffs[2].agent_type, AgentType::Gemini));
+    }
+
+    #[test]
+    fn inject_streaming_flags_claude_inserts_before_prompt() {
+        let mut args = vec![
+            "--dangerously-skip-permissions".to_string(),
+            "-p".to_string(),
+        ];
+        inject_streaming_flags(&AgentType::Claude, &mut args);
+        assert_eq!(
+            args,
+            vec![
+                "--dangerously-skip-permissions",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "-p",
+            ]
+        );
+    }
+
+    #[test]
+    fn inject_streaming_flags_claude_is_idempotent() {
+        let mut args = vec![
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
+            "-p".to_string(),
+        ];
+        let before = args.clone();
+        inject_streaming_flags(&AgentType::Claude, &mut args);
+        assert_eq!(args, before);
+    }
+
+    #[test]
+    fn inject_streaming_flags_codex_appends_json() {
+        let mut args = vec![
+            "--dangerously-bypass-approvals-and-sandbox".to_string(),
+            "exec".to_string(),
+        ];
+        inject_streaming_flags(&AgentType::Codex, &mut args);
+        assert_eq!(
+            args,
+            vec![
+                "--dangerously-bypass-approvals-and-sandbox",
+                "exec",
+                "--json",
+            ]
+        );
+    }
+
+    #[test]
+    fn inject_streaming_flags_gemini_inserts_before_prompt() {
+        let mut args = vec!["--yolo".to_string(), "-p".to_string()];
+        inject_streaming_flags(&AgentType::Gemini, &mut args);
+        assert_eq!(args, vec!["--yolo", "-o", "stream-json", "-p"]);
+    }
+
+    #[test]
+    fn inject_streaming_flags_bash_is_noop() {
+        let mut args = vec!["-c".to_string()];
+        let before = args.clone();
+        inject_streaming_flags(&AgentType::Bash, &mut args);
+        assert_eq!(args, before);
+    }
+
+    #[test]
+    fn extract_result_text_finds_claude_result_event() {
+        let lines = vec![
+            r#"{"type":"system","subtype":"init"}"#.to_string(),
+            r#"{"type":"assistant","message":{"content":[]}}"#.to_string(),
+            r#"{"type":"result","subtype":"success","result":"final text"}"#.to_string(),
+        ];
+        assert_eq!(extract_result_text(&lines), Some("final text".to_string()));
+    }
+
+    #[test]
+    fn extract_result_text_finds_codex_agent_message() {
+        let lines = vec![
+            r#"{"id":"1","msg":{"type":"some_other"}}"#.to_string(),
+            r#"{"id":"2","msg":{"type":"agent_message","message":"codex final"}}"#.to_string(),
+        ];
+        assert_eq!(extract_result_text(&lines), Some("codex final".to_string()));
+    }
+
+    #[test]
+    fn extract_result_text_prefers_last_result_event() {
+        // Scans newest-first; the last line wins.
+        let lines = vec![
+            r#"{"type":"result","result":"first"}"#.to_string(),
+            r#"{"type":"result","result":"second"}"#.to_string(),
+        ];
+        assert_eq!(extract_result_text(&lines), Some("second".to_string()));
+    }
+
+    #[test]
+    fn extract_result_text_returns_none_on_no_recognized_event() {
+        let lines = vec![
+            r#"{"type":"assistant","message":{"content":"nope"}}"#.to_string(),
+            r#"plain text not json"#.to_string(),
+        ];
+        assert_eq!(extract_result_text(&lines), None);
     }
 }
