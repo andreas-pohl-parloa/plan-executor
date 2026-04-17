@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.27.0] - 2026-04-17
+
+### Features
+
+- Show last activity column for running jobs ([178e327](https://github.com/andreas-pohl-parloa/plan-executor/commit/178e327b0117c3c7bc92826e9aac6a75885f65b7))
 ## [0.26.1] - 2026-04-17
 
 ### Bug Fixes
