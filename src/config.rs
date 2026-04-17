@@ -66,6 +66,17 @@ pub struct Config {
     /// Set via `plan-executor remote-setup`.
     #[serde(default)]
     pub remote_repo: Option<String>,
+    /// Watchdog: a job that emits no events for this many seconds is killed
+    /// and marked Failed. A hung sub-agent (e.g. a Bash script stuck in
+    /// `wait`) will stop producing output, so this is the primary liveness
+    /// signal. Default: 900 (15 min).
+    #[serde(default = "Config::default_stall_timeout_seconds")]
+    pub stall_timeout_seconds: u64,
+    /// Watchdog: absolute ceiling on total job runtime regardless of
+    /// activity. Caps genuinely long runs that never go idle. Default:
+    /// 10800 (3h).
+    #[serde(default = "Config::default_hard_cap_seconds")]
+    pub hard_cap_seconds: u64,
 }
 
 impl Default for Config {
@@ -73,11 +84,16 @@ impl Default for Config {
         Self {
             agents: AgentConfig::default(),
             remote_repo: None,
+            stall_timeout_seconds: Self::default_stall_timeout_seconds(),
+            hard_cap_seconds: Self::default_hard_cap_seconds(),
         }
     }
 }
 
 impl Config {
+    fn default_stall_timeout_seconds() -> u64 { 900 }
+    fn default_hard_cap_seconds() -> u64 { 10_800 }
+
     /// Returns the base directory: `~/.plan-executor/`
     pub fn base_dir() -> PathBuf {
         dirs::home_dir()
@@ -148,6 +164,47 @@ impl Config {
     }
 }
 
+/// Watchdog decision for a single running job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchdogVerdict {
+    /// Job is healthy — recent activity and within the hard cap.
+    Ok,
+    /// No event for longer than `stall_timeout`.
+    Stalled { silent_seconds: u64 },
+    /// Total runtime exceeded `hard_cap`.
+    HardCapped { total_seconds: u64 },
+}
+
+/// Pure decision function: given timing inputs, decide whether to kill a job.
+///
+/// HardCapped wins over Stalled when both apply (a job that's been silent for
+/// hours is also over the hard cap; we report the more severe reason).
+/// Thresholds of 0 disable the corresponding check — useful for tests and
+/// intentional opt-out.
+pub fn watchdog_verdict(
+    now_since_start: std::time::Duration,
+    now_since_last_activity: std::time::Duration,
+    stall_timeout: std::time::Duration,
+    hard_cap: std::time::Duration,
+) -> WatchdogVerdict {
+    let over_hard_cap =
+        !hard_cap.is_zero() && now_since_start >= hard_cap;
+    let stalled =
+        !stall_timeout.is_zero() && now_since_last_activity >= stall_timeout;
+
+    if over_hard_cap {
+        WatchdogVerdict::HardCapped {
+            total_seconds: now_since_start.as_secs(),
+        }
+    } else if stalled {
+        WatchdogVerdict::Stalled {
+            silent_seconds: now_since_last_activity.as_secs(),
+        }
+    } else {
+        WatchdogVerdict::Ok
+    }
+}
+
 /// Expands a leading `~/` to the home directory.
 pub fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
@@ -209,5 +266,100 @@ mod tests {
         let json = r#"{}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.remote_repo.is_none());
+    }
+
+    #[test]
+    fn test_config_watchdog_defaults_when_absent() {
+        let json = r#"{}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.stall_timeout_seconds, 900);
+        assert_eq!(config.hard_cap_seconds, 10_800);
+    }
+
+    #[test]
+    fn test_config_watchdog_overrides() {
+        let json = r#"{"stall_timeout_seconds": 60, "hard_cap_seconds": 300}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.stall_timeout_seconds, 60);
+        assert_eq!(config.hard_cap_seconds, 300);
+    }
+
+    use std::time::Duration;
+
+    #[test]
+    fn test_watchdog_healthy_job_within_thresholds() {
+        let verdict = watchdog_verdict(
+            Duration::from_secs(120),
+            Duration::from_secs(5),
+            Duration::from_secs(900),
+            Duration::from_secs(10_800),
+        );
+        assert_eq!(verdict, WatchdogVerdict::Ok);
+    }
+
+    #[test]
+    fn test_watchdog_detects_stall_exactly_at_threshold() {
+        let verdict = watchdog_verdict(
+            Duration::from_secs(901),
+            Duration::from_secs(900),
+            Duration::from_secs(900),
+            Duration::from_secs(10_800),
+        );
+        assert_eq!(
+            verdict,
+            WatchdogVerdict::Stalled { silent_seconds: 900 }
+        );
+    }
+
+    #[test]
+    fn test_watchdog_detects_stall_just_below_threshold_is_ok() {
+        let verdict = watchdog_verdict(
+            Duration::from_secs(900),
+            Duration::from_secs(899),
+            Duration::from_secs(900),
+            Duration::from_secs(10_800),
+        );
+        assert_eq!(verdict, WatchdogVerdict::Ok);
+    }
+
+    #[test]
+    fn test_watchdog_hard_cap_wins_over_stall() {
+        // Both conditions true — hard cap reported for severity.
+        let verdict = watchdog_verdict(
+            Duration::from_secs(11_000),
+            Duration::from_secs(5_000),
+            Duration::from_secs(900),
+            Duration::from_secs(10_800),
+        );
+        assert_eq!(
+            verdict,
+            WatchdogVerdict::HardCapped { total_seconds: 11_000 }
+        );
+    }
+
+    #[test]
+    fn test_watchdog_hard_cap_fires_even_with_recent_activity() {
+        let verdict = watchdog_verdict(
+            Duration::from_secs(10_800),
+            Duration::from_secs(1),
+            Duration::from_secs(900),
+            Duration::from_secs(10_800),
+        );
+        assert_eq!(
+            verdict,
+            WatchdogVerdict::HardCapped { total_seconds: 10_800 }
+        );
+    }
+
+    #[test]
+    fn test_watchdog_zero_thresholds_disable_checks() {
+        // A job idle and running forever is Ok if both thresholds are 0.
+        let verdict = watchdog_verdict(
+            Duration::from_secs(999_999),
+            Duration::from_secs(999_999),
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+        );
+        assert_eq!(verdict, WatchdogVerdict::Ok);
     }
 }

@@ -2,12 +2,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, Mutex};
 use tokio::time::Duration;
 use anyhow::Result;
 
-use crate::config::Config;
+use crate::config::{watchdog_verdict, Config, WatchdogVerdict};
 use crate::executor::{spawn_execution, ExecEvent};
 use crate::handoff;
 use crate::ipc::{socket_path, DaemonEvent, TuiRequest};
@@ -30,6 +31,16 @@ pub struct DaemonState {
     pub process_group_ids: HashMap<String, u32>,
     /// Process group IDs for active handoff sub-agent processes (job_id → [PGID, ...])
     pub sub_agent_pgids: HashMap<String, Vec<u32>>,
+    /// Wall-clock timestamp of the most recent liveness event (output,
+    /// display, handoff, sub-agent stream) seen for a running job. Used by
+    /// the watchdog to detect hung jobs. Missing entry = no stall baseline,
+    /// so only the hard-cap check applies for this tick.
+    pub job_last_activity: HashMap<String, Instant>,
+    /// Monotonic-clock start timestamp per running job, used by the
+    /// watchdog to compute `since_start` without being fooled by wall-clock
+    /// jumps (NTP step, VM suspend/resume). Populated at job start and
+    /// removed on finalization.
+    pub job_started_at_monotonic: HashMap<String, Instant>,
     /// Jobs currently paused at a handoff — sub-agents held until ResumeJob
     pub paused_jobs: std::collections::HashSet<String>,
     /// Remote executions being monitored: plan_path → (remote_repo, pr_number)
@@ -176,6 +187,8 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
         running_children: HashMap::new(),
         process_group_ids: HashMap::new(),
         sub_agent_pgids: HashMap::new(),
+        job_last_activity: HashMap::new(),
+        job_started_at_monotonic: HashMap::new(),
         paused_jobs: std::collections::HashSet::new(),
         remote_executions: HashMap::new(),
         event_tx: event_tx.clone(),
@@ -210,6 +223,14 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
     let mut remote_interval = tokio::time::interval(Duration::from_secs(30));
     remote_interval.tick().await; // consume immediate tick
 
+    // Watchdog (check every 60 seconds). Cause-agnostic liveness guard:
+    // kills any local running job that has emitted no events for
+    // stall_timeout_seconds, or whose total runtime exceeds
+    // hard_cap_seconds. Remote jobs have no tracked process group and are
+    // intentionally skipped.
+    let mut watchdog_interval = tokio::time::interval(Duration::from_secs(60));
+    watchdog_interval.tick().await;
+
     loop {
         tokio::select! {
             // New client connection
@@ -223,6 +244,201 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
             _ = remote_interval.tick() => {
                 poll_remote_executions(&state).await;
             }
+
+            // Watchdog for hung local jobs
+            _ = watchdog_interval.tick() => {
+                watchdog_check(&state).await;
+            }
+        }
+    }
+}
+
+/// Spawns a background heartbeat task that bumps `job_last_activity` for
+/// `job_id` every 30 seconds until the job leaves `running_jobs` or the
+/// task is aborted. Used to cover the gap when a non-bash sub-agent
+/// (Claude/Codex/Gemini) is running and produces no event stream. Bash
+/// sub-agents stream via `live_task`, so heartbeats there are redundant
+/// but harmless.
+fn spawn_sub_agent_heartbeat(
+    state: Arc<Mutex<DaemonState>>,
+    job_id: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.tick().await; // consume immediate tick
+        loop {
+            interval.tick().await;
+            let mut st = state.lock().await;
+            if !st.running_jobs.contains_key(&job_id) {
+                break;
+            }
+            st.job_last_activity.insert(job_id.clone(), Instant::now());
+        }
+    })
+}
+
+/// Sends SIGKILL to a job's main process group, all active sub-agent process
+/// groups, and its tracked child handle. Does NOT finalize the job — the
+/// caller owns the status transition. Safe to call while holding the state
+/// mutex: the only `.await` is `child.kill().await`, which is fine under a
+/// tokio Mutex.
+async fn send_kill_signals(st: &mut DaemonState, job_id: &str) {
+    if let Some(pgid) = st.process_group_ids.remove(job_id) {
+        if pgid > 0 {
+            #[cfg(unix)]
+            unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL); }
+        }
+    }
+    if let Some(pgids) = st.sub_agent_pgids.remove(job_id) {
+        for pgid in pgids {
+            if pgid > 0 {
+                #[cfg(unix)]
+                unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL); }
+            }
+        }
+    }
+    if let Some(mut child) = st.running_children.remove(job_id) {
+        let _ = child.kill().await;
+    }
+}
+
+/// Computes the per-job timing inputs the watchdog needs.
+///
+/// Missing `last_activity` is not fatal — we fall back to `Instant::now()`
+/// so the stall check is effectively Ok for this tick, but the hard-cap
+/// still applies. This preserves defense-in-depth if a future code path
+/// forgets to stamp activity on some transition.
+fn compute_watchdog_timings(
+    now: Instant,
+    last_activity: Option<Instant>,
+    started_monotonic: Instant,
+) -> (Duration, Duration) {
+    let since_start = now.saturating_duration_since(started_monotonic);
+    let since_activity = now.saturating_duration_since(last_activity.unwrap_or(now));
+    (since_start, since_activity)
+}
+
+/// Watchdog tick: kills any running local job whose last-activity age
+/// exceeds `stall_timeout_seconds` or whose total runtime exceeds
+/// `hard_cap_seconds`. Uses the pure `watchdog_verdict` helper to decide.
+///
+/// The function takes two locks: one to snapshot candidate timings, and a
+/// second per-victim to perform the kill atomically. Between them, the
+/// event loop may update `job_last_activity`, so the verdict is
+/// re-evaluated under the second lock before SIGKILL is sent. This avoids
+/// false-killing a job that came back to life right at the boundary.
+async fn watchdog_check(state: &Arc<Mutex<DaemonState>>) {
+    let (stall_timeout, hard_cap, candidates): (
+        Duration,
+        Duration,
+        Vec<(String, Duration, Duration)>,
+    ) = {
+        let st = state.lock().await;
+        let stall = Duration::from_secs(st.config.stall_timeout_seconds);
+        let cap = Duration::from_secs(st.config.hard_cap_seconds);
+        let now = Instant::now();
+        let list: Vec<(String, Duration, Duration)> = st
+            .running_jobs
+            .iter()
+            .filter(|(id, j)| {
+                j.status == JobStatus::Running && !st.paused_jobs.contains(*id)
+            })
+            .filter_map(|(id, _j)| {
+                // A job without a monotonic start entry predates this
+                // bookkeeping or lost its entry to a bug — skip safely
+                // rather than guessing.
+                let started = st.job_started_at_monotonic.get(id).copied()?;
+                let last = st.job_last_activity.get(id).copied();
+                let (since_start, since_activity) =
+                    compute_watchdog_timings(now, last, started);
+                Some((id.clone(), since_start, since_activity))
+            })
+            .collect();
+        (stall, cap, list)
+    };
+
+    for (job_id, since_start, since_activity) in candidates {
+        let verdict = watchdog_verdict(since_start, since_activity, stall_timeout, hard_cap);
+        if matches!(verdict, WatchdogVerdict::Ok) {
+            continue;
+        }
+
+        // Re-acquire the lock and re-check the verdict against fresh state
+        // before sending SIGKILL. A job that emitted output between the
+        // snapshot and now should not be killed.
+        let mut st = state.lock().await;
+
+        if !st.running_jobs.contains_key(&job_id) {
+            // Already finalized.
+            continue;
+        }
+        if st.paused_jobs.contains(&job_id) {
+            // User paused the job between snapshot and kill.
+            continue;
+        }
+
+        let fresh_now = Instant::now();
+        let Some(fresh_started) =
+            st.job_started_at_monotonic.get(&job_id).copied()
+        else {
+            // Entry cleared between snapshot and kill — nothing to do.
+            continue;
+        };
+        let fresh_last = st.job_last_activity.get(&job_id).copied();
+        let (fresh_since_start, fresh_since_activity) =
+            compute_watchdog_timings(fresh_now, fresh_last, fresh_started);
+        let fresh_verdict = watchdog_verdict(
+            fresh_since_start,
+            fresh_since_activity,
+            stall_timeout,
+            hard_cap,
+        );
+
+        let reason = match fresh_verdict {
+            WatchdogVerdict::Ok => continue,
+            WatchdogVerdict::Stalled { silent_seconds } => format!(
+                "no output for {}s (stall_timeout={}s)",
+                silent_seconds,
+                stall_timeout.as_secs()
+            ),
+            WatchdogVerdict::HardCapped { total_seconds } => format!(
+                "runtime {}s exceeds hard_cap={}s",
+                total_seconds,
+                hard_cap.as_secs()
+            ),
+        };
+
+        tracing::warn!(job = %job_id, %reason, "watchdog: killing hung job");
+
+        let banner = format!(
+            "⏺ [plan-executor] watchdog killed job: {}",
+            reason
+        );
+        append_display(&job_id, &banner);
+
+        send_kill_signals(&mut st, &job_id).await;
+        if let Some(mut job) = st.running_jobs.remove(&job_id) {
+            job.status = JobStatus::Failed;
+            job.finished_at = Some(chrono::Utc::now());
+            job.duration_ms = Some(
+                (chrono::Utc::now() - job.started_at)
+                    .num_milliseconds()
+                    .max(0) as u64,
+            );
+            let _ = job.save();
+            let _ = st
+                .event_tx
+                .send(DaemonEvent::JobDisplayLine {
+                    job_id: job_id.clone(),
+                    line: banner,
+                });
+            st.history.insert(0, job.clone());
+            st.job_output.remove(&job_id);
+            st.job_display_output.remove(&job_id);
+            st.job_last_activity.remove(&job_id);
+            st.job_started_at_monotonic.remove(&job_id);
+            notify_plan("Execution killed by watchdog", &job.plan_path, &reason);
+            let _ = st.event_tx.send(DaemonEvent::JobUpdated { job });
         }
     }
 }
@@ -396,6 +612,9 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
         st.job_display_output.insert(job_id.clone(), VecDeque::new());
         st.running_children.insert(job_id.clone(), child);
         st.process_group_ids.insert(job_id.clone(), pgid);
+        let now = Instant::now();
+        st.job_last_activity.insert(job_id.clone(), now);
+        st.job_started_at_monotonic.insert(job_id.clone(), now);
         let event = st.snapshot_state();
         let _ = st.event_tx.send(event);
     }
@@ -464,6 +683,12 @@ pub async fn retry_handoff_from_state(
         st.running_jobs.insert(job.id.clone(), running_job);
         st.job_output.insert(job.id.clone(), VecDeque::new());
         st.job_display_output.insert(job.id.clone(), VecDeque::new());
+        let now = Instant::now();
+        st.job_last_activity.insert(job.id.clone(), now);
+        // Retry uses current time as the monotonic start — we have no
+        // record of when the original job started on the monotonic clock,
+        // and the hard-cap applies from resume anyway.
+        st.job_started_at_monotonic.insert(job.id.clone(), now);
         let event = st.snapshot_state();
         let _ = st.event_tx.send(event);
     }
@@ -507,10 +732,16 @@ pub async fn retry_handoff_from_state(
             while let Some((_idx, line)) = live_rx.recv().await {
                 append_display(&live_jid, &line);
                 let mut st = live_state.lock().await;
+                st.job_last_activity.insert(live_jid.clone(), Instant::now());
                 st.job_display_output.entry(live_jid.clone()).or_default().push_back(line.clone());
                 let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: live_jid.clone(), line });
             }
         });
+
+        let heartbeat = spawn_sub_agent_heartbeat(
+            Arc::clone(&state_clone),
+            job_id_full.clone(),
+        );
 
         let (results, sub_pgids) = handoff::dispatch_all(
             state_data.handoffs,
@@ -520,11 +751,13 @@ pub async fn retry_handoff_from_state(
             &agents.bash,
             Some(live_tx),
         ).await;
+        heartbeat.abort();
         let _ = live_task.await;
 
         {
             let mut st = state_clone.lock().await;
             st.sub_agent_pgids.insert(job_id_full.clone(), sub_pgids);
+            st.job_last_activity.insert(job_id_full.clone(), Instant::now());
         }
 
         for r in &results {
@@ -571,6 +804,9 @@ pub async fn retry_handoff_from_state(
                 let mut st = state_clone.lock().await;
                 st.running_children.insert(job_id_full.clone(), new_child);
                 st.process_group_ids.insert(job_id_full.clone(), new_pgid);
+                // Resume fresh-starts the liveness baseline, mirroring
+                // the main-loop handoff-resume path.
+                st.job_last_activity.insert(job_id_full.clone(), Instant::now());
                 rx
             }
             Err(e) => {
@@ -604,6 +840,8 @@ async fn fail_job_cleanup(state: &Arc<Mutex<DaemonState>>, job_id: &str) {
         st.sub_agent_pgids.remove(job_id);
         st.job_output.remove(job_id);
         st.job_display_output.remove(job_id);
+        st.job_last_activity.remove(job_id);
+        st.job_started_at_monotonic.remove(job_id);
         let _ = st.event_tx.send(DaemonEvent::JobUpdated { job });
     }
 }
@@ -626,6 +864,7 @@ async fn run_exec_event_loop(
             match event {
                 ExecEvent::OutputLine(line) => {
                     let mut st = state.lock().await;
+                    st.job_last_activity.insert(job_id.clone(), Instant::now());
                     let buf = st.job_output.entry(job_id.clone()).or_default();
                     buf.push_back(line.clone());
                     if buf.len() > 10000 { buf.pop_front(); }
@@ -641,6 +880,7 @@ async fn run_exec_event_loop(
                     } else {
                         last_display_blank = is_blank;
                         let mut st = state.lock().await;
+                        st.job_last_activity.insert(job_id.clone(), Instant::now());
                         let buf = st.job_display_output.entry(job_id.clone()).or_default();
                         buf.push_back(line.clone());
                         if buf.len() > 10000 { buf.pop_front(); }
@@ -651,6 +891,12 @@ async fn run_exec_event_loop(
                     }
                 }
                 ExecEvent::HandoffRequired { session_id, state_file } => {
+                    // Handoff is a strong liveness signal — reset watchdog
+                    // before the (potentially long) sub-agent dispatch.
+                    {
+                        let mut st = state.lock().await;
+                        st.job_last_activity.insert(job_id.clone(), Instant::now());
+                    }
                     // Store session_id on the running job and persist to disk
                     // before the (potentially long) sub-agent dispatch. A daemon
                     // kill during dispatch will then show this job as Failed on
@@ -703,10 +949,16 @@ async fn run_exec_event_loop(
                         while let Some((_idx, line)) = live_rx.recv().await {
                             append_display(&live_job_id, &line);
                             let mut st = live_state.lock().await;
+                            st.job_last_activity.insert(live_job_id.clone(), Instant::now());
                             st.job_display_output.entry(live_job_id.clone()).or_default().push_back(line.clone());
                             let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: live_job_id.clone(), line });
                         }
                     });
+
+                    let heartbeat = spawn_sub_agent_heartbeat(
+                        Arc::clone(&state),
+                        job_id.clone(),
+                    );
 
                     let (results, sub_pgids) = handoff::dispatch_all(
                         state_data.handoffs,
@@ -716,11 +968,13 @@ async fn run_exec_event_loop(
                         &agents.bash,
                         Some(live_tx),
                     ).await;
+                    heartbeat.abort();
                     let _ = live_task.await;
 
                     {
                         let mut st = state.lock().await;
                         st.sub_agent_pgids.insert(job_id.clone(), sub_pgids);
+                        st.job_last_activity.insert(job_id.clone(), Instant::now());
                     }
 
                     for r in &results {
@@ -780,6 +1034,10 @@ async fn run_exec_event_loop(
                                 let mut st = state.lock().await;
                                 st.running_children.insert(job_id.clone(), new_child);
                                 st.process_group_ids.insert(job_id.clone(), new_pgid);
+                                // Handoff resume — bump liveness in case
+                                // the resumed session takes a while to
+                                // emit its first line.
+                                st.job_last_activity.insert(job_id.clone(), Instant::now());
                             }
                             exec_rx = new_rx;
                             continue 'outer;
@@ -842,6 +1100,10 @@ async fn run_exec_event_loop(
                                     let mut st = state.lock().await;
                                     st.running_children.insert(job_id.clone(), new_child);
                                     st.process_group_ids.insert(job_id.clone(), new_pgid);
+                                    // Resume fresh-starts the liveness
+                                    // baseline: the Finished event may have
+                                    // been the last stamp minutes ago.
+                                    st.job_last_activity.insert(job_id.clone(), Instant::now());
                                     exec_rx = new_rx;
                                     continue 'outer;
                                 }
@@ -897,6 +1159,8 @@ async fn run_exec_event_loop(
                     st.sub_agent_pgids.remove(&job_id);
                     st.job_output.remove(&job_id);
                     st.job_display_output.remove(&job_id);
+                    st.job_last_activity.remove(&job_id);
+                    st.job_started_at_monotonic.remove(&job_id);
                     st.history.insert(0, job.clone());
                     let status_str = match job.status {
                         JobStatus::Success => "succeeded",
@@ -928,6 +1192,8 @@ async fn run_exec_event_loop(
                 st.sub_agent_pgids.remove(&job_id);
                 st.job_output.remove(&job_id);
                 st.job_display_output.remove(&job_id);
+                st.job_last_activity.remove(&job_id);
+                st.job_started_at_monotonic.remove(&job_id);
                 let _ = st.event_tx.send(DaemonEvent::JobUpdated { job });
             }
         }
@@ -1003,32 +1269,14 @@ async fn handle_tui_request(
         }
         TuiRequest::KillJob { job_id } => {
             let mut st = state.lock().await;
-
-            // Kill the main agent's process group
-            if let Some(pgid) = st.process_group_ids.remove(&job_id) {
-                if pgid > 0 {
-                    #[cfg(unix)]
-                    unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL); }
-                }
-            }
-            // Kill any active handoff sub-agent process groups
-            if let Some(pgids) = st.sub_agent_pgids.remove(&job_id) {
-                for pgid in pgids {
-                    if pgid > 0 {
-                        #[cfg(unix)]
-                        unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL); }
-                    }
-                }
-            }
-            // Belt-and-suspenders: kill the tracked child handle too
-            if let Some(mut child) = st.running_children.remove(&job_id) {
-                let _ = child.kill().await;
-            }
+            send_kill_signals(&mut st, &job_id).await;
             if let Some(mut job) = st.running_jobs.remove(&job_id) {
                 job.status = JobStatus::Killed;
                 job.finished_at = Some(chrono::Utc::now());
                 let _ = job.save();
                 st.history.insert(0, job.clone());
+                st.job_last_activity.remove(&job_id);
+                st.job_started_at_monotonic.remove(&job_id);
                 let _ = st.event_tx.send(DaemonEvent::JobUpdated { job });
             }
         }
@@ -1064,5 +1312,56 @@ async fn handle_tui_request(
         TuiRequest::Subscribe => {
             // Already subscribed via broadcast channel; no-op
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_watchdog_timings_uses_monotonic_start() {
+        let start = Instant::now();
+        let last = start + Duration::from_secs(100);
+        let now = start + Duration::from_secs(200);
+        let (since_start, since_activity) =
+            compute_watchdog_timings(now, Some(last), start);
+        assert_eq!(since_start, Duration::from_secs(200));
+        assert_eq!(since_activity, Duration::from_secs(100));
+    }
+
+    #[test]
+    fn compute_watchdog_timings_missing_last_activity_collapses_silence_to_zero() {
+        // F5: when last_activity is absent the stall branch must be Ok
+        // (since_activity = 0) while hard-cap still applies via since_start.
+        let start = Instant::now();
+        let now = start + Duration::from_secs(600);
+        let (since_start, since_activity) =
+            compute_watchdog_timings(now, None, start);
+        assert_eq!(since_start, Duration::from_secs(600));
+        assert_eq!(since_activity, Duration::from_secs(0));
+
+        // Hard-cap fires for this synthetic input even without activity.
+        let v = watchdog_verdict(
+            since_start,
+            since_activity,
+            Duration::from_secs(300),
+            Duration::from_secs(500),
+        );
+        assert_eq!(v, WatchdogVerdict::HardCapped { total_seconds: 600 });
+    }
+
+    #[test]
+    fn compute_watchdog_timings_saturates_on_backward_clock_jump() {
+        // F2: a monotonic Instant cannot go backward, but if some future
+        // bug passes an `older > now` pair we saturate to zero rather than
+        // panic. Covers the defensive branch in saturating_duration_since.
+        let start = Instant::now();
+        let last = start + Duration::from_secs(500);
+        let now = start + Duration::from_secs(100); // now < last
+        let (since_start, since_activity) =
+            compute_watchdog_timings(now, Some(last), start);
+        assert_eq!(since_start, Duration::from_secs(100));
+        assert_eq!(since_activity, Duration::from_secs(0));
     }
 }
