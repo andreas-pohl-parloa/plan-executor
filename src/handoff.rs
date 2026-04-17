@@ -197,6 +197,7 @@ async fn dispatch_agent(
     handoff: Handoff,
     cmd: String,
     live_tx: Option<mpsc::Sender<(usize, String)>>,
+    pgid_tx: Option<mpsc::UnboundedSender<u32>>,
 ) -> (HandoffResult, u32) {
     let path = handoff.prompt_file.to_string_lossy().into_owned();
     let can_fail = handoff.can_fail;
@@ -239,6 +240,17 @@ async fn dispatch_agent(
     };
 
     let pgid = child.id().unwrap_or(0);
+
+    // Register the pgid with the daemon immediately — BEFORE awaiting the
+    // child's output. This is the only way a KillJob arriving while
+    // dispatch_all is still suspended can SIGKILL this sub-agent's
+    // process group. A channel send is non-blocking (unbounded), so there
+    // is no await between spawn and registration.
+    if let Some(ref tx) = pgid_tx {
+        if pgid > 0 {
+            let _ = tx.send(pgid);
+        }
+    }
 
     // Bash agents with a live channel: stream stdout/stderr in real-time.
     // The continuation payload for bash is just the exit status.
@@ -306,7 +318,12 @@ async fn dispatch_agent(
 }
 
 /// Dispatches all handoffs in a batch concurrently. Returns results sorted by index and PGIDs.
+///
 /// `live_tx` streams (agent_index, line) for bash agents' live output.
+/// `pgid_tx` (if provided) receives each sub-agent's pgid the instant it is
+/// spawned — before the await on child output. This lets the daemon track
+/// in-flight sub-agents and SIGKILL their process groups if a KillJob
+/// arrives while this function is still suspended.
 pub async fn dispatch_all(
     handoffs: Vec<Handoff>,
     claude_cmd: &str,
@@ -314,6 +331,7 @@ pub async fn dispatch_all(
     gemini_cmd: &str,
     bash_cmd: &str,
     live_tx: Option<mpsc::Sender<(usize, String)>>,
+    pgid_tx: Option<mpsc::UnboundedSender<u32>>,
 ) -> (Vec<HandoffResult>, Vec<u32>) {
     let handles: Vec<_> = handoffs.into_iter()
         .map(|h| {
@@ -324,7 +342,8 @@ pub async fn dispatch_all(
                 AgentType::Bash   => bash_cmd.to_string(),
             };
             let tx = if matches!(h.agent_type, AgentType::Bash) { live_tx.clone() } else { None };
-            tokio::spawn(dispatch_agent(h, cmd, tx))
+            let pg_tx = pgid_tx.clone();
+            tokio::spawn(dispatch_agent(h, cmd, tx, pg_tx))
         })
         .collect();
     let mut results = Vec::new();

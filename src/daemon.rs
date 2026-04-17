@@ -277,6 +277,30 @@ fn spawn_sub_agent_heartbeat(
     })
 }
 
+/// Reads sub-agent pgids from an unbounded channel and appends each one to
+/// `DaemonState.sub_agent_pgids[job_id]` the instant it arrives. Spawned
+/// alongside every `dispatch_all` call so a KillJob arriving mid-dispatch
+/// can SIGKILL the in-flight sub-agents' process groups. The task exits
+/// when the sender is dropped (after `dispatch_all` returns).
+fn spawn_pgid_registrar(
+    state: Arc<Mutex<DaemonState>>,
+    job_id: String,
+    mut pgid_rx: tokio::sync::mpsc::UnboundedReceiver<u32>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(pgid) = pgid_rx.recv().await {
+            if pgid == 0 {
+                continue;
+            }
+            let mut st = state.lock().await;
+            let entry = st.sub_agent_pgids.entry(job_id.clone()).or_default();
+            if !entry.contains(&pgid) {
+                entry.push(pgid);
+            }
+        }
+    })
+}
+
 /// Sends SIGKILL to a job's main process group, all active sub-agent process
 /// groups, and its tracked child handle. Does NOT finalize the job — the
 /// caller owns the status transition. Safe to call while holding the state
@@ -743,6 +767,22 @@ pub async fn retry_handoff_from_state(
             job_id_full.clone(),
         );
 
+        // Reset sub_agent_pgids for this batch and start a registration
+        // task so each sub-agent's pgid lands in DaemonState the instant
+        // it spawns. A KillJob arriving mid-dispatch can then SIGKILL
+        // every sub-agent's process group, not just the ones that had
+        // already finished.
+        {
+            let mut st = state_clone.lock().await;
+            st.sub_agent_pgids.insert(job_id_full.clone(), Vec::new());
+        }
+        let (pgid_tx, pgid_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+        let reg_task = spawn_pgid_registrar(
+            Arc::clone(&state_clone),
+            job_id_full.clone(),
+            pgid_rx,
+        );
+
         let (results, sub_pgids) = handoff::dispatch_all(
             state_data.handoffs,
             &agents.claude,
@@ -750,13 +790,33 @@ pub async fn retry_handoff_from_state(
             &agents.gemini,
             &agents.bash,
             Some(live_tx),
+            Some(pgid_tx),
         ).await;
         heartbeat.abort();
         let _ = live_task.await;
+        let _ = reg_task.await;
+
+        // If the job was killed while dispatch_all was suspended, bail
+        // out now instead of proceeding to resume_execution (which would
+        // spawn a new main agent for a job that no longer exists).
+        {
+            let st = state_clone.lock().await;
+            if !st.running_jobs.contains_key(&job_id_full) {
+                return;
+            }
+        }
 
         {
             let mut st = state_clone.lock().await;
-            st.sub_agent_pgids.insert(job_id_full.clone(), sub_pgids);
+            // Trust whatever pgids the registrar collected; sub_pgids is
+            // the ordered list returned after dispatch and may be more
+            // complete if registrations were late. Merge for safety.
+            let entry = st.sub_agent_pgids.entry(job_id_full.clone()).or_default();
+            for pgid in sub_pgids {
+                if pgid > 0 && !entry.contains(&pgid) {
+                    entry.push(pgid);
+                }
+            }
             st.job_last_activity.insert(job_id_full.clone(), Instant::now());
         }
 
@@ -960,6 +1020,20 @@ async fn run_exec_event_loop(
                         job_id.clone(),
                     );
 
+                    // Reset sub_agent_pgids for this batch and start a
+                    // registration task so a KillJob arriving mid-dispatch
+                    // can SIGKILL every sub-agent pgroup.
+                    {
+                        let mut st = state.lock().await;
+                        st.sub_agent_pgids.insert(job_id.clone(), Vec::new());
+                    }
+                    let (pgid_tx, pgid_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+                    let reg_task = spawn_pgid_registrar(
+                        Arc::clone(&state),
+                        job_id.clone(),
+                        pgid_rx,
+                    );
+
                     let (results, sub_pgids) = handoff::dispatch_all(
                         state_data.handoffs,
                         &agents.claude,
@@ -967,13 +1041,28 @@ async fn run_exec_event_loop(
                         &agents.gemini,
                         &agents.bash,
                         Some(live_tx),
+                        Some(pgid_tx),
                     ).await;
                     heartbeat.abort();
                     let _ = live_task.await;
+                    let _ = reg_task.await;
+
+                    // If the job was killed during dispatch, bail out.
+                    {
+                        let st = state.lock().await;
+                        if !st.running_jobs.contains_key(&job_id) {
+                            break 'outer;
+                        }
+                    }
 
                     {
                         let mut st = state.lock().await;
-                        st.sub_agent_pgids.insert(job_id.clone(), sub_pgids);
+                        let entry = st.sub_agent_pgids.entry(job_id.clone()).or_default();
+                        for pgid in sub_pgids {
+                            if pgid > 0 && !entry.contains(&pgid) {
+                                entry.push(pgid);
+                            }
+                        }
                         st.job_last_activity.insert(job_id.clone(), Instant::now());
                     }
 
