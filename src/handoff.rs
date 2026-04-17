@@ -44,6 +44,20 @@ pub struct HandoffResult {
     pub can_fail: bool,
 }
 
+/// One streamed line from a dispatched sub-agent. The daemon uses these
+/// both as a watchdog liveness signal (stamp `job_last_activity` on each
+/// line) and as the raw feed for per-sub-agent output files the
+/// `plan-executor output` command renders inline.
+#[derive(Debug, Clone)]
+pub struct SubAgentLine {
+    pub index: usize,
+    /// Short agent-type label used in persisted filenames so the
+    /// renderer can pick the right rendering path (stream-json vs. raw).
+    pub agent_type: &'static str,
+    pub is_stderr: bool,
+    pub line: String,
+}
+
 // ── State file deserialization ─────────────────────────────────────────────
 //
 // Two schemas are supported:
@@ -291,12 +305,18 @@ async fn dispatch_agent(
     cmd: String,
     live_tx: Option<mpsc::Sender<(usize, String)>>,
     pgid_tx: Option<mpsc::UnboundedSender<u32>>,
-    activity_tx: Option<mpsc::UnboundedSender<()>>,
+    subagent_tx: Option<mpsc::UnboundedSender<SubAgentLine>>,
 ) -> (HandoffResult, u32) {
     let path = handoff.prompt_file.to_string_lossy().into_owned();
     let can_fail = handoff.can_fail;
     let index = handoff.index;
     let is_bash = matches!(handoff.agent_type, AgentType::Bash);
+    let agent_type_label: &'static str = match handoff.agent_type {
+        AgentType::Claude => "claude",
+        AgentType::Codex  => "codex",
+        AgentType::Gemini => "gemini",
+        AgentType::Bash   => "bash",
+    };
 
     // Verify the prompt file exists before attempting to dispatch.
     if !handoff.prompt_file.exists() {
@@ -356,14 +376,21 @@ async fn dispatch_agent(
         let stderr = child.stderr.take();
 
         let tx_out = tx.clone();
-        let act_out = activity_tx.clone();
+        let sa_out = subagent_tx.clone();
         let stdout_handle = tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
             let mut lines = Vec::new();
             if let Some(out) = stdout {
                 let mut reader = BufReader::new(out).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
-                    if let Some(ref a) = act_out { let _ = a.send(()); }
+                    if let Some(ref s) = sa_out {
+                        let _ = s.send(SubAgentLine {
+                            index,
+                            agent_type: agent_type_label,
+                            is_stderr: false,
+                            line: line.clone(),
+                        });
+                    }
                     let _ = tx_out.send((index, line.clone())).await;
                     lines.push(line);
                 }
@@ -372,14 +399,21 @@ async fn dispatch_agent(
         });
 
         let tx_err = tx;
-        let act_err = activity_tx.clone();
+        let sa_err = subagent_tx.clone();
         let stderr_handle = tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
             let mut lines = Vec::new();
             if let Some(err) = stderr {
                 let mut reader = BufReader::new(err).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
-                    if let Some(ref a) = act_err { let _ = a.send(()); }
+                    if let Some(ref s) = sa_err {
+                        let _ = s.send(SubAgentLine {
+                            index,
+                            agent_type: agent_type_label,
+                            is_stderr: true,
+                            line: line.clone(),
+                        });
+                    }
                     let _ = tx_err.send((index, line.clone())).await;
                     lines.push(line);
                 }
@@ -405,28 +439,42 @@ async fn dispatch_agent(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let act_out = activity_tx.clone();
+    let sa_out = subagent_tx.clone();
     let stdout_handle = tokio::spawn(async move {
         use tokio::io::{AsyncBufReadExt, BufReader};
         let mut lines: Vec<String> = Vec::new();
         if let Some(out) = stdout {
             let mut reader = BufReader::new(out).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                if let Some(ref a) = act_out { let _ = a.send(()); }
+                if let Some(ref s) = sa_out {
+                    let _ = s.send(SubAgentLine {
+                        index,
+                        agent_type: agent_type_label,
+                        is_stderr: false,
+                        line: line.clone(),
+                    });
+                }
                 lines.push(line);
             }
         }
         lines
     });
 
-    let act_err = activity_tx.clone();
+    let sa_err = subagent_tx.clone();
     let stderr_handle = tokio::spawn(async move {
         use tokio::io::{AsyncBufReadExt, BufReader};
         let mut lines: Vec<String> = Vec::new();
         if let Some(err) = stderr {
             let mut reader = BufReader::new(err).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                if let Some(ref a) = act_err { let _ = a.send(()); }
+                if let Some(ref s) = sa_err {
+                    let _ = s.send(SubAgentLine {
+                        index,
+                        agent_type: agent_type_label,
+                        is_stderr: true,
+                        line: line.clone(),
+                    });
+                }
                 lines.push(line);
             }
         }
@@ -452,10 +500,11 @@ async fn dispatch_agent(
 /// `pgid_tx` (if provided) receives each sub-agent's pgid the instant it is
 /// spawned — before the await on child output — so an in-flight KillJob
 /// can SIGKILL the sub-agent process groups.
-/// `activity_tx` (if provided) receives one tick per stdout/stderr line
-/// from any sub-agent. The daemon uses this to stamp `job_last_activity`
-/// so the watchdog treats each emitted JSONL event as liveness — real
-/// sub-agent progress rather than a blind timer.
+/// `subagent_tx` (if provided) receives a `SubAgentLine` per stdout/stderr
+/// line from any sub-agent. The daemon uses this both as the watchdog
+/// liveness signal (true sub-agent progress, not a blind timer) and as
+/// the feed for per-sub-agent output files rendered inline by
+/// `plan-executor output`.
 pub async fn dispatch_all(
     handoffs: Vec<Handoff>,
     claude_cmd: &str,
@@ -464,7 +513,7 @@ pub async fn dispatch_all(
     bash_cmd: &str,
     live_tx: Option<mpsc::Sender<(usize, String)>>,
     pgid_tx: Option<mpsc::UnboundedSender<u32>>,
-    activity_tx: Option<mpsc::UnboundedSender<()>>,
+    subagent_tx: Option<mpsc::UnboundedSender<SubAgentLine>>,
 ) -> (Vec<HandoffResult>, Vec<u32>) {
     let handles: Vec<_> = handoffs.into_iter()
         .map(|h| {
@@ -476,8 +525,8 @@ pub async fn dispatch_all(
             };
             let tx = if matches!(h.agent_type, AgentType::Bash) { live_tx.clone() } else { None };
             let pg_tx = pgid_tx.clone();
-            let act_tx = activity_tx.clone();
-            tokio::spawn(dispatch_agent(h, cmd, tx, pg_tx, act_tx))
+            let sa_tx = subagent_tx.clone();
+            tokio::spawn(dispatch_agent(h, cmd, tx, pg_tx, sa_tx))
         })
         .collect();
     let mut results = Vec::new();

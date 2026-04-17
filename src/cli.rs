@@ -78,6 +78,69 @@ fn print_display_line(line: &str) {
     }
 }
 
+/// Dim-indented prefix used to nest sub-agent output under the main
+/// agent's display. Keeps the context visible at a glance — any line
+/// wearing this prefix is coming from a spawned sub-agent.
+const SUBAGENT_PREFIX: &str = "\x1b[2m│  \x1b[0m";
+
+/// Renders one sub-agent's persisted JSONL output via sjv and prints
+/// each resulting visible line with `SUBAGENT_PREFIX`. Best-effort: if
+/// no file is found or reading fails, the function silently skips
+/// (sub-agent output is optional context, not critical signal).
+fn render_subagent_output(job_id: &str, dispatch: u32, index: usize) {
+    use std::path::PathBuf;
+    let base: PathBuf = crate::config::Config::base_dir()
+        .join("jobs")
+        .join(job_id)
+        .join("sub-agents");
+    let Ok(entries) = std::fs::read_dir(&base) else { return };
+
+    let prefix_stdout = format!("dispatch-{}-agent-{}-", dispatch, index);
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(&prefix_stdout) {
+            continue;
+        }
+        let path = entry.path();
+        let is_stderr = path.extension().and_then(|s| s.to_str()) == Some("stderr");
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let header = if is_stderr {
+            format!(
+                "{}\x1b[2m─── sub-agent {} stderr ───\x1b[0m",
+                SUBAGENT_PREFIX, index,
+            )
+        } else {
+            format!(
+                "{}\x1b[2m─── sub-agent {} output ───\x1b[0m",
+                SUBAGENT_PREFIX, index,
+            )
+        };
+        println!("{}", header);
+        for raw_line in content.lines() {
+            if raw_line.is_empty() {
+                continue;
+            }
+            let rendered = if is_stderr {
+                // stderr is plain text — print raw.
+                format!("\x1b[2m{}\x1b[0m", raw_line)
+            } else {
+                // stdout is JSONL from a streaming agent — run it
+                // through sjv, same as the main agent.
+                sjv::render_runtime_line(raw_line, false, true)
+            };
+            for visual in rendered.lines() {
+                if visual.is_empty() {
+                    continue;
+                }
+                println!("{}{}", SUBAGENT_PREFIX, visual);
+            }
+        }
+    }
+}
+
 fn terminal_width() -> usize {
     #[cfg(unix)]
     {
@@ -288,11 +351,25 @@ async fn output_job(job_id_prefix: String, follow: bool) -> Result<()> {
         anyhow::bail!("Unexpected response from daemon");
     };
 
-    // Print stored display output from display.log (pre-rendered, includes [plan-executor] lines).
+    // Print stored display output from display.log (pre-rendered, includes
+    // [plan-executor] lines). Sub-agent output is interleaved inline: each
+    // `dispatching N sub-agent(s)` line advances a dispatch counter, and
+    // before each `sub-agent <N> done` / `sub-agent <N> failed` line we
+    // render the matching persisted JSONL file with a dim indented prefix
+    // so the context is clear.
     let display_path = Config::base_dir().join("jobs").join(&job_id).join("display.log");
     if display_path.exists() {
         let content = std::fs::read_to_string(&display_path)?;
+        let mut dispatch_counter: u32 = 0;
         for line in content.lines() {
+            if line.contains("⏺ [plan-executor] dispatching")
+                && line.contains("sub-agent(s)")
+            {
+                dispatch_counter += 1;
+            }
+            if let Some(idx) = parse_subagent_done_index(line) {
+                render_subagent_output(&job_id, dispatch_counter, idx);
+            }
             print_display_line(line);
         }
     }
@@ -302,12 +379,22 @@ async fn output_job(job_id_prefix: String, follow: bool) -> Result<()> {
     }
 
     // Follow mode: stream live JobDisplayLine events for this job.
+    // Use the same interleave logic so live output matches the replay.
     eprintln!("[following {} — Ctrl+C to stop]", &job_id[..job_id.len().min(8)]);
+    let mut dispatch_counter: u32 = 0;
     while let Some(line) = reader.next_line().await? {
                 if let Ok(DaemonEvent::JobDisplayLine { job_id: jid, line: text }) =
                     serde_json::from_str::<DaemonEvent>(&line)
                 {
                     if jid == job_id {
+                        if text.contains("⏺ [plan-executor] dispatching")
+                            && text.contains("sub-agent(s)")
+                        {
+                            dispatch_counter += 1;
+                        }
+                        if let Some(idx) = parse_subagent_done_index(&text) {
+                            render_subagent_output(&job_id, dispatch_counter, idx);
+                        }
                         print_display_line(&text);
                     }
                 } else if let Ok(DaemonEvent::JobUpdated { job }) =
@@ -320,6 +407,25 @@ async fn output_job(job_id_prefix: String, follow: bool) -> Result<()> {
                 }
     }
     Ok(())
+}
+
+/// Parses `⏺ [plan-executor] sub-agent <N> done` / `failed` /
+/// `skipped (can-fail)` lines and returns the sub-agent index. Used by
+/// `output_job` to look up the matching persisted sub-agent output.
+fn parse_subagent_done_index(line: &str) -> Option<usize> {
+    // Match any of: "sub-agent <N> done", "sub-agent <N> failed:",
+    // "sub-agent <N> skipped (can-fail):".
+    let after = line.strip_prefix("⏺ [plan-executor] sub-agent ")?;
+    let (num, rest) = after.split_once(' ')?;
+    let idx: usize = num.parse().ok()?;
+    if rest.starts_with("done")
+        || rest.starts_with("failed")
+        || rest.starts_with("skipped")
+    {
+        Some(idx)
+    } else {
+        None
+    }
 }
 
 async fn retry_job(job_id_prefix: String) -> Result<()> {
@@ -1327,5 +1433,42 @@ mod tests {
         assert_eq!(format_duration(86_400), "1d00h");
         assert_eq!(format_duration(100_000), "1d03h");
         assert_eq!(format_duration(604_800), "7d00h");
+    }
+
+    #[test]
+    fn parse_subagent_done_index_accepts_done() {
+        assert_eq!(
+            parse_subagent_done_index("⏺ [plan-executor] sub-agent 3 done (1234 chars)"),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn parse_subagent_done_index_accepts_failed() {
+        assert_eq!(
+            parse_subagent_done_index("⏺ [plan-executor] sub-agent 1 failed: boom"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn parse_subagent_done_index_accepts_skipped() {
+        assert_eq!(
+            parse_subagent_done_index("⏺ [plan-executor] sub-agent 2 skipped (can-fail): reason"),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn parse_subagent_done_index_ignores_dispatching() {
+        assert_eq!(
+            parse_subagent_done_index("⏺ [plan-executor] dispatching 4 sub-agent(s) (phase: x)"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_subagent_done_index_ignores_unrelated() {
+        assert_eq!(parse_subagent_done_index("some other line"), None);
     }
 }

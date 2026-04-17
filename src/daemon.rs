@@ -41,6 +41,10 @@ pub struct DaemonState {
     /// jumps (NTP step, VM suspend/resume). Populated at job start and
     /// removed on finalization.
     pub job_started_at_monotonic: HashMap<String, Instant>,
+    /// Incrementing counter per job used to namespace sub-agent output
+    /// files (one call to `dispatch_all` = one "dispatch"). Files land
+    /// at `<job_dir>/sub-agents/dispatch-<N>-agent-<index>-<type>.*`.
+    pub sub_agent_dispatch_counter: HashMap<String, u32>,
     /// Jobs currently paused at a handoff — sub-agents held until ResumeJob
     pub paused_jobs: std::collections::HashSet<String>,
     /// Remote executions being monitored: plan_path → (remote_repo, pr_number)
@@ -207,6 +211,7 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
         sub_agent_pgids: HashMap::new(),
         job_last_activity: HashMap::new(),
         job_started_at_monotonic: HashMap::new(),
+        sub_agent_dispatch_counter: HashMap::new(),
         paused_jobs: std::collections::HashSet::new(),
         remote_executions: HashMap::new(),
         event_tx: event_tx.clone(),
@@ -271,25 +276,74 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
     }
 }
 
-/// Consumes per-line activity ticks from `handoff::dispatch_all` and
-/// stamps `job_last_activity` on each one. The channel closes when the
-/// last sender is dropped (after `dispatch_all` returns and every
-/// streaming reader finishes), at which point the task exits. A truly
-/// hung sub-agent emits no lines → no ticks → stall timer is free to
-/// run. This replaces the earlier blind 30-second heartbeat, which
-/// masked hangs by stamping regardless of actual sub-agent progress.
-fn spawn_activity_receiver(
+/// Consumes streamed sub-agent lines from `handoff::dispatch_all` and
+/// does two things per line:
+///  1. Stamps `job_last_activity` — real per-line liveness for the
+///     watchdog; a hung sub-agent emits no lines → no ticks.
+///  2. Appends the line to a per-sub-agent output file under the job
+///     directory. Stdout lands in `<job>/sub-agents/dispatch-<N>-
+///     agent-<idx>-<type>.jsonl`; stderr gets a sibling `.stderr` file.
+///
+/// The channel closes when the last sender is dropped (after
+/// `dispatch_all` returns and both streaming readers finish), at which
+/// point the task exits. Replaces the earlier blind 30-second heartbeat.
+fn spawn_subagent_writer(
     state: Arc<Mutex<DaemonState>>,
     job_id: String,
-    mut activity_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    dispatch_num: u32,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::handoff::SubAgentLine>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while activity_rx.recv().await.is_some() {
-            let mut st = state.lock().await;
-            if !st.running_jobs.contains_key(&job_id) {
-                break;
+        use tokio::io::AsyncWriteExt;
+        let base_dir = Config::base_dir()
+            .join("jobs")
+            .join(&job_id)
+            .join("sub-agents");
+        if let Err(e) = tokio::fs::create_dir_all(&base_dir).await {
+            tracing::warn!(job = %job_id, error = %e, "sub-agent dir create failed");
+        }
+
+        let mut handles: HashMap<(usize, bool), tokio::fs::File> = HashMap::new();
+        while let Some(msg) = rx.recv().await {
+            {
+                let mut st = state.lock().await;
+                if !st.running_jobs.contains_key(&job_id) {
+                    break;
+                }
+                st.job_last_activity.insert(job_id.clone(), Instant::now());
             }
-            st.job_last_activity.insert(job_id.clone(), Instant::now());
+
+            let key = (msg.index, msg.is_stderr);
+            let file = match handles.get_mut(&key) {
+                Some(f) => f,
+                None => {
+                    let ext = if msg.is_stderr { "stderr" } else { "jsonl" };
+                    let path = base_dir.join(format!(
+                        "dispatch-{}-agent-{}-{}.{}",
+                        dispatch_num, msg.index, msg.agent_type, ext
+                    ));
+                    match tokio::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .await
+                    {
+                        Ok(f) => {
+                            handles.insert(key, f);
+                            handles.get_mut(&key).expect("just inserted")
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                job = %job_id, path = %path.display(),
+                                error = %e, "sub-agent file open failed",
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
+            let _ = file.write_all(msg.line.as_bytes()).await;
+            let _ = file.write_all(b"\n").await;
         }
     })
 }
@@ -565,6 +619,7 @@ async fn watchdog_check(state: &Arc<Mutex<DaemonState>>) {
             st.job_display_output.remove(&job_id);
             st.job_last_activity.remove(&job_id);
             st.job_started_at_monotonic.remove(&job_id);
+            st.sub_agent_dispatch_counter.remove(&job_id);
             notify_plan("Execution killed by watchdog", &job.plan_path, &reason);
             let _ = st.event_tx.send(DaemonEvent::JobUpdated { job });
         }
@@ -882,14 +937,25 @@ pub async fn retry_handoff_from_state(
             pgid_rx,
         );
 
-        // Activity receiver stamps job_last_activity once per sub-agent
-        // JSONL line. Replaces the old blind 30s heartbeat so a hung
-        // sub-agent actually trips the stall timer.
-        let (activity_tx, activity_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        let act_task = spawn_activity_receiver(
+        // Sub-agent writer task: receives each streamed line, stamps
+        // job_last_activity (watchdog liveness), and persists to
+        // per-sub-agent files for later rendering by `output`.
+        let dispatch_num = {
+            let mut st = state_clone.lock().await;
+            let entry = st
+                .sub_agent_dispatch_counter
+                .entry(job_id_full.clone())
+                .or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        let (subagent_tx, subagent_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::handoff::SubAgentLine>();
+        let sa_task = spawn_subagent_writer(
             Arc::clone(&state_clone),
             job_id_full.clone(),
-            activity_rx,
+            dispatch_num,
+            subagent_rx,
         );
 
         let (results, sub_pgids) = handoff::dispatch_all(
@@ -900,11 +966,11 @@ pub async fn retry_handoff_from_state(
             &agents.bash,
             Some(live_tx),
             Some(pgid_tx),
-            Some(activity_tx),
+            Some(subagent_tx),
         ).await;
         let _ = live_task.await;
         let _ = reg_task.await;
-        let _ = act_task.await;
+        let _ = sa_task.await;
 
         // If the job was killed while dispatch_all was suspended, bail
         // out now instead of proceeding to resume_execution (which would
@@ -1012,6 +1078,7 @@ async fn fail_job_cleanup(state: &Arc<Mutex<DaemonState>>, job_id: &str) {
         st.job_display_output.remove(job_id);
         st.job_last_activity.remove(job_id);
         st.job_started_at_monotonic.remove(job_id);
+            st.sub_agent_dispatch_counter.remove(job_id);
         let _ = st.event_tx.send(DaemonEvent::JobUpdated { job });
     }
 }
@@ -1139,14 +1206,26 @@ async fn run_exec_event_loop(
                         pgid_rx,
                     );
 
-                    // Activity receiver stamps job_last_activity per
-                    // sub-agent JSONL line. Replaces the old heartbeat
-                    // so a hung sub-agent trips the stall timer.
-                    let (activity_tx, activity_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-                    let act_task = spawn_activity_receiver(
+                    // Sub-agent writer task: receives each streamed
+                    // line, stamps job_last_activity (watchdog
+                    // liveness), and persists to per-sub-agent files
+                    // for later rendering by `output`.
+                    let dispatch_num = {
+                        let mut st = state.lock().await;
+                        let entry = st
+                            .sub_agent_dispatch_counter
+                            .entry(job_id.clone())
+                            .or_insert(0);
+                        *entry += 1;
+                        *entry
+                    };
+                    let (subagent_tx, subagent_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<crate::handoff::SubAgentLine>();
+                    let sa_task = spawn_subagent_writer(
                         Arc::clone(&state),
                         job_id.clone(),
-                        activity_rx,
+                        dispatch_num,
+                        subagent_rx,
                     );
 
                     let (results, sub_pgids) = handoff::dispatch_all(
@@ -1157,11 +1236,11 @@ async fn run_exec_event_loop(
                         &agents.bash,
                         Some(live_tx),
                         Some(pgid_tx),
-                        Some(activity_tx),
+                        Some(subagent_tx),
                     ).await;
                     let _ = live_task.await;
                     let _ = reg_task.await;
-                    let _ = act_task.await;
+                    let _ = sa_task.await;
 
                     // If the job was killed during dispatch, bail out.
                     {
@@ -1366,6 +1445,7 @@ async fn run_exec_event_loop(
                     st.job_display_output.remove(&job_id);
                     st.job_last_activity.remove(&job_id);
                     st.job_started_at_monotonic.remove(&job_id);
+            st.sub_agent_dispatch_counter.remove(&job_id);
                     st.history.insert(0, job.clone());
                     let status_str = match job.status {
                         JobStatus::Success => "succeeded",
@@ -1399,6 +1479,7 @@ async fn run_exec_event_loop(
                 st.job_display_output.remove(&job_id);
                 st.job_last_activity.remove(&job_id);
                 st.job_started_at_monotonic.remove(&job_id);
+            st.sub_agent_dispatch_counter.remove(&job_id);
                 let _ = st.event_tx.send(DaemonEvent::JobUpdated { job });
             }
         }
@@ -1482,6 +1563,7 @@ async fn handle_tui_request(
                 st.history.insert(0, job.clone());
                 st.job_last_activity.remove(&job_id);
                 st.job_started_at_monotonic.remove(&job_id);
+            st.sub_agent_dispatch_counter.remove(&job_id);
                 let _ = st.event_tx.send(DaemonEvent::JobUpdated { job });
             }
         }
