@@ -822,19 +822,26 @@ fn list_jobs() {
                 let r_target_w = remote_jobs.iter()
                     .map(|rj| rj.target.len())
                     .max().unwrap_or(6).max(6);
-                let r_gaps = 6; // 3 gaps × 2 spaces
-                let r_plan_w = term_w.saturating_sub(pr_w + r_status_w + r_target_w + r_gaps).max(20);
+                let r_dur_w = 10;
+                let r_gaps = 8; // 4 gaps × 2 spaces
+                let r_plan_w = term_w
+                    .saturating_sub(pr_w + r_status_w + r_target_w + r_dur_w + r_gaps)
+                    .max(20);
                 println!(
-                    "{:<pr_w$}  {:<r_plan_w$}  {:<r_status_w$}  {:<r_target_w$}",
-                    "PR", "PLAN", "STATUS", "TARGET",
+                    "{:<pr_w$}  {:<r_plan_w$}  {:<r_status_w$}  {:<r_target_w$}  {:>r_dur_w$}",
+                    "PR", "PLAN", "STATUS", "TARGET", "DURATION",
                 );
                 println!("{}", "─".repeat(term_w));
                 for rj in &remote_jobs {
                     let plan_display = truncate_str(&rj.plan_name, r_plan_w);
                     let target_display = truncate_str(&rj.target, r_target_w);
+                    let duration = rj
+                        .duration_seconds
+                        .map(|s| format!("{}s", s))
+                        .unwrap_or_else(|| "-".to_string());
                     println!(
-                        "#{:<width$}  {:<r_plan_w$}  {:<r_status_w$}  {:<r_target_w$}",
-                        rj.number, plan_display, rj.status, target_display,
+                        "#{:<width$}  {:<r_plan_w$}  {:<r_status_w$}  {:<r_target_w$}  {:>r_dur_w$}",
+                        rj.number, plan_display, rj.status, target_display, duration,
                         width = pr_w - 1,
                     );
                 }

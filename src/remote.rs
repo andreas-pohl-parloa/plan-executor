@@ -314,9 +314,10 @@ pub fn list_remote_executions(remote_repo: &str) -> Result<Vec<RemoteJob>> {
         "--repo", remote_repo,
         "--state", "all",
         "--limit", "20",
-        "--json", "number,title,state,labels",
+        "--json", "number,title,state,labels,createdAt,closedAt",
     ])?;
     let prs: Vec<serde_json::Value> = serde_json::from_str(&output)?;
+    let now = chrono::Utc::now();
     let mut jobs = Vec::new();
     for pr in prs {
         let number = pr["number"].as_u64().unwrap_or(0);
@@ -352,7 +353,29 @@ pub fn list_remote_executions(remote_repo: &str) -> Result<Vec<RemoteJob>> {
             other => other.to_lowercase(),
         };
 
-        jobs.push(RemoteJob { number, plan_name, status, target });
+        // Duration: for open PRs it's wall-clock age from createdAt;
+        // for closed/merged PRs it's closedAt - createdAt. `gh` emits
+        // RFC-3339 timestamps.
+        let created_at = pr["createdAt"]
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+        let closed_at = pr["closedAt"]
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+        let duration_seconds = created_at.map(|start| {
+            let end = closed_at.map(|c| c.with_timezone(&chrono::Utc)).unwrap_or(now);
+            (end - start.with_timezone(&chrono::Utc))
+                .num_seconds()
+                .max(0) as u64
+        });
+
+        jobs.push(RemoteJob {
+            number,
+            plan_name,
+            status,
+            target,
+            duration_seconds,
+        });
     }
     Ok(jobs)
 }
@@ -364,6 +387,10 @@ pub struct RemoteJob {
     pub plan_name: String,
     pub status: String,
     pub target: String,
+    /// Wall-clock duration in seconds. `None` if the PR lacks a valid
+    /// `createdAt` timestamp. For open PRs this is age since creation;
+    /// for closed/merged PRs it's the time between creation and close.
+    pub duration_seconds: Option<u64>,
 }
 
 /// Queries the state and labels of a PR by number. Returns `(state, labels)`.
