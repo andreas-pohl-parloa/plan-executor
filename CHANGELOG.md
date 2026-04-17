@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.30.0] - 2026-04-17
+
+### Features
+
+- Daemon-inject subprocess-hygiene block into every sub-agent prompt ([1a9203f](https://github.com/andreas-pohl-parloa/plan-executor/commit/1a9203fb7e86e29ba9b85337b7e5e8b4adeb3359))
 ## [0.29.1] - 2026-04-17
 
 ### Bug Fixes
