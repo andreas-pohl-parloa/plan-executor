@@ -97,6 +97,29 @@ fn truncate_str(s: &str, max: usize) -> String {
     }
 }
 
+/// Formats a duration in seconds as a compact two-unit string:
+///   <60s     → "45s"
+///   <60m     → "12m34s"
+///   <24h     → "2h15m"
+///   >=24h    → "3d02h"
+fn format_duration(total_seconds: u64) -> String {
+    if total_seconds < 60 {
+        format!("{}s", total_seconds)
+    } else if total_seconds < 3_600 {
+        let m = total_seconds / 60;
+        let s = total_seconds % 60;
+        format!("{}m{:02}s", m, s)
+    } else if total_seconds < 86_400 {
+        let h = total_seconds / 3_600;
+        let m = (total_seconds % 3_600) / 60;
+        format!("{}h{:02}m", h, m)
+    } else {
+        let d = total_seconds / 86_400;
+        let h = (total_seconds % 86_400) / 3_600;
+        format!("{}d{:02}h", d, h)
+    }
+}
+
 pub fn run() {
     let cli = Cli::parse();
 
@@ -795,7 +818,7 @@ fn list_jobs() {
             JobStatus::RemoteRunning => "remote",
         };
         let duration = job.duration_ms
-            .map(|ms| format!("{}s", ms / 1000))
+            .map(|ms| format_duration(ms / 1000))
             .unwrap_or_else(|| "-".to_string());
         println!(
             "{:<id_w$}  {:<plan_w$}  {:<status_w$}  {:>dur_w$}",
@@ -837,7 +860,7 @@ fn list_jobs() {
                     let target_display = truncate_str(&rj.target, r_target_w);
                     let duration = rj
                         .duration_seconds
-                        .map(|s| format!("{}s", s))
+                        .map(format_duration)
                         .unwrap_or_else(|| "-".to_string());
                     println!(
                         "#{:<width$}  {:<r_plan_w$}  {:<r_status_w$}  {:<r_target_w$}  {:>r_dur_w$}",
@@ -1164,4 +1187,37 @@ fn notify_daemon_track_remote(plan_path: String, remote_repo: String, pr_number:
 
 fn gh_secret_set(repo: &str, name: &str, value: &str) -> Result<()> {
     crate::remote::gh_secret_set_stdin(name, repo, value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_duration_seconds_only() {
+        assert_eq!(format_duration(0), "0s");
+        assert_eq!(format_duration(1), "1s");
+        assert_eq!(format_duration(59), "59s");
+    }
+
+    #[test]
+    fn format_duration_minutes_and_seconds() {
+        assert_eq!(format_duration(60), "1m00s");
+        assert_eq!(format_duration(125), "2m05s");
+        assert_eq!(format_duration(3_599), "59m59s");
+    }
+
+    #[test]
+    fn format_duration_hours_and_minutes() {
+        assert_eq!(format_duration(3_600), "1h00m");
+        assert_eq!(format_duration(5_579), "1h32m");
+        assert_eq!(format_duration(86_399), "23h59m");
+    }
+
+    #[test]
+    fn format_duration_days_and_hours() {
+        assert_eq!(format_duration(86_400), "1d00h");
+        assert_eq!(format_duration(100_000), "1d03h");
+        assert_eq!(format_duration(604_800), "7d00h");
+    }
 }
