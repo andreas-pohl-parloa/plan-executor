@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.31.0] - 2026-04-17
+
+### Features
+
+- Include sub-agent index in indent prefix ([77b8299](https://github.com/andreas-pohl-parloa/plan-executor/commit/77b82994de9f3ba71ab901d9103052cf233d1f43))
 ## [0.30.1] - 2026-04-17
 
 ### Bug Fixes
