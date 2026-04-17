@@ -876,13 +876,16 @@ fn list_jobs() {
     // Fixed-width columns; PLAN gets all remaining space
     let id_w = 10;
     let status_w = 8;
+    let last_w = 8;
     let dur_w = 10;
-    let gaps = 6; // 3 gaps × 2 spaces each
-    let plan_w = term_w.saturating_sub(id_w + status_w + dur_w + gaps).max(20);
+    let gaps = 8; // 4 gaps × 2 spaces each
+    let plan_w = term_w
+        .saturating_sub(id_w + status_w + last_w + dur_w + gaps)
+        .max(20);
 
     println!(
-        "{:<id_w$}  {:<plan_w$}  {:<status_w$}  {:>dur_w$}",
-        "ID", "PLAN", "STATUS", "DURATION",
+        "{:<id_w$}  {:<plan_w$}  {:<status_w$}  {:>last_w$}  {:>dur_w$}",
+        "ID", "PLAN", "STATUS", "LAST", "DURATION",
     );
     println!("{}", "─".repeat(term_w));
 
@@ -900,9 +903,18 @@ fn list_jobs() {
         let duration = job.duration_ms
             .map(|ms| format_duration(ms / 1000))
             .unwrap_or_else(|| "-".to_string());
+        let last = if matches!(job.status, JobStatus::Running) {
+            job_processes
+                .get(&job.id)
+                .and_then(|p| p.idle_seconds)
+                .map(format_duration)
+                .unwrap_or_else(|| "-".to_string())
+        } else {
+            "-".to_string()
+        };
         let line = format!(
-            "{:<id_w$}  {:<plan_w$}  {:<status_w$}  {:>dur_w$}",
-            id, plan_display, status, duration,
+            "{:<id_w$}  {:<plan_w$}  {:<status_w$}  {:>last_w$}  {:>dur_w$}",
+            id, plan_display, status, last, duration,
         );
         let is_running = matches!(job.status, JobStatus::Running | JobStatus::RemoteRunning);
         if is_running {

@@ -39,6 +39,12 @@ pub struct JobProcesses {
     /// PGIDs for every currently-dispatched sub-agent.
     #[serde(default)]
     pub sub_agent_pgids: Vec<u32>,
+    /// Seconds since the last liveness event for this job. `None` if no
+    /// baseline has been stamped yet. This is the same signal the
+    /// watchdog uses — small values mean the job is actively producing
+    /// output, large values mean it's been silent.
+    #[serde(default)]
+    pub idle_seconds: Option<u64>,
 }
 
 /// Messages sent from Daemon → TUI

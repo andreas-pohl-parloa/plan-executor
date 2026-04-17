@@ -132,6 +132,7 @@ fn append_display(job_id: &str, line: &str) {
 
 impl DaemonState {
     pub fn snapshot_state(&self) -> DaemonEvent {
+        let now = Instant::now();
         let running_processes = self
             .running_jobs
             .keys()
@@ -143,6 +144,9 @@ impl DaemonState {
                     .get(job_id)
                     .cloned()
                     .unwrap_or_default(),
+                idle_seconds: self.job_last_activity.get(job_id).map(|t| {
+                    now.saturating_duration_since(*t).as_secs()
+                }),
             })
             .collect();
         DaemonEvent::State {
