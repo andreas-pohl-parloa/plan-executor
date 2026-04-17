@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.22.0] - 2026-04-17
+
+### Features
+
+- Show duration column for remote jobs ([cb82bfc](https://github.com/andreas-pohl-parloa/plan-executor/commit/cb82bfcea19866fd3c8645b6e5ac075b2a38fc47))
 ## [0.21.2] - 2026-04-17
 
 ### Bug Fixes
