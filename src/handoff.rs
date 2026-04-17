@@ -276,6 +276,29 @@ fn inject_streaming_flags(agent_type: &AgentType, args: &mut Vec<String>) {
 ///  * Codex `--json`              — `{"msg":{"type":"agent_message",
 ///    "message":"..."}}`. The final agent_message event contains the
 ///    model's last text response.
+/// Checks a single JSONL line for the terminal "agent is done"
+/// signature. Mirrors the match set in `extract_result_text` but returns
+/// a `bool` so the streaming reader can cheaply flag completion without
+/// collecting text.
+fn is_terminal_result_line(line: &str) -> bool {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    if parsed.get("type").and_then(|v| v.as_str()) == Some("result")
+        && parsed.get("result").and_then(|v| v.as_str()).is_some()
+    {
+        return true;
+    }
+    if let Some(msg) = parsed.get("msg") {
+        if msg.get("type").and_then(|v| v.as_str()) == Some("agent_message")
+            && msg.get("message").and_then(|v| v.as_str()).is_some()
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn extract_result_text(lines: &[String]) -> Option<String> {
     for line in lines.iter().rev() {
         let parsed: serde_json::Value = match serde_json::from_str(line) {
@@ -430,19 +453,30 @@ async fn dispatch_agent(
     }
 
     // Non-bash JSONL streaming path. Every stdout/stderr line is read as
-    // it arrives so the daemon can stamp `job_last_activity` per tick —
-    // that's what the watchdog now relies on instead of the old blind
-    // heartbeat. The final continuation payload is extracted from the
-    // JSONL `result` event (see extract_result_text); raw stdout
-    // concatenation is the fallback when no recognizable result event
-    // appears (non-JSONL agent, malformed stream, etc.).
+    // it arrives so the daemon can stamp `job_last_activity` per tick.
+    //
+    // Critically, the sub-agent process doesn't always exit when it
+    // emits its terminal result: claude CLI spawns Bash-tool commands
+    // with `setpgid`, and a hung shell script (e.g. stuck on
+    // `wait $PROXY_PID`) keeps claude's stdout pipe open via inherited
+    // fds, so `child.wait()` would block forever even though the agent's
+    // work is done. To unblock the main-agent resume, we detect the
+    // terminal `result` event as it streams by, start a short grace
+    // timer, then force-kill the entire descendant process tree. The
+    // result text is already captured in `stdout_lines` before the kill,
+    // so the continuation payload is unaffected.
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    let child_pid = child.id().unwrap_or(0);
+
+    let terminal_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let notify_reader = std::sync::Arc::clone(&terminal_notify);
 
     let sa_out = subagent_tx.clone();
     let stdout_handle = tokio::spawn(async move {
         use tokio::io::{AsyncBufReadExt, BufReader};
         let mut lines: Vec<String> = Vec::new();
+        let mut notified = false;
         if let Some(out) = stdout {
             let mut reader = BufReader::new(out).lines();
             while let Ok(Some(line)) = reader.next_line().await {
@@ -453,6 +487,10 @@ async fn dispatch_agent(
                         is_stderr: false,
                         line: line.clone(),
                     });
+                }
+                if !notified && is_terminal_result_line(&line) {
+                    notified = true;
+                    notify_reader.notify_one();
                 }
                 lines.push(line);
             }
@@ -481,7 +519,30 @@ async fn dispatch_agent(
         lines
     });
 
-    let status = child.wait().await;
+    let status = {
+        let terminal_fired = async {
+            terminal_notify.notified().await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        };
+        tokio::pin!(terminal_fired);
+        tokio::select! {
+            biased;
+            s = child.wait() => s,
+            _ = &mut terminal_fired => {
+                // Agent emitted its result event but is still alive —
+                // almost always a Bash-tool grand-child deadlock holding
+                // stdout open. Force-kill the whole descendant pgroup
+                // tree so our streams close and we can move on.
+                tracing::warn!(
+                    agent = %agent_type_label, index,
+                    "sub-agent emitted terminal result but did not exit; force-killing tree",
+                );
+                crate::proctree::kill_descendant_pgids(child_pid);
+                let _ = child.kill().await;
+                child.wait().await
+            }
+        }
+    };
     let stdout_lines = stdout_handle.await.unwrap_or_default();
     let stderr_lines = stderr_handle.await.unwrap_or_default();
     let success = status.map(|s| s.success()).unwrap_or(false);
@@ -910,5 +971,37 @@ mod tests {
             r#"plain text not json"#.to_string(),
         ];
         assert_eq!(extract_result_text(&lines), None);
+    }
+
+    #[test]
+    fn is_terminal_result_line_detects_claude_result() {
+        assert!(is_terminal_result_line(
+            r#"{"type":"result","subtype":"success","result":"done"}"#
+        ));
+    }
+
+    #[test]
+    fn is_terminal_result_line_detects_codex_agent_message() {
+        assert!(is_terminal_result_line(
+            r#"{"id":"1","msg":{"type":"agent_message","message":"all good"}}"#
+        ));
+    }
+
+    #[test]
+    fn is_terminal_result_line_rejects_result_without_text() {
+        // A result event without a string `result` field is not usable
+        // as a terminal signal.
+        assert!(!is_terminal_result_line(
+            r#"{"type":"result","subtype":"error"}"#
+        ));
+    }
+
+    #[test]
+    fn is_terminal_result_line_rejects_other_events() {
+        assert!(!is_terminal_result_line(
+            r#"{"type":"assistant","message":{"content":"mid"}}"#
+        ));
+        assert!(!is_terminal_result_line(""));
+        assert!(!is_terminal_result_line("not json at all"));
     }
 }

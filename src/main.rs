@@ -7,6 +7,7 @@ mod ipc;
 mod remote;
 mod jobs;
 mod plan;
+mod proctree;
 
 pub use config::Config;
 
