@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.24.0] - 2026-04-17
+
+### Features
+
+- Color running jobs yellow in jobs table ([4843248](https://github.com/andreas-pohl-parloa/plan-executor/commit/4843248e89c46255b1b293c83b3b9e0ec5f6af8b))
 ## [0.23.0] - 2026-04-17
 
 ### Features
