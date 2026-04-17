@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.21.1] - 2026-04-17
+
+### Bug Fixes
+
+- Track sub-agent pgids in real time so kill reaches in-flight dispatches ([cf6c69d](https://github.com/andreas-pohl-parloa/plan-executor/commit/cf6c69d12df03b71a62bdf986577567abe252298))
 ## [0.21.0] - 2026-04-17
 
 ### Features
