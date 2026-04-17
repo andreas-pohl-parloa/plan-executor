@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.30.1] - 2026-04-17
+
+### Bug Fixes
+
+- Prepend hygiene block as a top-of-prompt blockquote ([b9e33d8](https://github.com/andreas-pohl-parloa/plan-executor/commit/b9e33d8edcc9e046784a9380d906ff13dd7cd649))
 ## [0.30.0] - 2026-04-17
 
 ### Features
