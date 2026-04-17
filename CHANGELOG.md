@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.21.0] - 2026-04-17
+
+### Features
+
+- Add watchdog for hung local jobs ([13a699f](https://github.com/andreas-pohl-parloa/plan-executor/commit/13a699fe6d244558a3128c8ea65100aaa166c2b2))
 ## [0.20.2] - 2026-04-16
 
 ### Bug Fixes
