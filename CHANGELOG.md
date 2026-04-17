@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.29.1] - 2026-04-17
+
+### Bug Fixes
+
+- Unblock main agent when sub-agent emits result but doesn't exit ([1145061](https://github.com/andreas-pohl-parloa/plan-executor/commit/1145061ef0dc4dda0b921f0aa7efadb64a4f70ab))
 ## [0.29.0] - 2026-04-17
 
 ### Features
