@@ -276,6 +276,61 @@ fn inject_streaming_flags(agent_type: &AgentType, args: &mut Vec<String>) {
 ///  * Codex `--json`              — `{"msg":{"type":"agent_message",
 ///    "message":"..."}}`. The final agent_message event contains the
 ///    model's last text response.
+/// Canonical marker string the daemon looks for to decide whether a
+/// prompt file already carries the subprocess-hygiene block. Must match
+/// the block emitted by both `ensure_hygiene_in_prompt` below and the
+/// plugin SKILL.md copies so we don't duplicate a block the orchestrator
+/// correctly emitted.
+const HYGIENE_MARKER: &str = "Subprocess hygiene (MANDATORY";
+
+/// Subprocess-hygiene block appended to every non-bash sub-agent prompt
+/// at dispatch time. Uses the same 4-rule wording the SKILL.md files
+/// carry so sub-agents see a consistent rule regardless of whether the
+/// orchestrator remembered to include it. A visible daemon-injected
+/// banner makes it clear this came from the executor, not the plan.
+const HYGIENE_BLOCK: &str = concat!(
+    "\n\n---\n\n",
+    "<!-- plan-executor daemon-injected block: enforced regardless of orchestrator compliance. -->\n\n",
+    "**Subprocess hygiene (MANDATORY — the daemon watchdog kills the job after prolonged silence).**\n\n",
+    "Any Bash command that starts a long-running or backgrounded process MUST follow these rules:\n",
+    "1. Wrap every invocation in `timeout N` (N ≤ 600 seconds). Example: `timeout 120 ./run-tests`.\n",
+    "2. Never call bare `wait \"$PID\"` on a backgrounded process. Use `timeout N wait \"$PID\"` or a bounded `kill -0 \"$PID\"` poll with a max iteration count instead.\n",
+    "3. Escalate signals on cleanup: `kill -TERM \"$PID\" 2>/dev/null; sleep 1; kill -KILL \"$PID\" 2>/dev/null || true`. `SIGTERM` alone may be ignored.\n",
+    "4. Before exiting any script that spawned children, reap the group: `pkill -P $$ 2>/dev/null || true`.\n",
+);
+
+/// Appends the canonical hygiene block to a sub-agent prompt file if it
+/// isn't already present. Idempotent via `HYGIENE_MARKER`. Silent on
+/// read/write failures — the block is a defense-in-depth safeguard, so
+/// an I/O hiccup shouldn't block dispatch; the in-daemon watchdog and
+/// terminal-result grace kill still cover the worst case.
+///
+/// Appends rather than prepends because several sub-agent prompt
+/// conventions rely on the first line being semantically meaningful —
+/// e.g. the security reviewer's `/security:big-toni` invocation line.
+/// Prepending would break those.
+fn ensure_hygiene_in_prompt(path: &Path) {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "hygiene inject: read failed");
+            return;
+        }
+    };
+    if content.contains(HYGIENE_MARKER) {
+        return;
+    }
+    let mut new = String::with_capacity(content.len() + HYGIENE_BLOCK.len());
+    new.push_str(&content);
+    if !content.ends_with('\n') {
+        new.push('\n');
+    }
+    new.push_str(HYGIENE_BLOCK);
+    if let Err(e) = std::fs::write(path, new) {
+        tracing::warn!(path = %path.display(), error = %e, "hygiene inject: write failed");
+    }
+}
+
 /// Checks a single JSONL line for the terminal "agent is done"
 /// signature. Mirrors the match set in `extract_result_text` but returns
 /// a `bool` so the streaming reader can cheaply flag completion without
@@ -350,6 +405,14 @@ async fn dispatch_agent(
             success: false,
             can_fail,
         }, 0);
+    }
+
+    // Defense-in-depth: guarantee every non-bash sub-agent prompt
+    // carries the subprocess-hygiene rule even if the orchestrator LLM
+    // forgot to emit it. Bash handoffs are shell scripts — injecting
+    // markdown into them would break execution, so we skip bash here.
+    if !is_bash {
+        ensure_hygiene_in_prompt(&handoff.prompt_file);
     }
 
     let (program, mut args) = crate::config::Config::parse_cmd(&cmd);
@@ -1003,5 +1066,54 @@ mod tests {
         ));
         assert!(!is_terminal_result_line(""));
         assert!(!is_terminal_result_line("not json at all"));
+    }
+
+    #[test]
+    fn ensure_hygiene_in_prompt_appends_when_missing() {
+        let tmp = std::env::temp_dir().join(format!(
+            "plan-executor-hygiene-missing-{}.md",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, "Original prompt body\nsecond line").unwrap();
+        ensure_hygiene_in_prompt(&tmp);
+        let updated = std::fs::read_to_string(&tmp).unwrap();
+        assert!(updated.starts_with("Original prompt body"));
+        assert!(updated.contains(HYGIENE_MARKER));
+        assert!(updated.contains("plan-executor daemon-injected"));
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn ensure_hygiene_in_prompt_is_idempotent() {
+        let tmp = std::env::temp_dir().join(format!(
+            "plan-executor-hygiene-idempotent-{}.md",
+            std::process::id()
+        ));
+        let original = format!(
+            "Prompt header\n\n**{}** some body text\nmore\n",
+            HYGIENE_MARKER
+        );
+        std::fs::write(&tmp, &original).unwrap();
+        ensure_hygiene_in_prompt(&tmp);
+        let after = std::fs::read_to_string(&tmp).unwrap();
+        // File untouched because marker was already present.
+        assert_eq!(after, original);
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn ensure_hygiene_in_prompt_adds_trailing_newline_if_missing() {
+        let tmp = std::env::temp_dir().join(format!(
+            "plan-executor-hygiene-nonl-{}.md",
+            std::process::id()
+        ));
+        // No trailing newline on original — appended block must still
+        // be on its own line, not glued to the last character.
+        std::fs::write(&tmp, "no final newline").unwrap();
+        ensure_hygiene_in_prompt(&tmp);
+        let updated = std::fs::read_to_string(&tmp).unwrap();
+        assert!(updated.starts_with("no final newline\n"));
+        assert!(updated.contains(HYGIENE_MARKER));
+        std::fs::remove_file(&tmp).ok();
     }
 }
