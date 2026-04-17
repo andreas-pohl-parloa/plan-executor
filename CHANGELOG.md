@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.28.0] - 2026-04-17
+
+### Features
+
+- Persist and render sub-agent JSONL inline in output command ([b1edadc](https://github.com/andreas-pohl-parloa/plan-executor/commit/b1edadc494e8f79787db6fb0e6f1f65b0234135d))
 ## [0.27.0] - 2026-04-17
 
 ### Features
