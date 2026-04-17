@@ -283,32 +283,35 @@ fn inject_streaming_flags(agent_type: &AgentType, args: &mut Vec<String>) {
 /// correctly emitted.
 const HYGIENE_MARKER: &str = "Subprocess hygiene (MANDATORY";
 
-/// Subprocess-hygiene block appended to every non-bash sub-agent prompt
-/// at dispatch time. Uses the same 4-rule wording the SKILL.md files
-/// carry so sub-agents see a consistent rule regardless of whether the
-/// orchestrator remembered to include it. A visible daemon-injected
-/// banner makes it clear this came from the executor, not the plan.
+/// Subprocess-hygiene block prepended to every non-bash sub-agent
+/// prompt at dispatch time. Wrapped in a Markdown blockquote and
+/// preceded by a "Sub-Agent Instructions" banner so it reads as
+/// framing rather than body content. Uses the same 4-rule wording the
+/// plugin SKILL.md copies carry.
 const HYGIENE_BLOCK: &str = concat!(
-    "\n\n---\n\n",
-    "<!-- plan-executor daemon-injected block: enforced regardless of orchestrator compliance. -->\n\n",
-    "**Subprocess hygiene (MANDATORY — the daemon watchdog kills the job after prolonged silence).**\n\n",
-    "Any Bash command that starts a long-running or backgrounded process MUST follow these rules:\n",
-    "1. Wrap every invocation in `timeout N` (N ≤ 600 seconds). Example: `timeout 120 ./run-tests`.\n",
-    "2. Never call bare `wait \"$PID\"` on a backgrounded process. Use `timeout N wait \"$PID\"` or a bounded `kill -0 \"$PID\"` poll with a max iteration count instead.\n",
-    "3. Escalate signals on cleanup: `kill -TERM \"$PID\" 2>/dev/null; sleep 1; kill -KILL \"$PID\" 2>/dev/null || true`. `SIGTERM` alone may be ignored.\n",
-    "4. Before exiting any script that spawned children, reap the group: `pkill -P $$ 2>/dev/null || true`.\n",
+    "> **Sub-Agent Instructions (plan-executor enforced — do not remove):**\n",
+    ">\n",
+    "> **Subprocess hygiene (MANDATORY — the daemon watchdog kills the job after prolonged silence).**\n",
+    ">\n",
+    "> Any Bash command that starts a long-running or backgrounded process MUST follow these rules:\n",
+    "> 1. Wrap every invocation in `timeout N` (N ≤ 600 seconds). Example: `timeout 120 ./run-tests`.\n",
+    "> 2. Never call bare `wait \"$PID\"` on a backgrounded process. Use `timeout N wait \"$PID\"` or a bounded `kill -0 \"$PID\"` poll with a max iteration count instead.\n",
+    "> 3. Escalate signals on cleanup: `kill -TERM \"$PID\" 2>/dev/null; sleep 1; kill -KILL \"$PID\" 2>/dev/null || true`. `SIGTERM` alone may be ignored.\n",
+    "> 4. Before exiting any script that spawned children, reap the group: `pkill -P $$ 2>/dev/null || true`.\n",
+    "\n---\n\n",
 );
 
-/// Appends the canonical hygiene block to a sub-agent prompt file if it
+/// Prepends the canonical hygiene block to a sub-agent prompt if it
 /// isn't already present. Idempotent via `HYGIENE_MARKER`. Silent on
 /// read/write failures — the block is a defense-in-depth safeguard, so
 /// an I/O hiccup shouldn't block dispatch; the in-daemon watchdog and
 /// terminal-result grace kill still cover the worst case.
 ///
-/// Appends rather than prepends because several sub-agent prompt
-/// conventions rely on the first line being semantically meaningful —
-/// e.g. the security reviewer's `/security:big-toni` invocation line.
-/// Prepending would break those.
+/// If the first non-empty line is a slash-command invocation
+/// (e.g. the security reviewer's `/security:big-toni`), the block is
+/// inserted immediately after that line so the slash invocation stays
+/// in its conventional first-line position. Otherwise the block is
+/// prepended to the very top of the file.
 fn ensure_hygiene_in_prompt(path: &Path) {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -320,14 +323,43 @@ fn ensure_hygiene_in_prompt(path: &Path) {
     if content.contains(HYGIENE_MARKER) {
         return;
     }
-    let mut new = String::with_capacity(content.len() + HYGIENE_BLOCK.len());
-    new.push_str(&content);
-    if !content.ends_with('\n') {
-        new.push('\n');
-    }
-    new.push_str(HYGIENE_BLOCK);
+    let new = inject_hygiene_block(&content);
     if let Err(e) = std::fs::write(path, new) {
         tracing::warn!(path = %path.display(), error = %e, "hygiene inject: write failed");
+    }
+}
+
+/// Pure prepend helper split out for unit-testing. Returns a new string
+/// with `HYGIENE_BLOCK` placed near the top of `content`, preserving
+/// a leading slash-command invocation if present.
+fn inject_hygiene_block(content: &str) -> String {
+    let (head, body) = split_leading_slash_invocation(content);
+    let mut out = String::with_capacity(content.len() + HYGIENE_BLOCK.len() + 1);
+    if !head.is_empty() {
+        out.push_str(head);
+        if !head.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out.push_str(HYGIENE_BLOCK);
+    out.push_str(body);
+    out
+}
+
+/// If the prompt opens with a slash-command line (after optional
+/// leading blank lines), returns `(head, body)` where `head` is that
+/// line (including its trailing newline if present) and `body` is the
+/// remainder. Otherwise returns `("", content)`.
+fn split_leading_slash_invocation(content: &str) -> (&str, &str) {
+    let trimmed_start = content.trim_start_matches('\n');
+    let offset = content.len() - trimmed_start.len();
+    let first_line_end = trimmed_start.find('\n').map(|e| e + 1).unwrap_or(trimmed_start.len());
+    let first_line = &trimmed_start[..first_line_end];
+    if first_line.trim_start().starts_with('/') {
+        let split_at = offset + first_line_end;
+        (&content[..split_at], &content[split_at..])
+    } else {
+        ("", content)
     }
 }
 
@@ -1069,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_hygiene_in_prompt_appends_when_missing() {
+    fn ensure_hygiene_in_prompt_prepends_when_missing() {
         let tmp = std::env::temp_dir().join(format!(
             "plan-executor-hygiene-missing-{}.md",
             std::process::id()
@@ -1077,9 +1109,14 @@ mod tests {
         std::fs::write(&tmp, "Original prompt body\nsecond line").unwrap();
         ensure_hygiene_in_prompt(&tmp);
         let updated = std::fs::read_to_string(&tmp).unwrap();
-        assert!(updated.starts_with("Original prompt body"));
+        // Block is at the top (blockquote banner precedes the body).
+        assert!(updated.starts_with("> **Sub-Agent Instructions"));
         assert!(updated.contains(HYGIENE_MARKER));
-        assert!(updated.contains("plan-executor daemon-injected"));
+        assert!(updated.contains("Original prompt body"));
+        // Marker comes before body.
+        let marker_pos = updated.find(HYGIENE_MARKER).unwrap();
+        let body_pos = updated.find("Original prompt body").unwrap();
+        assert!(marker_pos < body_pos);
         std::fs::remove_file(&tmp).ok();
     }
 
@@ -1102,18 +1139,44 @@ mod tests {
     }
 
     #[test]
-    fn ensure_hygiene_in_prompt_adds_trailing_newline_if_missing() {
-        let tmp = std::env::temp_dir().join(format!(
-            "plan-executor-hygiene-nonl-{}.md",
-            std::process::id()
-        ));
-        // No trailing newline on original — appended block must still
-        // be on its own line, not glued to the last character.
-        std::fs::write(&tmp, "no final newline").unwrap();
-        ensure_hygiene_in_prompt(&tmp);
-        let updated = std::fs::read_to_string(&tmp).unwrap();
-        assert!(updated.starts_with("no final newline\n"));
-        assert!(updated.contains(HYGIENE_MARKER));
-        std::fs::remove_file(&tmp).ok();
+    fn inject_hygiene_block_preserves_slash_command_first_line() {
+        let prompt = "/security:big-toni review the repo\n\nRest of prompt.\n";
+        let out = inject_hygiene_block(prompt);
+        // Slash command stays on line 1.
+        assert!(out.starts_with("/security:big-toni review the repo\n"));
+        // Block comes immediately after.
+        let first_newline = out.find('\n').unwrap();
+        assert!(out[first_newline..].starts_with("\n> **Sub-Agent Instructions"));
+        // Body is after the block.
+        assert!(out.contains("Rest of prompt."));
+    }
+
+    #[test]
+    fn inject_hygiene_block_prepends_when_no_slash_line() {
+        let prompt = "You are a focused agent. Do X.\n";
+        let out = inject_hygiene_block(prompt);
+        assert!(out.starts_with("> **Sub-Agent Instructions"));
+        assert!(out.contains("You are a focused agent. Do X."));
+    }
+
+    #[test]
+    fn split_leading_slash_invocation_detects_slash() {
+        let (head, body) = split_leading_slash_invocation("/foo:bar arg\nrest\n");
+        assert_eq!(head, "/foo:bar arg\n");
+        assert_eq!(body, "rest\n");
+    }
+
+    #[test]
+    fn split_leading_slash_invocation_ignores_non_slash() {
+        let (head, body) = split_leading_slash_invocation("You are a reviewer.\nrest\n");
+        assert_eq!(head, "");
+        assert_eq!(body, "You are a reviewer.\nrest\n");
+    }
+
+    #[test]
+    fn split_leading_slash_invocation_skips_blank_lines() {
+        let (head, body) = split_leading_slash_invocation("\n\n/foo:bar\nrest\n");
+        assert_eq!(head, "\n\n/foo:bar\n");
+        assert_eq!(body, "rest\n");
     }
 }
