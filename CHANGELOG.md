@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.26.0] - 2026-04-17
+
+### Features
+
+- Stream sub-agent stdout for real liveness, drop heartbeat ([4dc60a4](https://github.com/andreas-pohl-parloa/plan-executor/commit/4dc60a46de8ec986923060d270e2a60444781dfd))
 ## [0.25.0] - 2026-04-17
 
 ### Features
