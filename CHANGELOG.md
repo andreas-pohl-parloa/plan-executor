@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.21.2] - 2026-04-17
+
+### Bug Fixes
+
+- Size remote jobs status column to widest value ([da6e81c](https://github.com/andreas-pohl-parloa/plan-executor/commit/da6e81ce5ce19c433ac0d1fc9631438f2c247bee))
 ## [0.21.1] - 2026-04-17
 
 ### Bug Fixes
