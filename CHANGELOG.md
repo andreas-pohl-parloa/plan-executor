@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.26.1] - 2026-04-17
+
+### Bug Fixes
+
+- Tree-walking kill reaches grand-children in foreign pgroups ([96b23b9](https://github.com/andreas-pohl-parloa/plan-executor/commit/96b23b947b3a3ea14e1186e6ffa65f714be88bc3))
 ## [0.26.0] - 2026-04-17
 
 ### Features
