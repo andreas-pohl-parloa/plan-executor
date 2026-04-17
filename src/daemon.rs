@@ -314,26 +314,113 @@ fn spawn_pgid_registrar(
     })
 }
 
+/// Snapshots the OS process table as `(pid, ppid, pgid)` tuples. Uses
+/// `ps -A -o pid=,ppid=,pgid=` which is portable across macOS and Linux.
+/// Returns an empty vec on any `ps` failure.
+fn snapshot_process_table() -> Vec<(u32, u32, u32)> {
+    let output = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,pgid="])
+        .output();
+    let Ok(output) = output else { return Vec::new() };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut parts = l.split_whitespace();
+            let pid: u32 = parts.next()?.parse().ok()?;
+            let ppid: u32 = parts.next()?.parse().ok()?;
+            let pgid: u32 = parts.next()?.parse().ok()?;
+            Some((pid, ppid, pgid))
+        })
+        .collect()
+}
+
+/// BFS expansion of a root PID's descendant set using a pre-sampled
+/// process table. Extracted for deterministic unit testing. Pure: no I/O,
+/// no process side effects.
+fn expand_descendants(table: &[(u32, u32, u32)], root_pid: u32) -> std::collections::HashSet<u32> {
+    let mut descendants: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    descendants.insert(root_pid);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (pid, ppid, _pgid) in table {
+            if !descendants.contains(pid) && descendants.contains(ppid) {
+                descendants.insert(*pid);
+                changed = true;
+            }
+        }
+    }
+    descendants
+}
+
+/// Projects a descendant PID set to the unique set of PGIDs those
+/// descendants belong to. Skips pgid 0/1 so we never signal init or the
+/// daemon's own pgroup.
+fn collect_pgids_from_descendants(
+    table: &[(u32, u32, u32)],
+    descendants: &std::collections::HashSet<u32>,
+) -> Vec<u32> {
+    let mut pgids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for (pid, _ppid, pgid) in table {
+        if descendants.contains(pid) && *pgid > 1 {
+            pgids.insert(*pgid);
+        }
+    }
+    pgids.into_iter().collect()
+}
+
+/// Walks the live process table rooted at `root_pid` and returns every
+/// distinct PGID under that root (including root's own). Used to reach
+/// grand-children in pgroups that don't match the one the daemon
+/// tracked — claude CLI's Bash tool calls `setpgid` on each spawned
+/// command, so a sub-agent's shell scripts end up as pgroup leaders of
+/// their own groups and are invisible to `kill -<tracked_pgid>`.
+fn collect_descendant_pgids(root_pid: u32) -> Vec<u32> {
+    let table = snapshot_process_table();
+    let descendants = expand_descendants(&table, root_pid);
+    collect_pgids_from_descendants(&table, &descendants)
+}
+
 /// Sends SIGKILL to a job's main process group, all active sub-agent process
 /// groups, and its tracked child handle. Does NOT finalize the job — the
 /// caller owns the status transition. Safe to call while holding the state
 /// mutex: the only `.await` is `child.kill().await`, which is fine under a
 /// tokio Mutex.
+///
+/// For each tracked pgroup, this also walks the live process tree and
+/// signals every descendant pgroup. Necessary because claude's Bash tool
+/// puts each spawned command in its own process group via `setpgid`, so
+/// hanging shell scripts survive a plain pgroup-kill of the sub-agent.
 async fn send_kill_signals(st: &mut DaemonState, job_id: &str) {
+    let mut all_pgids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
     if let Some(pgid) = st.process_group_ids.remove(job_id) {
         if pgid > 0 {
-            #[cfg(unix)]
-            unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL); }
+            all_pgids.insert(pgid);
+            for p in collect_descendant_pgids(pgid) {
+                all_pgids.insert(p);
+            }
         }
     }
     if let Some(pgids) = st.sub_agent_pgids.remove(job_id) {
         for pgid in pgids {
             if pgid > 0 {
-                #[cfg(unix)]
-                unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL); }
+                all_pgids.insert(pgid);
+                for p in collect_descendant_pgids(pgid) {
+                    all_pgids.insert(p);
+                }
             }
         }
     }
+
+    for pgid in all_pgids {
+        #[cfg(unix)]
+        unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL); }
+    }
+
     if let Some(mut child) = st.running_children.remove(job_id) {
         let _ = child.kill().await;
     }
@@ -1477,5 +1564,83 @@ mod tests {
             compute_watchdog_timings(now, Some(last), start);
         assert_eq!(since_start, Duration::from_secs(100));
         assert_eq!(since_activity, Duration::from_secs(0));
+    }
+
+    // Synthetic process table matching the exact orphan pattern observed
+    // on job 3f17cc56: the daemon tracked pgid=sub_agent_pid (100) but
+    // the sub-agent's Bash-tool spawned shells (200, 300) became pgroup
+    // leaders of their own groups, and each shell backgrounded a proxy
+    // (201, 301) in its shell's pgroup.
+    fn orphan_like_table() -> Vec<(u32, u32, u32)> {
+        vec![
+            // (pid, ppid, pgid)
+            (1,   0,   1),     // init
+            (10,  1,   10),    // plan-executor daemon
+            (100, 10,  100),   // sub-agent (spawned with process_group(0))
+            (110, 100, 100),   // MCP server child of sub-agent, same pgroup
+            (200, 100, 200),   // shell 1 (setpgid → own pgroup)
+            (201, 200, 200),   // proxy 1, in shell's pgroup
+            (300, 100, 300),   // shell 2 (setpgid → own pgroup)
+            (301, 300, 300),   // proxy 2
+            (500, 1,   500),   // unrelated process
+        ]
+    }
+
+    #[test]
+    fn expand_descendants_walks_full_subtree() {
+        let table = orphan_like_table();
+        let d = expand_descendants(&table, 100);
+        assert!(d.contains(&100), "root included");
+        assert!(d.contains(&110), "direct child");
+        assert!(d.contains(&200), "child in different pgroup still reachable via ppid");
+        assert!(d.contains(&201), "grandchild");
+        assert!(d.contains(&300));
+        assert!(d.contains(&301));
+        assert!(!d.contains(&10), "parent not included");
+        assert!(!d.contains(&500), "unrelated not included");
+    }
+
+    #[test]
+    fn collect_pgids_covers_all_descendant_pgroups() {
+        let table = orphan_like_table();
+        let d = expand_descendants(&table, 100);
+        let pgids: std::collections::HashSet<u32> = collect_pgids_from_descendants(&table, &d)
+            .into_iter()
+            .collect();
+        // Every distinct pgroup under root 100: 100, 200, 300.
+        assert!(pgids.contains(&100));
+        assert!(pgids.contains(&200));
+        assert!(pgids.contains(&300));
+        assert_eq!(pgids.len(), 3);
+    }
+
+    #[test]
+    fn collect_pgids_skips_init_and_zero() {
+        let table = vec![
+            (1, 0, 1),   // init in pgroup 1 — skipped by > 1 filter
+            (5, 1, 0),   // bogus pgid 0 — skipped
+            (7, 5, 7),
+        ];
+        let d = expand_descendants(&table, 5);
+        let pgids: Vec<u32> = collect_pgids_from_descendants(&table, &d);
+        assert_eq!(pgids, vec![7]);
+    }
+
+    #[test]
+    fn expand_descendants_stops_without_children() {
+        let table = vec![(50, 1, 50)];
+        let d = expand_descendants(&table, 50);
+        assert_eq!(d.len(), 1);
+        assert!(d.contains(&50));
+    }
+
+    #[test]
+    fn expand_descendants_handles_missing_root_gracefully() {
+        // Root pid not present in table: returns a singleton set (root
+        // itself), no panic, no infinite loop.
+        let table = orphan_like_table();
+        let d = expand_descendants(&table, 9999);
+        assert_eq!(d.len(), 1);
+        assert!(d.contains(&9999));
     }
 }
