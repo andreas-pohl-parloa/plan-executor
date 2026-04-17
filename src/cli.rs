@@ -811,11 +811,18 @@ fn list_jobs() {
                 println!();
                 println!("Remote ({}):", remote_repo);
                 let pr_w = 6;
-                let r_status_w = 8;
-                let r_gaps = 6; // 3 gaps × 2 spaces
+                // Grow status/target columns to fit the widest value. The
+                // local table uses a fixed status_w=8, but remote statuses
+                // can be wider ("succeeded" is 9 chars), and a hard-coded
+                // 8 here silently pushes the target past term_w and wraps
+                // the last character.
+                let r_status_w = remote_jobs.iter()
+                    .map(|rj| rj.status.len())
+                    .max().unwrap_or(8).max(8);
                 let r_target_w = remote_jobs.iter()
                     .map(|rj| rj.target.len())
                     .max().unwrap_or(6).max(6);
+                let r_gaps = 6; // 3 gaps × 2 spaces
                 let r_plan_w = term_w.saturating_sub(pr_w + r_status_w + r_target_w + r_gaps).max(20);
                 println!(
                     "{:<pr_w$}  {:<r_plan_w$}  {:<r_status_w$}  {:<r_target_w$}",
