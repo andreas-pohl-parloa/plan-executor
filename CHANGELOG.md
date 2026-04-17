@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.23.0] - 2026-04-17
+
+### Features
+
+- Format job durations with minutes/hours/days instead of raw seconds ([191e694](https://github.com/andreas-pohl-parloa/plan-executor/commit/191e694392b92741211207e700be6dfbed3e4773))
 ## [0.22.0] - 2026-04-17
 
 ### Features
