@@ -378,10 +378,17 @@ async fn output_job(job_id_prefix: String, follow: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Follow mode: stream live JobDisplayLine events for this job.
-    // Use the same interleave logic so live output matches the replay.
+    // Follow mode: stream live JobDisplayLine and SubAgentLine events.
+    // Sub-agent output is rendered live as each line arrives rather than
+    // batch-rendered at `sub-agent N done` (which is how replay works).
+    // We track (dispatch, index) pairs we've seen live so that if a
+    // sub-agent finished before follow began, we still batch-render its
+    // file at the done marker; otherwise we skip the batch to avoid
+    // double-rendering what we already streamed.
     eprintln!("[following {} — Ctrl+C to stop]", &job_id[..job_id.len().min(8)]);
     let mut dispatch_counter: u32 = 0;
+    let mut live_streamed: std::collections::HashSet<(u32, usize)> =
+        std::collections::HashSet::new();
     while let Some(line) = reader.next_line().await? {
                 if let Ok(DaemonEvent::JobDisplayLine { job_id: jid, line: text }) =
                     serde_json::from_str::<DaemonEvent>(&line)
@@ -393,9 +400,19 @@ async fn output_job(job_id_prefix: String, follow: bool) -> Result<()> {
                             dispatch_counter += 1;
                         }
                         if let Some(idx) = parse_subagent_done_index(&text) {
-                            render_subagent_output(&job_id, dispatch_counter, idx);
+                            if !live_streamed.contains(&(dispatch_counter, idx)) {
+                                render_subagent_output(&job_id, dispatch_counter, idx);
+                            }
                         }
                         print_display_line(&text);
+                    }
+                } else if let Ok(DaemonEvent::SubAgentLine {
+                    job_id: jid, index, is_stderr, line: sa_line, ..
+                }) = serde_json::from_str::<DaemonEvent>(&line)
+                {
+                    if jid == job_id {
+                        live_streamed.insert((dispatch_counter, index));
+                        render_subagent_live(index, is_stderr, &sa_line);
                     }
                 } else if let Ok(DaemonEvent::JobUpdated { job }) =
                     serde_json::from_str::<DaemonEvent>(&line)
@@ -407,6 +424,25 @@ async fn output_job(job_id_prefix: String, follow: bool) -> Result<()> {
                 }
     }
     Ok(())
+}
+
+/// Renders one streamed sub-agent line in follow mode, using the same
+/// sjv pipeline and dim `│  ` indent prefix as the batch replay.
+fn render_subagent_live(_index: usize, is_stderr: bool, line: &str) {
+    if line.is_empty() {
+        return;
+    }
+    let rendered = if is_stderr {
+        format!("\x1b[2m{}\x1b[0m", line)
+    } else {
+        sjv::render_runtime_line(line, false, true)
+    };
+    for visual in rendered.lines() {
+        if visual.is_empty() {
+            continue;
+        }
+        println!("{}{}", SUBAGENT_PREFIX, visual);
+    }
 }
 
 /// Parses `⏺ [plan-executor] sub-agent <N> done` / `failed` /

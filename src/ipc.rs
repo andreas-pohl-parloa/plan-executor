@@ -67,6 +67,16 @@ pub enum DaemonEvent {
     JobOutput { job_id: String, line: String },
     /// A formatted human-readable display line for a job
     JobDisplayLine { job_id: String, line: String },
+    /// One streamed line from a sub-agent, broadcast live so `output -f`
+    /// can render sub-agent JSONL events as they arrive rather than only
+    /// batch-rendering from disk at `sub-agent N done`.
+    SubAgentLine {
+        job_id: String,
+        index: usize,
+        agent_type: String,
+        is_stderr: bool,
+        line: String,
+    },
     /// A job's metadata changed (status, tokens, cost)
     JobUpdated { job: JobMetadata },
     /// Error response

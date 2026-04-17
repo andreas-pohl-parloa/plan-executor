@@ -291,6 +291,7 @@ fn spawn_subagent_writer(
     state: Arc<Mutex<DaemonState>>,
     job_id: String,
     dispatch_num: u32,
+    event_tx: broadcast::Sender<DaemonEvent>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::handoff::SubAgentLine>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -312,6 +313,17 @@ fn spawn_subagent_writer(
                 }
                 st.job_last_activity.insert(job_id.clone(), Instant::now());
             }
+
+            // Broadcast live so `plan-executor output -f` can render each
+            // sub-agent line as it arrives instead of waiting for the
+            // "sub-agent N done" marker and re-reading from disk.
+            let _ = event_tx.send(DaemonEvent::SubAgentLine {
+                job_id: job_id.clone(),
+                index: msg.index,
+                agent_type: msg.agent_type.to_string(),
+                is_stderr: msg.is_stderr,
+                line: msg.line.clone(),
+            });
 
             let key = (msg.index, msg.is_stderr);
             let file = match handles.get_mut(&key) {
@@ -955,6 +967,7 @@ pub async fn retry_handoff_from_state(
             Arc::clone(&state_clone),
             job_id_full.clone(),
             dispatch_num,
+            { state_clone.lock().await.event_tx.clone() },
             subagent_rx,
         );
 
@@ -1225,6 +1238,7 @@ async fn run_exec_event_loop(
                         Arc::clone(&state),
                         job_id.clone(),
                         dispatch_num,
+                        { state.lock().await.event_tx.clone() },
                         subagent_rx,
                     );
 
