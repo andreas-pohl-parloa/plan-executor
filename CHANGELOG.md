@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.33.0] - 2026-04-19
+
+### Features
+
+- Orchestrate commit-signing setup from remote-setup ([ea4f4b1](https://github.com/andreas-pohl-parloa/plan-executor/commit/ea4f4b14273e95443bb773d9f7ecf1c891980c11))
 ## [0.32.2] - 2026-04-19
 
 ### Bug Fixes
