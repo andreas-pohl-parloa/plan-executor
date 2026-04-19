@@ -744,17 +744,22 @@ pub async fn resume_execution(
         crate::config::Config::base_dir().join("jobs").join(id).join("output.jsonl")
     });
 
+    // Linux caps a single argv entry at MAX_ARG_STRLEN (32 × page_size =
+    // 128 KB on x86_64). Review-phase continuations routinely exceed that
+    // when reviewers produce large triage output (>150 KB observed). Pass
+    // the continuation via stdin so argv stays tiny and the resume can
+    // handle arbitrarily large payloads.
     let (program, mut base_args) = crate::config::Config::parse_cmd(main_cmd);
     base_args.extend_from_slice(&[
         "--resume".to_string(),
         session_id.to_string(),
         "-p".to_string(),
-        continuation.to_string(),
     ]);
 
     let mut child = {
         let mut cmd = tokio::process::Command::new(&program);
         cmd.args(&base_args)
+           .stdin(std::process::Stdio::piped())
            .stdout(std::process::Stdio::piped())
            .stderr(std::process::Stdio::null());
         #[cfg(unix)]
@@ -763,6 +768,18 @@ pub async fn resume_execution(
     };
 
     let resume_pgid = child.id().unwrap_or(0);
+
+    // Feed the continuation via stdin and close — claude reads the prompt
+    // from stdin when `-p` is passed with no value. Spawn the write as a
+    // detached task so the caller can return immediately; we drop any
+    // write error because the child will exit-code its own failure.
+    let mut child_stdin = child.stdin.take().expect("stdin must be piped");
+    let continuation_owned = continuation.to_string();
+    tokio::spawn(async move {
+        let _ = child_stdin.write_all(continuation_owned.as_bytes()).await;
+        let _ = child_stdin.shutdown().await;
+        drop(child_stdin);
+    });
 
     let stdout = child.stdout.take().expect("stdout must be piped");
     let (tx, rx) = mpsc::channel::<ExecEvent>(256);
