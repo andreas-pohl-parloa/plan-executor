@@ -765,26 +765,70 @@ fn gpg_export(fingerprint: &str, secret: bool) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Returns true if the current `gh auth` user already has a GPG key with
-/// this fingerprint uploaded.
-pub fn github_has_gpg_key(fingerprint: &str) -> Result<bool> {
-    let output = run_gh(&["api", "user/gpg_keys", "--jq", ".[].key_id"])?;
+/// Result of querying the current user's uploaded GPG keys.
+///
+/// Distinguishes "scope missing" from a genuine network/API error so the
+/// caller can give the operator an actionable manual-upload fallback
+/// instead of a scary stacktrace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GithubGpgKeyCheck {
+    Present,
+    Absent,
+    MissingScope,
+}
+
+/// Recognizes the `gh` error that fires when the cached OAuth token lacks
+/// `admin:gpg_key` / `read:gpg_key` scope. The default `gh auth login` flow
+/// does not request those scopes, so this is the common case on a fresh
+/// machine.
+fn is_gpg_scope_error(stderr: &str) -> bool {
+    stderr.contains("admin:gpg_key")
+        || stderr.contains("read:gpg_key")
+        || stderr.contains("write:gpg_key")
+}
+
+/// Checks whether the current `gh auth` user already has a GPG key with
+/// this fingerprint uploaded, returning `MissingScope` when the OAuth
+/// token can't see the endpoint at all.
+pub fn github_check_gpg_key(fingerprint: &str) -> Result<GithubGpgKeyCheck> {
+    let output = std::process::Command::new("gh")
+        .args(["api", "user/gpg_keys", "--jq", ".[].key_id"])
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to run gh: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_gpg_scope_error(&stderr) {
+            return Ok(GithubGpgKeyCheck::MissingScope);
+        }
+        anyhow::bail!("gh api user/gpg_keys failed: {stderr}");
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let fp_upper = fingerprint.to_uppercase();
     // GitHub reports either the long key id or the full fingerprint
     // depending on vintage; match against either.
-    Ok(output.lines().any(|l| {
+    let hit = stdout.lines().any(|l| {
         let s = l.trim().to_uppercase();
         !s.is_empty() && (fp_upper.ends_with(&s) || s.ends_with(&fp_upper))
-    }))
+    });
+    Ok(if hit { GithubGpgKeyCheck::Present } else { GithubGpgKeyCheck::Absent })
 }
 
-/// Uploads the armored public key to the current `gh auth` user's GPG keys.
-pub fn github_upload_gpg_key(armored_public: &str) -> Result<()> {
+/// Outcome of attempting to upload the armored public key to GitHub.
+pub enum GithubGpgUploadResult {
+    Uploaded,
+    MissingScope,
+}
+
+/// Uploads the armored public key to the current `gh auth` user's GPG
+/// keys. Returns `MissingScope` when the OAuth token lacks the required
+/// scope so the caller can fall back to a manual-paste flow instead of
+/// exiting with an error.
+pub fn github_upload_gpg_key(armored_public: &str) -> Result<GithubGpgUploadResult> {
     use std::io::Write;
     use std::process::Stdio;
-    // Using `--input -` so the key body travels through stdin rather than
-    // argv; large keys and multiline content don't fit in a shell argument
-    // cleanly anyway.
+    // Using `-f armored_public_key=@-` so the key body travels through
+    // stdin rather than argv; large keys and multiline content don't fit
+    // in a shell argument cleanly anyway.
     let mut child = std::process::Command::new("gh")
         .args(["api", "user/gpg_keys", "-X", "POST",
                "-H", "Accept: application/vnd.github+json",
@@ -798,12 +842,14 @@ pub fn github_upload_gpg_key(armored_public: &str) -> Result<()> {
         stdin.write_all(armored_public.as_bytes())?;
     }
     let output = child.wait_with_output()?;
-    anyhow::ensure!(
-        output.status.success(),
-        "gh api user/gpg_keys POST failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(())
+    if output.status.success() {
+        return Ok(GithubGpgUploadResult::Uploaded);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if is_gpg_scope_error(&stderr) {
+        return Ok(GithubGpgUploadResult::MissingScope);
+    }
+    anyhow::bail!("gh api user/gpg_keys POST failed: {stderr}");
 }
 
 /// Pipes a secret value via stdin to `gh secret set` to avoid leaking it

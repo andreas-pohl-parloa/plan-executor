@@ -1552,13 +1552,23 @@ fn configure_commit_signing(
     // Public key on GitHub — upload if the current gh user doesn't have
     // it yet. Cross-repo rotations skip this when the key was already
     // uploaded from a previous run.
-    match crate::remote::github_has_gpg_key(&fingerprint) {
-        Ok(true) => println!("  Public key already on GitHub."),
-        Ok(false) => match crate::remote::gpg_export_public(&fingerprint) {
+    use crate::remote::{GithubGpgKeyCheck, GithubGpgUploadResult};
+    match crate::remote::github_check_gpg_key(&fingerprint) {
+        Ok(GithubGpgKeyCheck::Present) => println!("  Public key already on GitHub."),
+        Ok(GithubGpgKeyCheck::Absent) => match crate::remote::gpg_export_public(&fingerprint) {
             Ok(pub_armored) => match crate::remote::github_upload_gpg_key(&pub_armored) {
-                Ok(()) => println!("  Uploaded public key to GitHub user account."),
+                Ok(GithubGpgUploadResult::Uploaded) => {
+                    println!("  Uploaded public key to GitHub user account.");
+                }
+                Ok(GithubGpgUploadResult::MissingScope) => {
+                    print_gpg_upload_fallback(&pub_armored);
+                }
                 Err(e) => eprintln!("  Warning: could not upload public key: {e}"),
             },
+            Err(e) => eprintln!("  Warning: could not export public key: {e}"),
+        },
+        Ok(GithubGpgKeyCheck::MissingScope) => match crate::remote::gpg_export_public(&fingerprint) {
+            Ok(pub_armored) => print_gpg_upload_fallback(&pub_armored),
             Err(e) => eprintln!("  Warning: could not export public key: {e}"),
         },
         Err(e) => eprintln!("  Warning: could not check user GPG keys: {e}"),
@@ -1687,6 +1697,26 @@ fn short_fingerprint(fp: &str) -> String {
     } else {
         fp.to_string()
     }
+}
+
+/// Printed when the automatic upload path via `gh api user/gpg_keys` is
+/// blocked by a missing OAuth scope. Gives the operator both a
+/// gh-auth-refresh command and a copy-paste option so the signing flow
+/// never hard-blocks on scope.
+fn print_gpg_upload_fallback(armored_public: &str) {
+    println!("  Public key upload requires the `admin:gpg_key` scope, which gh auth");
+    println!("  does not request by default. Two ways to complete the upload:");
+    println!();
+    println!("  (1) Refresh scope, then re-run this setup to upload automatically:");
+    println!("      gh auth refresh -h github.com -s admin:gpg_key");
+    println!();
+    println!("  (2) Paste the key at https://github.com/settings/gpg/new");
+    println!();
+    for line in armored_public.lines() {
+        println!("    {}", line);
+    }
+    println!();
+    println!("  (Setup continues — the private key secret is already stored.)");
 }
 
 fn notify_daemon_track_remote(plan_path: String, remote_repo: String, pr_number: u64) -> Result<()> {
