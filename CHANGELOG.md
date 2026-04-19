@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.33.1] - 2026-04-19
+
+### Bug Fixes
+
+- Use real name in commit signing, not CI marker ([ed9dd2e](https://github.com/andreas-pohl-parloa/plan-executor/commit/ed9dd2eb94e21be56cfb932b3c09d805ae6a0de8))
 ## [0.33.0] - 2026-04-19
 
 ### Features
