@@ -205,6 +205,12 @@ Configured via `plan-executor remote-setup`:
 /// Uses git clone+commit+push because the GitHub Contents API blocks
 /// writes to `.github/workflows/` when org-level workflow security
 /// policies are active.
+///
+/// Falls back to a PR flow when direct push to `main` is rejected by
+/// branch protection or org-wide ruleset. The fallback:
+/// 1. Pushes the commit to a `setup/execute-plan-workflow` branch.
+/// 2. Opens a PR against `main`.
+/// 3. Enables auto-merge so the PR merges once required checks pass.
 pub fn push_workflow(remote_repo: &str) -> Result<()> {
     let tmp = std::env::temp_dir().join("plan-executor-setup");
     let _ = std::fs::remove_dir_all(&tmp);
@@ -235,10 +241,117 @@ pub fn push_workflow(remote_repo: &str) -> Result<()> {
         "-c", "user.email=plan-executor@noreply",
         "commit", "-m", "chore: update workflow and README",
     ])?;
-    run_git(&tmp, &["push"])?;
 
-    let _ = std::fs::remove_dir_all(&tmp);
-    Ok(())
+    match run_git(&tmp, &["push"]) {
+        Ok(_) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            Ok(())
+        }
+        Err(e) if is_branch_protection_error(&e) => {
+            eprintln!("  Direct push to main blocked by branch protection. Opening PR...");
+            push_workflow_via_pr(remote_repo, &tmp)?;
+            let _ = std::fs::remove_dir_all(&tmp);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Heuristic for detecting GitHub branch-protection / ruleset push rejections.
+fn is_branch_protection_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("protected branch")
+        || msg.contains("push declined")
+        || msg.contains("repository rule violations")
+        || msg.contains("GH013")
+        || msg.contains("Required workflow")
+        || msg.contains("Changes must be made through a pull request")
+}
+
+/// Fallback path when `main` is protected: push the already-committed change
+/// to a setup branch, open a PR, and enable auto-merge.
+fn push_workflow_via_pr(remote_repo: &str, repo_dir: &Path) -> Result<()> {
+    let branch = "setup/execute-plan-workflow";
+
+    // Create (or reset) local branch from the current commit.
+    run_git(repo_dir, &["checkout", "-B", branch])?;
+    // Force-push to overwrite any stale branch from a previous failed run.
+    run_git(repo_dir, &["push", "--force", "-u", "origin", branch])?;
+
+    // Enable auto-merge on the repo (idempotent; ignore errors, we fall
+    // back to a direct merge attempt below).
+    let _ = run_gh(&[
+        "api", &format!("repos/{}", remote_repo),
+        "-X", "PATCH",
+        "-F", "allow_auto_merge=true",
+    ]);
+
+    // Open PR (or reuse an existing one). If PR creation fails because a
+    // PR already exists for this branch, look it up.
+    let pr_url = match run_gh(&[
+        "pr", "create",
+        "--repo", remote_repo,
+        "--head", branch,
+        "--base", "main",
+        "--title", "chore: add execute-plan workflow",
+        "--body", "Automated setup by `plan-executor remote-setup`.\n\n\
+                   Adds the execute-plan GitHub Actions workflow and the README.",
+    ]) {
+        Ok(url) => url.trim().to_string(),
+        Err(_) => {
+            let out = run_gh(&[
+                "pr", "list",
+                "--repo", remote_repo,
+                "--head", branch,
+                "--state", "open",
+                "--json", "url",
+                "--jq", ".[0].url",
+            ])?;
+            let url = out.trim().to_string();
+            anyhow::ensure!(!url.is_empty(), "failed to create or find setup PR");
+            url
+        }
+    };
+    println!("  Opened PR: {}", pr_url);
+
+    let pr_num = pr_number_from_url(&pr_url)
+        .ok_or_else(|| anyhow::anyhow!("could not parse PR number from {}", pr_url))?;
+    let pr_num_s = pr_num.to_string();
+
+    // Try immediate merge first (succeeds if user has bypass rights or no
+    // required checks exist). Otherwise fall back to auto-merge, which
+    // completes once required checks pass.
+    match run_gh(&[
+        "pr", "merge", &pr_num_s,
+        "--repo", remote_repo,
+        "--squash", "--delete-branch",
+    ]) {
+        Ok(_) => {
+            println!("  Merged.");
+            Ok(())
+        }
+        Err(immediate_err) => match run_gh(&[
+            "pr", "merge", &pr_num_s,
+            "--repo", remote_repo,
+            "--squash", "--auto", "--delete-branch",
+        ]) {
+            Ok(_) => {
+                println!("  Auto-merge enabled. PR will merge once required checks pass.");
+                Ok(())
+            }
+            Err(auto_err) => {
+                eprintln!(
+                    "  Could not merge automatically (direct: {}; auto-merge: {}).",
+                    immediate_err, auto_err
+                );
+                eprintln!("  Merge the PR manually to finish setup: {}", pr_url);
+                Ok(())
+            }
+        },
+    }
 }
 
 /// Creates a branch with plan files and execution metadata in the execution repo,
@@ -524,6 +637,30 @@ fn base64_encode(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_branch_protection_error_matches_known_messages() {
+        let cases = [
+            "error: GH013: Repository rule violations found for refs/heads/main",
+            "remote rejected: push declined due to repository rule violations",
+            "Required workflow 'Compliance Checks - Wiz scan' is not satisfied",
+            "Changes must be made through a pull request",
+            "protected branch hook declined",
+        ];
+        for msg in cases {
+            let err = anyhow::anyhow!(msg.to_string());
+            assert!(
+                is_branch_protection_error(&err),
+                "expected match for: {msg}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_branch_protection_error_ignores_unrelated() {
+        let err = anyhow::anyhow!("fatal: could not read from remote repository");
+        assert!(!is_branch_protection_error(&err));
+    }
 
     #[test]
     fn test_pr_title_format() {
