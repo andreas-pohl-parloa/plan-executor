@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.33.2] - 2026-04-19
+
+### Bug Fixes
+
+- Handle missing gpg_key gh scope with manual-paste fallback ([1adf195](https://github.com/andreas-pohl-parloa/plan-executor/commit/1adf195e5848dc7c1e656bc2791e0dade6571c45))
 ## [0.33.1] - 2026-04-19
 
 ### Bug Fixes
