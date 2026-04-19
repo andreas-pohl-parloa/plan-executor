@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.32.2] - 2026-04-19
+
+### Bug Fixes
+
+- Pipe resume continuation via stdin to avoid ARG_MAX ([7e090b2](https://github.com/andreas-pohl-parloa/plan-executor/commit/7e090b275f06d9787f1d83c77112ffbfa64128ba))
 ## [0.32.1] - 2026-04-19
 
 ### Bug Fixes
