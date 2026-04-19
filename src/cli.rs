@@ -86,6 +86,33 @@ fn subagent_prefix(index: usize) -> String {
     format!("\x1b[2m│{}│ \x1b[0m", index)
 }
 
+/// Prints one live sub-agent line (from `dispatch_all`'s subagent channel)
+/// with the standard `│N│ ` prefix. Bash stdout is raw text, bash stderr is
+/// dim text, and claude/codex/gemini stdout is rendered through sjv so the
+/// assistant blocks match the main-agent visual style.
+fn render_subagent_live_line(sl: &crate::handoff::SubAgentLine) {
+    let prefix = subagent_prefix(sl.index);
+    if sl.agent_type == "bash" || sl.is_stderr {
+        let body = if sl.is_stderr {
+            format!("\x1b[2m{}\x1b[0m", sl.line)
+        } else {
+            sl.line.clone()
+        };
+        println!("{}{}", prefix, body);
+        return;
+    }
+    // Non-bash stdout is JSONL — render the same way the main agent stream
+    // is rendered. sjv may emit multi-line blocks per input line; prefix
+    // each visible output line.
+    let rendered = sjv::render_runtime_line(&sl.line, false, true);
+    for visual in rendered.lines() {
+        if visual.is_empty() {
+            continue;
+        }
+        println!("{}{}", prefix, visual);
+    }
+}
+
 /// Renders one sub-agent's persisted JSONL output via sjv and prints
 /// each resulting visible line with an indent prefix that carries the
 /// sub-agent index. Best-effort: if no file is found or reading fails,
@@ -701,12 +728,27 @@ async fn execute_foreground(plan_path: String, config: crate::config::Config) ->
                     println!("\x1b[33m\u{23fa} [plan-executor]\x1b[0m dispatching {} sub-agent(s) (phase: {})",
                         state_data.handoffs.len(), state_data.phase);
 
-                    // Channel for bash agents to stream live output to terminal.
-                    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel::<(usize, String)>(256);
-                    let live_task = tokio::spawn(async move {
-                        while let Some((_idx, line)) = live_rx.recv().await {
-                            println!("{}", line);
+                    // Stream every sub-agent's output live to stdout with a
+                    // per-index `│N│ ` prefix, rendering JSONL through sjv —
+                    // same visual format that `plan-executor output`
+                    // produces in daemon mode. This makes the sub-agent
+                    // turn visible in CI logs instead of a silent gap
+                    // between `dispatching` and `done`.
+                    let (subagent_tx, mut subagent_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<handoff::SubAgentLine>();
+                    let render_task = tokio::spawn(async move {
+                        while let Some(sl) = subagent_rx.recv().await {
+                            render_subagent_live_line(&sl);
                         }
+                    });
+
+                    // `dispatch_agent` takes the bash fast path only when
+                    // `live_tx.is_some()`, so we still need to pass a
+                    // channel — but its contents are already covered by
+                    // `subagent_tx` above, so drain it silently.
+                    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel::<(usize, String)>(256);
+                    let drain_task = tokio::spawn(async move {
+                        while live_rx.recv().await.is_some() {}
                     });
 
                     let (results, _pgids) = handoff::dispatch_all(
@@ -717,9 +759,10 @@ async fn execute_foreground(plan_path: String, config: crate::config::Config) ->
                         &config.agents.bash,
                         Some(live_tx),
                         None, // no pgid tracking in foreground path
-                        None, // no watchdog in foreground path
+                        Some(subagent_tx),
                     ).await;
-                    let _ = live_task.await;
+                    let _ = drain_task.await;
+                    let _ = render_task.await;
 
                     for r in &results {
                         if r.success {
