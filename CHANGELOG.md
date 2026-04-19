@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.32.0] - 2026-04-19
+
+### Features
+
+- Stream sub-agent output live in foreground execute ([9de9b40](https://github.com/andreas-pohl-parloa/plan-executor/commit/9de9b40585d3d34d87d8878e582dff0ddef57c2c))
 ## [0.31.2] - 2026-04-19
 
 ### Bug Fixes
