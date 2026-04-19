@@ -1463,7 +1463,11 @@ fn remote_setup() {
         println!("  Skipped.");
     }
 
-    // Step 6: Push workflow to execution repo
+    // Step 6: Commit signing
+    println!();
+    configure_commit_signing(&remote_repo, &stdin, &mut stdout);
+
+    // Step 7: Push workflow to execution repo
     println!("Pushing execute-plan workflow...");
     match crate::remote::push_workflow(&remote_repo) {
         Ok(()) => println!("  Pushed to .github/workflows/execute-plan.yml"),
@@ -1472,6 +1476,180 @@ fn remote_setup() {
 
     println!();
     println!("Setup complete. Remote execution ready.");
+}
+
+/// Orchestrates the commit-signing portion of `remote-setup`.
+///
+/// Layered decisions:
+///   1. If the execution repo already has `GPG_SIGNING_KEY`, default to
+///      skip; offer rotate.
+///   2. Otherwise (or on rotate), look for an existing `plan-executor CI`
+///      key on the local keyring and default to reusing it across repos.
+///   3. If neither applies, generate a fresh passphraseless ed25519 key
+///      whose uid carries the CI marker for future runs to find.
+///   4. Ensure the public key is on the current gh user, then set
+///      `GPG_SIGNING_KEY` and `GPG_SIGNING_KEY_ID` on the execution repo.
+fn configure_commit_signing(
+    remote_repo: &str,
+    stdin: &std::io::Stdin,
+    stdout: &mut std::io::Stdout,
+) {
+    use std::io::{BufRead, Write};
+
+    println!("Commit signing:");
+
+    let already_set = crate::remote::gh_secret_exists(remote_repo, "GPG_SIGNING_KEY")
+        .unwrap_or_else(|e| {
+            eprintln!("  Warning: could not query existing secrets ({e}); assuming not set.");
+            false
+        });
+
+    let mut rotating = false;
+    if already_set {
+        print!("  GPG_SIGNING_KEY already set on {}. (r)otate / (s)kip [default: skip]: ", remote_repo);
+        let _ = stdout.flush();
+        let mut choice = String::new();
+        let _ = stdin.lock().read_line(&mut choice);
+        match choice.trim() {
+            "r" | "rotate" => rotating = true,
+            _ => { println!("  Skipped."); return; }
+        }
+    }
+
+    // Prefer reusing an existing CI key across execution repos unless we
+    // were explicitly asked to rotate.
+    let fingerprint = if rotating {
+        match generate_new_ci_key(stdin, stdout) {
+            Some(fp) => fp,
+            None => { println!("  Skipped."); return; }
+        }
+    } else if let Some(existing) = crate::remote::find_ci_signing_key() {
+        let short = short_fingerprint(&existing.fingerprint);
+        let label = if existing.email.is_empty() {
+            existing.name.clone()
+        } else {
+            format!("{} <{}>", existing.name, existing.email)
+        };
+        print!("  Found existing CI key {} ({label}). (u)se / (g)enerate new / (s)kip [default: use]: ", short);
+        let _ = stdout.flush();
+        let mut choice = String::new();
+        let _ = stdin.lock().read_line(&mut choice);
+        match choice.trim() {
+            "" | "u" | "use" => existing.fingerprint,
+            "g" | "generate" => match generate_new_ci_key(stdin, stdout) {
+                Some(fp) => fp,
+                None => { println!("  Skipped."); return; }
+            },
+            _ => { println!("  Skipped."); return; }
+        }
+    } else {
+        match generate_new_ci_key(stdin, stdout) {
+            Some(fp) => fp,
+            None => { println!("  Skipped."); return; }
+        }
+    };
+
+    // Public key on GitHub — upload if the current gh user doesn't have
+    // it yet. Cross-repo rotations skip this when the key was already
+    // uploaded from a previous run.
+    match crate::remote::github_has_gpg_key(&fingerprint) {
+        Ok(true) => println!("  Public key already on GitHub."),
+        Ok(false) => match crate::remote::gpg_export_public(&fingerprint) {
+            Ok(pub_armored) => match crate::remote::github_upload_gpg_key(&pub_armored) {
+                Ok(()) => println!("  Uploaded public key to GitHub user account."),
+                Err(e) => eprintln!("  Warning: could not upload public key: {e}"),
+            },
+            Err(e) => eprintln!("  Warning: could not export public key: {e}"),
+        },
+        Err(e) => eprintln!("  Warning: could not check user GPG keys: {e}"),
+    }
+
+    // Private key secret.
+    match crate::remote::gpg_export_secret(&fingerprint) {
+        Ok(secret) => match crate::remote::gh_secret_set_stdin("GPG_SIGNING_KEY", remote_repo, &secret) {
+            Ok(()) => println!("  Stored GPG_SIGNING_KEY."),
+            Err(e) => eprintln!("  Error storing GPG_SIGNING_KEY: {e}"),
+        },
+        Err(e) => eprintln!("  Error exporting secret key: {e}"),
+    }
+    if let Err(e) = crate::remote::gh_secret_set_stdin("GPG_SIGNING_KEY_ID", remote_repo, &fingerprint) {
+        eprintln!("  Error storing GPG_SIGNING_KEY_ID: {e}");
+    } else {
+        println!("  Stored GPG_SIGNING_KEY_ID ({}).", short_fingerprint(&fingerprint));
+    }
+}
+
+fn generate_new_ci_key(
+    stdin: &std::io::Stdin,
+    stdout: &mut std::io::Stdout,
+) -> Option<String> {
+    use std::io::{BufRead, Write};
+
+    let default_name = git_config_get("user.name")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "plan-executor".to_string());
+    let default_email = git_config_get("user.email")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "plan-executor@noreply".to_string());
+    let default_uid_name = format!("{} ({})", default_name, crate::remote::CI_SIGNING_KEY_MARKER);
+
+    print!("  Commit name [{}]: ", default_uid_name);
+    let _ = stdout.flush();
+    let mut name_input = String::new();
+    let _ = stdin.lock().read_line(&mut name_input);
+    let name = match name_input.trim() {
+        "" => default_uid_name,
+        s => {
+            // Ensure the marker stays in the uid so future runs can find it.
+            if s.contains(crate::remote::CI_SIGNING_KEY_MARKER) {
+                s.to_string()
+            } else {
+                format!("{} ({})", s, crate::remote::CI_SIGNING_KEY_MARKER)
+            }
+        }
+    };
+
+    print!("  Commit email [{}]: ", default_email);
+    let _ = stdout.flush();
+    let mut email_input = String::new();
+    let _ = stdin.lock().read_line(&mut email_input);
+    let email = match email_input.trim() {
+        "" => default_email,
+        s => s.to_string(),
+    };
+
+    println!("  Generating ed25519 signing key (no passphrase)...");
+    match crate::remote::gpg_generate_ci_key(&name, &email) {
+        Ok(fp) => {
+            println!("  Generated {} ({} <{}>).", short_fingerprint(&fp), name, email);
+            Some(fp)
+        }
+        Err(e) => {
+            eprintln!("  Error generating key: {e}");
+            None
+        }
+    }
+}
+
+fn git_config_get(key: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["config", "--global", "--get", key])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn short_fingerprint(fp: &str) -> String {
+    // Show the last 16 hex chars — that's the long key id historically
+    // printed by `gpg --list-keys --keyid-format=long`.
+    if fp.len() > 16 {
+        fp[fp.len() - 16..].to_string()
+    } else {
+        fp.to_string()
+    }
 }
 
 fn notify_daemon_track_remote(plan_path: String, remote_repo: String, pr_number: u64) -> Result<()> {

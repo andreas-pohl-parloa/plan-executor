@@ -588,6 +588,220 @@ fn push_file_to_branch(repo: &str, branch: &str, path: &str, content: &str) -> R
     ]).map(|_| ())
 }
 
+/// Returns true if the execution repo already has a secret with this name.
+/// Uses `gh secret list --json name` so the secret value never crosses the
+/// wire.
+pub fn gh_secret_exists(repo: &str, name: &str) -> Result<bool> {
+    let output = run_gh(&["secret", "list", "--repo", repo, "--json", "name"])?;
+    let secrets: Vec<serde_json::Value> = serde_json::from_str(&output)
+        .map_err(|e| anyhow::anyhow!("parse gh secret list: {e}"))?;
+    Ok(secrets.iter().any(|s| s.get("name").and_then(|v| v.as_str()) == Some(name)))
+}
+
+/// Marker embedded in a CI signing key's uid comment so subsequent
+/// `remote-setup` runs can find and reuse the key instead of regenerating.
+pub const CI_SIGNING_KEY_MARKER: &str = "plan-executor CI";
+
+/// A plan-executor CI signing key discovered on the local GPG keyring.
+#[derive(Debug, Clone)]
+pub struct CiSigningKey {
+    /// Full hex fingerprint.
+    pub fingerprint: String,
+    /// uid name portion (before the `<email>`).
+    pub name: String,
+    /// uid email portion.
+    pub email: String,
+}
+
+/// Scans the local GPG secret keyring for a non-expired ed25519 signing
+/// key whose uid contains `CI_SIGNING_KEY_MARKER`. Returns the most
+/// recently created match, or `None` if nothing usable is found.
+pub fn find_ci_signing_key() -> Option<CiSigningKey> {
+    let output = std::process::Command::new("gpg")
+        .args(["--list-secret-keys", "--with-colons"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    let mut current_fpr: Option<String> = None;
+    let mut current_created: i64 = 0;
+    let mut current_expired: bool = false;
+    let mut best: Option<(i64, CiSigningKey)> = None;
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        match fields.first().copied() {
+            Some("sec") => {
+                // Field 2 = validity (e for expired, - for unknown, u/f for valid).
+                current_fpr = None;
+                current_created = fields.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
+                current_expired = matches!(fields.get(1).copied(), Some("e") | Some("r"));
+            }
+            Some("fpr") if current_fpr.is_none() => {
+                current_fpr = fields.get(9).map(|s| s.to_string());
+            }
+            Some("uid") if !current_expired => {
+                let uid = fields.get(9).copied().unwrap_or("");
+                if !uid.contains(CI_SIGNING_KEY_MARKER) {
+                    continue;
+                }
+                let Some(fpr) = current_fpr.clone() else { continue };
+                let (name, email) = parse_uid(uid);
+                let key = CiSigningKey { fingerprint: fpr, name, email };
+                let is_newer = best.as_ref().map_or(true, |(ts, _)| current_created > *ts);
+                if is_newer {
+                    best = Some((current_created, key));
+                }
+            }
+            _ => {}
+        }
+    }
+    best.map(|(_, k)| k)
+}
+
+/// Splits a uid like `"Andreas Pohl (plan-executor CI) <bot@example.com>"`
+/// into `(name, email)`. Returns the raw uid in `name` and an empty email
+/// if the expected `<...>` segment is missing.
+fn parse_uid(uid: &str) -> (String, String) {
+    match (uid.find('<'), uid.rfind('>')) {
+        (Some(lt), Some(gt)) if gt > lt => {
+            let name = uid[..lt].trim().to_string();
+            let email = uid[lt + 1..gt].trim().to_string();
+            (name, email)
+        }
+        _ => (uid.trim().to_string(), String::new()),
+    }
+}
+
+/// Generates a passphraseless ed25519 GPG signing key whose uid carries
+/// `CI_SIGNING_KEY_MARKER` so future runs can find it. Returns the new
+/// key's full fingerprint.
+pub fn gpg_generate_ci_key(name: &str, email: &str) -> Result<String> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // The `Name-Real` must not contain "<" or ">". Callers already pass
+    // the uid comment, so just forbid the obvious breaker.
+    anyhow::ensure!(
+        !name.contains('<') && !name.contains('>'),
+        "signing-key name must not contain angle brackets"
+    );
+
+    let recipe = format!(
+        "%no-protection\n\
+         Key-Type: EDDSA\n\
+         Key-Curve: ed25519\n\
+         Key-Usage: sign\n\
+         Name-Real: {name}\n\
+         Name-Email: {email}\n\
+         Expire-Date: 2y\n\
+         %commit\n"
+    );
+
+    let mut child = std::process::Command::new("gpg")
+        .args(["--batch", "--status-fd", "2", "--gen-key"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn gpg: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(recipe.as_bytes())?;
+    }
+    let output = child.wait_with_output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "gpg --gen-key failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Parse the KEY_CREATED line from status stderr for the new fingerprint.
+    //   [GNUPG:] KEY_CREATED <type> <fingerprint> <handle>
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stderr.lines() {
+        if let Some(rest) = line.strip_prefix("[GNUPG:] KEY_CREATED ") {
+            let mut parts = rest.split_whitespace();
+            let _kind = parts.next();
+            if let Some(fpr) = parts.next() {
+                return Ok(fpr.to_string());
+            }
+        }
+    }
+    // Fallback: look the key up by email (most recent wins).
+    find_ci_signing_key()
+        .filter(|k| k.email == email)
+        .map(|k| k.fingerprint)
+        .ok_or_else(|| anyhow::anyhow!("generated key but could not find its fingerprint"))
+}
+
+/// Exports the armored public key for the given fingerprint.
+pub fn gpg_export_public(fingerprint: &str) -> Result<String> {
+    gpg_export(fingerprint, false)
+}
+
+/// Exports the armored secret key for the given fingerprint.
+pub fn gpg_export_secret(fingerprint: &str) -> Result<String> {
+    gpg_export(fingerprint, true)
+}
+
+fn gpg_export(fingerprint: &str, secret: bool) -> Result<String> {
+    let flag = if secret { "--export-secret-keys" } else { "--export" };
+    let output = std::process::Command::new("gpg")
+        .args(["--batch", "--armor", flag, fingerprint])
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to spawn gpg export: {e}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "gpg {} failed: {}",
+        flag,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Returns true if the current `gh auth` user already has a GPG key with
+/// this fingerprint uploaded.
+pub fn github_has_gpg_key(fingerprint: &str) -> Result<bool> {
+    let output = run_gh(&["api", "user/gpg_keys", "--jq", ".[].key_id"])?;
+    let fp_upper = fingerprint.to_uppercase();
+    // GitHub reports either the long key id or the full fingerprint
+    // depending on vintage; match against either.
+    Ok(output.lines().any(|l| {
+        let s = l.trim().to_uppercase();
+        !s.is_empty() && (fp_upper.ends_with(&s) || s.ends_with(&fp_upper))
+    }))
+}
+
+/// Uploads the armored public key to the current `gh auth` user's GPG keys.
+pub fn github_upload_gpg_key(armored_public: &str) -> Result<()> {
+    use std::io::Write;
+    use std::process::Stdio;
+    // Using `--input -` so the key body travels through stdin rather than
+    // argv; large keys and multiline content don't fit in a shell argument
+    // cleanly anyway.
+    let mut child = std::process::Command::new("gh")
+        .args(["api", "user/gpg_keys", "-X", "POST",
+               "-H", "Accept: application/vnd.github+json",
+               "-f", "armored_public_key=@-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn gh: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(armored_public.as_bytes())?;
+    }
+    let output = child.wait_with_output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "gh api user/gpg_keys POST failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
 /// Pipes a secret value via stdin to `gh secret set` to avoid leaking it
 /// in process arguments visible via `ps aux` / `/proc/*/cmdline`.
 pub fn gh_secret_set_stdin(name: &str, repo: &str, value: &str) -> Result<()> {
