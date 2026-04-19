@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.31.1] - 2026-04-19
+
+### Bug Fixes
+
+- Fall back to PR+auto-merge when main is branch-protected ([9965162](https://github.com/andreas-pohl-parloa/plan-executor/commit/996516211efbcc584f1641372ec69cf2682bea71))
 ## [0.31.0] - 2026-04-17
 
 ### Features
