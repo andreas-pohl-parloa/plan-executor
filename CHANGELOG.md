@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.32.1] - 2026-04-19
+
+### Bug Fixes
+
+- Switch protocol-violation detection to 60s post-handoff timeout ([29ee140](https://github.com/andreas-pohl-parloa/plan-executor/commit/29ee14077995a960334ef408d5ad105329500109))
 ## [0.32.0] - 2026-04-19
 
 ### Features
