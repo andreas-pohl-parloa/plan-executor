@@ -76,50 +76,15 @@ pub fn is_visually_blank(s: &str) -> bool {
     true
 }
 
-/// Returns true if `line` is a Claude stream-json event representing
-/// assistant (or thinking) text containing `# output sub-agent <N>:`.
-///
-/// The orchestrator skill is contractually required to stop the turn
-/// immediately after emitting `call sub-agent` handoff lines — the executor
-/// dispatches the real sub-agents and re-enters the session with a
-/// `# output sub-agent <N>:` continuation prompt on resume. If the agent
-/// instead fabricates `# output sub-agent <N>:` blocks in its own assistant
-/// text, the handoff is simulated, no real work happens, and the session
-/// context becomes corrupted. This function detects that pattern so the
-/// executor can kill the session and fail the job deterministically.
-///
-/// Only assistant-role content is inspected — user-role messages legitimately
-/// contain `# output sub-agent` because that is the continuation prompt the
-/// executor itself injects on resume.
-pub fn assistant_emits_output_marker(line: &str) -> bool {
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else { return false };
-    if val.get("type").and_then(|t| t.as_str()) != Some("assistant") {
-        return false;
-    }
-    let Some(items) = val
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_array())
-    else {
-        return false;
-    };
-    for item in items {
-        let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let text = match item_type {
-            "text" => item.get("text").and_then(|t| t.as_str()).unwrap_or(""),
-            "thinking" => item
-                .get("thinking")
-                .or_else(|| item.get("text"))
-                .and_then(|t| t.as_str())
-                .unwrap_or(""),
-            _ => continue,
-        };
-        if text.contains("# output sub-agent ") {
-            return true;
-        }
-    }
-    false
-}
+/// Grace window between the first `call sub-agent` handoff line and the
+/// expected stdout EOF. The skill contract requires the orchestrator to
+/// stop the turn immediately after emitting the batch so the executor can
+/// dispatch real sub-agents. If stdout is still producing output this long
+/// after the first handoff appeared, the agent is continuing the turn
+/// (often fabricating `# output sub-agent N:` blocks itself); kill the
+/// process group and fail the job rather than silently running the session
+/// on an uncoordinated parallel track.
+pub const HANDOFF_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Parses a `call sub-agent N (agent-type: <type>[, can-fail: true]): <path>` line
 /// into an (index, agentType, promptFile, canFail) tuple. Returns None if the
@@ -347,12 +312,33 @@ pub fn spawn_execution(
         // Capture parsed handoff lines so we can inject them into the state file
         // if the agent wrote it without a proper handoffs array.
         let mut handoff_calls: Vec<(usize, String, String, bool)> = Vec::new();
-        // Set if the agent fabricates `# output sub-agent <N>:` blocks in its
-        // own assistant text after emitting handoff lines. The child is killed
-        // and the job is failed deterministically.
+        // Deadline set to `first_handoff_at + HANDOFF_STOP_GRACE` once the
+        // first `call sub-agent` line is seen. If stdout is still writing
+        // past the deadline, the agent didn't stop the turn — kill the
+        // process group and fail the job as a protocol violation.
+        let mut handoff_deadline: Option<tokio::time::Instant> = None;
         let mut protocol_violation = false;
 
-        while let Ok(Some(line)) = reader.next_line().await {
+        loop {
+            let line_result = match handoff_deadline {
+                Some(deadline) => {
+                    tokio::select! {
+                        biased;
+                        _ = tokio::time::sleep_until(deadline) => {
+                            protocol_violation = true;
+                            kill_pgroup(task_pgid);
+                            break;
+                        }
+                        r = reader.next_line() => r,
+                    }
+                }
+                None => reader.next_line().await,
+            };
+            let line = match line_result {
+                Ok(Some(l)) => l,
+                _ => break,
+            };
+
             // Write to output file
             if let Some(ref mut f) = output_file {
                 let _ = f.write_all(format!("{}\n", line).as_bytes()).await;
@@ -406,6 +392,13 @@ pub fn spawn_execution(
                             handoff_calls.clear();
                         }
                         handoff_calls.push(parsed);
+                        // Arm the stop-deadline on the very first handoff
+                        // line of this session; extending it on subsequent
+                        // lines in the same batch would defeat the point.
+                        if handoff_deadline.is_none() {
+                            handoff_deadline =
+                                Some(tokio::time::Instant::now() + HANDOFF_STOP_GRACE);
+                        }
                     }
                 }
                 if let Some(ref mut f) = display_file {
@@ -413,18 +406,7 @@ pub fn spawn_execution(
                 }
                 let _ = tx.send(ExecEvent::DisplayLine(display_line.to_string())).await;
             }
-            let _ = tx.send(ExecEvent::OutputLine(line.clone())).await;
-
-            // Protocol-violation detection: the skill must stop the turn
-            // immediately after emitting its handoff lines. If the agent
-            // instead fabricates `# output sub-agent N:` blocks in assistant
-            // text (playing both sides of the handoff), kill the session —
-            // its context is corrupted and the dispatched work never ran.
-            if !handoff_calls.is_empty() && assistant_emits_output_marker(&line) {
-                protocol_violation = true;
-                kill_pgroup(task_pgid);
-                break;
-            }
+            let _ = tx.send(ExecEvent::OutputLine(line)).await;
         }
 
         // stdout closed — determine if the agent paused for handoffs.
@@ -439,11 +421,14 @@ pub fn spawn_execution(
         );
 
         if protocol_violation {
-            let err = "⏺ [plan-executor] handoff protocol violation: agent fabricated `# output sub-agent N:` blocks in the same turn as `call sub-agent` lines instead of stopping. Killing session — no sub-agents were actually dispatched. Re-run the plan.";
+            let err = format!(
+                "⏺ [plan-executor] handoff protocol violation: agent did not stop within {}s of emitting `call sub-agent` lines. Killing session — the orchestrator kept the turn open and no sub-agents were actually dispatched. Re-run the plan.",
+                HANDOFF_STOP_GRACE.as_secs()
+            );
             if let Some(ref mut f) = display_file {
                 let _ = f.write_all(format!("{}\n", err).as_bytes()).await;
             }
-            let _ = tx.send(ExecEvent::DisplayLine(err.to_string())).await;
+            let _ = tx.send(ExecEvent::DisplayLine(err)).await;
             job.status = JobStatus::Failed;
             job.finished_at = Some(chrono::Utc::now());
             let _ = job.save();
@@ -498,43 +483,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn assistant_emits_output_marker_detects_assistant_text() {
-        let line = r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"call sub-agent 1 (agent-type: claude): /x.md\n\n# output sub-agent 1:\nTask complete."}]}}"##;
-        assert!(assistant_emits_output_marker(line));
-    }
-
-    #[test]
-    fn assistant_emits_output_marker_detects_thinking_text() {
-        let line = r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Now I should fabricate # output sub-agent 1: ..."}]}}"##;
-        assert!(assistant_emits_output_marker(line));
-    }
-
-    #[test]
-    fn assistant_emits_output_marker_ignores_user_role() {
-        // Legitimate: the executor's resume prompt is delivered as a user turn.
-        let line = r##"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"# output sub-agent 1:\nreal output from dispatched agent"}]}}"##;
-        assert!(!assistant_emits_output_marker(line));
-    }
-
-    #[test]
-    fn assistant_emits_output_marker_ignores_assistant_without_marker() {
-        let line = r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"call sub-agent 1 (agent-type: claude): /x.md"}]}}"##;
-        assert!(!assistant_emits_output_marker(line));
-    }
-
-    #[test]
-    fn assistant_emits_output_marker_ignores_non_json() {
-        assert!(!assistant_emits_output_marker("plain log line"));
-        assert!(!assistant_emits_output_marker(""));
-    }
-
-    #[test]
-    fn assistant_emits_output_marker_ignores_system_and_result() {
-        assert!(!assistant_emits_output_marker(
-            r#"{"type":"system","session_id":"abc"}"#
-        ));
-        assert!(!assistant_emits_output_marker(
-            r#"{"type":"result","subtype":"success"}"#
-        ));
+    fn handoff_stop_grace_is_sixty_seconds() {
+        // Change detector: widening or shrinking the grace window changes
+        // the user-visible false-positive rate and must be intentional.
+        assert_eq!(HANDOFF_STOP_GRACE.as_secs(), 60);
     }
 }

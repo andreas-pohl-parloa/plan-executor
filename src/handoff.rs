@@ -795,8 +795,28 @@ pub async fn resume_execution(
 
         let mut last_display_blank = false;
         let mut handoff_calls: Vec<(usize, String, String, bool)> = Vec::new();
+        let mut handoff_deadline: Option<tokio::time::Instant> = None;
         let mut protocol_violation = false;
-        while let Ok(Some(line)) = reader.next_line().await {
+        loop {
+            let line_result = match handoff_deadline {
+                Some(deadline) => {
+                    tokio::select! {
+                        biased;
+                        _ = tokio::time::sleep_until(deadline) => {
+                            protocol_violation = true;
+                            crate::executor::kill_pgroup(resume_pgid);
+                            break;
+                        }
+                        r = reader.next_line() => r,
+                    }
+                }
+                None => reader.next_line().await,
+            };
+            let line = match line_result {
+                Ok(Some(l)) => l,
+                _ => break,
+            };
+
             // Append raw line to output file (same as initial turn).
             if let Some(ref mut f) = out_file {
                 let _ = f.write_all(format!("{}\n", line).as_bytes()).await;
@@ -815,6 +835,12 @@ pub async fn resume_execution(
                             handoff_calls.clear();
                         }
                         handoff_calls.push(parsed);
+                        if handoff_deadline.is_none() {
+                            handoff_deadline = Some(
+                                tokio::time::Instant::now()
+                                    + crate::executor::HANDOFF_STOP_GRACE,
+                            );
+                        }
                     }
                 }
                 if let Some(ref mut f) = disp_file {
@@ -850,27 +876,17 @@ pub async fn resume_execution(
                     _ => {}
                 }
             }
-
-            // Protocol-violation detection: the agent must stop the turn
-            // after emitting handoff lines. `# output sub-agent N:` appearing
-            // in assistant text after `call sub-agent` means the agent is
-            // fabricating both sides of the handoff — kill the session.
-            // User-role messages containing `# output sub-agent` are legitimate
-            // (they're the resume prompt we injected) and are filtered out by
-            // assistant_emits_output_marker.
-            if !handoff_calls.is_empty() && crate::executor::assistant_emits_output_marker(&line) {
-                protocol_violation = true;
-                crate::executor::kill_pgroup(resume_pgid);
-                break;
-            }
         }
 
         if protocol_violation {
-            let err = "⏺ [plan-executor] handoff protocol violation: agent fabricated `# output sub-agent N:` blocks in the same resumed turn as `call sub-agent` lines instead of stopping. Killing session — no sub-agents were actually dispatched. Re-run the plan.";
+            let err = format!(
+                "⏺ [plan-executor] handoff protocol violation: agent did not stop within {}s of emitting `call sub-agent` lines on the resumed turn. Killing session — the orchestrator kept the turn open and no sub-agents were actually dispatched. Re-run the plan.",
+                crate::executor::HANDOFF_STOP_GRACE.as_secs()
+            );
             if let Some(ref mut f) = disp_file {
                 let _ = f.write_all(format!("{}\n", err).as_bytes()).await;
             }
-            let _ = tx.send(ExecEvent::DisplayLine(err.to_string())).await;
+            let _ = tx.send(ExecEvent::DisplayLine(err)).await;
             resumed_failed = true;
         } else if !handoff_calls.is_empty() {
             // Primary transport: output lines. Same logic as spawn_execution.
