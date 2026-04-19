@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.31.2] - 2026-04-19
+
+### Bug Fixes
+
+- Detect handoff-protocol violation and kill session ([6cc6025](https://github.com/andreas-pohl-parloa/plan-executor/commit/6cc602587006a17e18aab0e806cc1e41c3f79eca))
 ## [0.31.1] - 2026-04-19
 
 ### Bug Fixes
