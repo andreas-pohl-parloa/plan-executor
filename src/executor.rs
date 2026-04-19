@@ -38,6 +38,24 @@ struct UsageBlock {
     cache_read_input_tokens: Option<u64>,
 }
 
+/// Sends SIGKILL to the process group `pgid`. No-op for pgid 0. Safe to call
+/// when the group has already exited. Used to force-terminate the main agent
+/// when it commits a handoff-protocol violation.
+#[cfg(unix)]
+pub fn kill_pgroup(pgid: u32) {
+    if pgid == 0 {
+        return;
+    }
+    // Safety: sending SIGKILL to a pgroup is defined; a stale pgid just
+    // yields ESRCH, which we ignore.
+    unsafe {
+        libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+pub fn kill_pgroup(_pgid: u32) {}
+
 /// Returns true if `s` contains no visible characters after stripping ANSI
 /// escape sequences and ASCII whitespace. Used to detect blank display lines
 /// regardless of embedded color reset codes.
@@ -56,6 +74,51 @@ pub fn is_visually_blank(s: &str) -> bool {
         }
     }
     true
+}
+
+/// Returns true if `line` is a Claude stream-json event representing
+/// assistant (or thinking) text containing `# output sub-agent <N>:`.
+///
+/// The orchestrator skill is contractually required to stop the turn
+/// immediately after emitting `call sub-agent` handoff lines — the executor
+/// dispatches the real sub-agents and re-enters the session with a
+/// `# output sub-agent <N>:` continuation prompt on resume. If the agent
+/// instead fabricates `# output sub-agent <N>:` blocks in its own assistant
+/// text, the handoff is simulated, no real work happens, and the session
+/// context becomes corrupted. This function detects that pattern so the
+/// executor can kill the session and fail the job deterministically.
+///
+/// Only assistant-role content is inspected — user-role messages legitimately
+/// contain `# output sub-agent` because that is the continuation prompt the
+/// executor itself injects on resume.
+pub fn assistant_emits_output_marker(line: &str) -> bool {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else { return false };
+    if val.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+        return false;
+    }
+    let Some(items) = val
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    else {
+        return false;
+    };
+    for item in items {
+        let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let text = match item_type {
+            "text" => item.get("text").and_then(|t| t.as_str()).unwrap_or(""),
+            "thinking" => item
+                .get("thinking")
+                .or_else(|| item.get("text"))
+                .and_then(|t| t.as_str())
+                .unwrap_or(""),
+            _ => continue,
+        };
+        if text.contains("# output sub-agent ") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Parses a `call sub-agent N (agent-type: <type>[, can-fail: true]): <path>` line
@@ -271,6 +334,7 @@ pub fn spawn_execution(
     let display_path = job.display_path();
     job.save()?;
 
+    let task_pgid = pgid;
     tokio::spawn(async move {
         let mut got_result = false;
         let mut reader = BufReader::new(stdout).lines();
@@ -283,6 +347,10 @@ pub fn spawn_execution(
         // Capture parsed handoff lines so we can inject them into the state file
         // if the agent wrote it without a proper handoffs array.
         let mut handoff_calls: Vec<(usize, String, String, bool)> = Vec::new();
+        // Set if the agent fabricates `# output sub-agent <N>:` blocks in its
+        // own assistant text after emitting handoff lines. The child is killed
+        // and the job is failed deterministically.
+        let mut protocol_violation = false;
 
         while let Ok(Some(line)) = reader.next_line().await {
             // Write to output file
@@ -345,7 +413,18 @@ pub fn spawn_execution(
                 }
                 let _ = tx.send(ExecEvent::DisplayLine(display_line.to_string())).await;
             }
-            let _ = tx.send(ExecEvent::OutputLine(line)).await;
+            let _ = tx.send(ExecEvent::OutputLine(line.clone())).await;
+
+            // Protocol-violation detection: the skill must stop the turn
+            // immediately after emitting its handoff lines. If the agent
+            // instead fabricates `# output sub-agent N:` blocks in assistant
+            // text (playing both sides of the handoff), kill the session —
+            // its context is corrupted and the dispatched work never ran.
+            if !handoff_calls.is_empty() && assistant_emits_output_marker(&line) {
+                protocol_violation = true;
+                kill_pgroup(task_pgid);
+                break;
+            }
         }
 
         // stdout closed — determine if the agent paused for handoffs.
@@ -354,8 +433,23 @@ pub fn spawn_execution(
         // The state file is the skill's persistence store — the executor
         // only needs it for consume_handoffs (skill resume signal) and
         // crash recovery (retry_handoff_from_state).
-        tracing::debug!("executor: stdout EOF — handoff_calls={} session_id={:?}",
-            handoff_calls.len(), job.session_id);
+        tracing::debug!(
+            "executor: stdout EOF — handoff_calls={} session_id={:?} protocol_violation={}",
+            handoff_calls.len(), job.session_id, protocol_violation
+        );
+
+        if protocol_violation {
+            let err = "⏺ [plan-executor] handoff protocol violation: agent fabricated `# output sub-agent N:` blocks in the same turn as `call sub-agent` lines instead of stopping. Killing session — no sub-agents were actually dispatched. Re-run the plan.";
+            if let Some(ref mut f) = display_file {
+                let _ = f.write_all(format!("{}\n", err).as_bytes()).await;
+            }
+            let _ = tx.send(ExecEvent::DisplayLine(err.to_string())).await;
+            job.status = JobStatus::Failed;
+            job.finished_at = Some(chrono::Utc::now());
+            let _ = job.save();
+            let _ = tx.send(ExecEvent::Finished(job)).await;
+            return;
+        }
 
         if !handoff_calls.is_empty() {
             // Agent requested sub-agent dispatch via output lines.
@@ -397,4 +491,50 @@ pub fn spawn_execution(
     });
 
     Ok((child, pgid, rx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assistant_emits_output_marker_detects_assistant_text() {
+        let line = r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"call sub-agent 1 (agent-type: claude): /x.md\n\n# output sub-agent 1:\nTask complete."}]}}"##;
+        assert!(assistant_emits_output_marker(line));
+    }
+
+    #[test]
+    fn assistant_emits_output_marker_detects_thinking_text() {
+        let line = r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Now I should fabricate # output sub-agent 1: ..."}]}}"##;
+        assert!(assistant_emits_output_marker(line));
+    }
+
+    #[test]
+    fn assistant_emits_output_marker_ignores_user_role() {
+        // Legitimate: the executor's resume prompt is delivered as a user turn.
+        let line = r##"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"# output sub-agent 1:\nreal output from dispatched agent"}]}}"##;
+        assert!(!assistant_emits_output_marker(line));
+    }
+
+    #[test]
+    fn assistant_emits_output_marker_ignores_assistant_without_marker() {
+        let line = r##"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"call sub-agent 1 (agent-type: claude): /x.md"}]}}"##;
+        assert!(!assistant_emits_output_marker(line));
+    }
+
+    #[test]
+    fn assistant_emits_output_marker_ignores_non_json() {
+        assert!(!assistant_emits_output_marker("plain log line"));
+        assert!(!assistant_emits_output_marker(""));
+    }
+
+    #[test]
+    fn assistant_emits_output_marker_ignores_system_and_result() {
+        assert!(!assistant_emits_output_marker(
+            r#"{"type":"system","session_id":"abc"}"#
+        ));
+        assert!(!assistant_emits_output_marker(
+            r#"{"type":"result","subtype":"success"}"#
+        ));
+    }
 }

@@ -795,6 +795,7 @@ pub async fn resume_execution(
 
         let mut last_display_blank = false;
         let mut handoff_calls: Vec<(usize, String, String, bool)> = Vec::new();
+        let mut protocol_violation = false;
         while let Ok(Some(line)) = reader.next_line().await {
             // Append raw line to output file (same as initial turn).
             if let Some(ref mut f) = out_file {
@@ -849,10 +850,30 @@ pub async fn resume_execution(
                     _ => {}
                 }
             }
+
+            // Protocol-violation detection: the agent must stop the turn
+            // after emitting handoff lines. `# output sub-agent N:` appearing
+            // in assistant text after `call sub-agent` means the agent is
+            // fabricating both sides of the handoff — kill the session.
+            // User-role messages containing `# output sub-agent` are legitimate
+            // (they're the resume prompt we injected) and are filtered out by
+            // assistant_emits_output_marker.
+            if !handoff_calls.is_empty() && crate::executor::assistant_emits_output_marker(&line) {
+                protocol_violation = true;
+                crate::executor::kill_pgroup(resume_pgid);
+                break;
+            }
         }
 
-        // Primary transport: output lines. Same logic as spawn_execution.
-        if !handoff_calls.is_empty() {
+        if protocol_violation {
+            let err = "⏺ [plan-executor] handoff protocol violation: agent fabricated `# output sub-agent N:` blocks in the same resumed turn as `call sub-agent` lines instead of stopping. Killing session — no sub-agents were actually dispatched. Re-run the plan.";
+            if let Some(ref mut f) = disp_file {
+                let _ = f.write_all(format!("{}\n", err).as_bytes()).await;
+            }
+            let _ = tx.send(ExecEvent::DisplayLine(err.to_string())).await;
+            resumed_failed = true;
+        } else if !handoff_calls.is_empty() {
+            // Primary transport: output lines. Same logic as spawn_execution.
             if let Some(state_file) = crate::executor::find_state_file(&execution_root) {
                 crate::executor::inject_handoffs_into_state_file(&state_file, &handoff_calls);
                 let _ = tx.send(ExecEvent::HandoffRequired {
