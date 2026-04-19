@@ -1585,28 +1585,16 @@ fn generate_new_ci_key(
 ) -> Option<String> {
     use std::io::{BufRead, Write};
 
-    let default_name = git_config_get("user.name")
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "plan-executor".to_string());
-    let default_email = git_config_get("user.email")
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "plan-executor@noreply".to_string());
-    let default_uid_name = format!("{} ({})", default_name, crate::remote::CI_SIGNING_KEY_MARKER);
+    let default_name = default_commit_name();
+    let default_email = default_commit_email();
 
-    print!("  Commit name [{}]: ", default_uid_name);
+    print!("  Commit name [{}]: ", default_name);
     let _ = stdout.flush();
     let mut name_input = String::new();
     let _ = stdin.lock().read_line(&mut name_input);
     let name = match name_input.trim() {
-        "" => default_uid_name,
-        s => {
-            // Ensure the marker stays in the uid so future runs can find it.
-            if s.contains(crate::remote::CI_SIGNING_KEY_MARKER) {
-                s.to_string()
-            } else {
-                format!("{} ({})", s, crate::remote::CI_SIGNING_KEY_MARKER)
-            }
-        }
+        "" => default_name.clone(),
+        s => s.to_string(),
     };
 
     print!("  Commit email [{}]: ", default_email);
@@ -1614,10 +1602,14 @@ fn generate_new_ci_key(
     let mut email_input = String::new();
     let _ = stdin.lock().read_line(&mut email_input);
     let email = match email_input.trim() {
-        "" => default_email,
+        "" => default_email.clone(),
         s => s.to_string(),
     };
 
+    // The `plan-executor CI` marker goes into the GPG uid's comment
+    // field by gpg_generate_ci_key, not into the Name-Real we pass here.
+    // That keeps commit author strings clean while still letting
+    // find_ci_signing_key identify the key on the keyring.
     println!("  Generating ed25519 signing key (no passphrase)...");
     match crate::remote::gpg_generate_ci_key(&name, &email) {
         Ok(fp) => {
@@ -1631,6 +1623,37 @@ fn generate_new_ci_key(
     }
 }
 
+/// Resolves the best default commit author name, in order:
+///   1. `git config --global user.name`
+///   2. `gh api user --jq .name` (GitHub profile display name)
+///   3. `gh api user --jq .login` (GitHub username)
+///   4. `"plan-executor"` (last-resort placeholder)
+fn default_commit_name() -> String {
+    git_config_get("user.name")
+        .filter(|s| !s.is_empty())
+        .or_else(|| gh_user_field("name"))
+        .or_else(|| gh_user_field("login"))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "plan-executor".to_string())
+}
+
+/// Resolves the best default commit email, in order:
+///   1. `git config --global user.email`
+///   2. GitHub's canonical noreply form `<id>+<login>@users.noreply.github.com`
+///      (derived from `gh api user`)
+///   3. `"plan-executor@noreply"` (last-resort placeholder)
+fn default_commit_email() -> String {
+    if let Some(e) = git_config_get("user.email").filter(|s| !s.is_empty()) {
+        return e;
+    }
+    if let (Some(id), Some(login)) = (gh_user_field("id"), gh_user_field("login")) {
+        if !id.is_empty() && !login.is_empty() {
+            return format!("{id}+{login}@users.noreply.github.com");
+        }
+    }
+    "plan-executor@noreply".to_string()
+}
+
 fn git_config_get(key: &str) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(["config", "--global", "--get", key])
@@ -1640,6 +1663,20 @@ fn git_config_get(key: &str) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Reads a single field from `gh api user`. Returns `None` when gh is not
+/// authenticated, the field is absent, or the value is null.
+fn gh_user_field(field: &str) -> Option<String> {
+    let output = std::process::Command::new("gh")
+        .args(["api", "user", "--jq", &format!(".{field}")])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if v.is_empty() || v == "null" { None } else { Some(v) }
 }
 
 fn short_fingerprint(fp: &str) -> String {

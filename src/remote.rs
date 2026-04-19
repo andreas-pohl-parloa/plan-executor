@@ -676,17 +676,19 @@ fn parse_uid(uid: &str) -> (String, String) {
 }
 
 /// Generates a passphraseless ed25519 GPG signing key whose uid carries
-/// `CI_SIGNING_KEY_MARKER` so future runs can find it. Returns the new
-/// key's full fingerprint.
+/// `CI_SIGNING_KEY_MARKER` in the comment field so future runs can find it.
+/// The Name-Real field stays clean so commits show just the real author.
+/// Returns the new key's full fingerprint.
 pub fn gpg_generate_ci_key(name: &str, email: &str) -> Result<String> {
     use std::io::Write;
     use std::process::Stdio;
 
-    // The `Name-Real` must not contain "<" or ">". Callers already pass
-    // the uid comment, so just forbid the obvious breaker.
+    // Forbid characters that break the uid schema. `(` and `)` are reserved
+    // for the comment block; `<` and `>` terminate Name-Real.
     anyhow::ensure!(
-        !name.contains('<') && !name.contains('>'),
-        "signing-key name must not contain angle brackets"
+        !name.contains('<') && !name.contains('>')
+            && !name.contains('(') && !name.contains(')'),
+        "signing-key name must not contain angle brackets or parentheses"
     );
 
     let recipe = format!(
@@ -695,9 +697,11 @@ pub fn gpg_generate_ci_key(name: &str, email: &str) -> Result<String> {
          Key-Curve: ed25519\n\
          Key-Usage: sign\n\
          Name-Real: {name}\n\
+         Name-Comment: {marker}\n\
          Name-Email: {email}\n\
          Expire-Date: 2y\n\
-         %commit\n"
+         %commit\n",
+        marker = CI_SIGNING_KEY_MARKER,
     );
 
     let mut child = std::process::Command::new("gpg")

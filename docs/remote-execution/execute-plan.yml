@@ -86,7 +86,12 @@ jobs:
 
           UID_LINE=$(gpg --with-colons --list-secret-keys "$GPG_SIGNING_KEY_ID" \
             | awk -F: '/^uid:/ { print $10; exit }')
-          NAME=$(printf '%s' "$UID_LINE" | sed 's/ *<[^>]*>$//')
+          # Strip the (comment) segment (the `plan-executor CI` marker
+          # lives there) and the <email> segment to recover Name-Real.
+          NAME=$(printf '%s' "$UID_LINE" \
+            | sed -e 's/ *([^)]*)//g' -e 's/ *<[^>]*>$//' \
+            | sed 's/  */ /g' \
+            | sed 's/^ *//; s/ *$//')
           EMAIL=$(printf '%s' "$UID_LINE" | sed -n 's/.*<\([^>]*\)>.*/\1/p')
 
           git config --global user.signingkey "$GPG_SIGNING_KEY_ID"
