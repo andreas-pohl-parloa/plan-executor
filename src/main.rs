@@ -8,6 +8,7 @@ mod remote;
 mod jobs;
 mod plan;
 mod proctree;
+mod schema;
 
 pub use config::Config;
 
