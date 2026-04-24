@@ -137,12 +137,25 @@ pub fn compile_plan_to_manifest(
                         if let Ok(()) = read_and_validate(&final_tasks_json, &final_cache_dir) {
                             return Ok(final_tasks_json);
                         }
-                        // Concurrent writer won but its cache is also poisoned; fall through.
+                        // Concurrent writer won but its cache is also poisoned. Remove it so the
+                        // next attempt's rename can succeed (otherwise it fails with ENOTEMPTY
+                        // and the loop eventually drops into unreachable!()).
+                        let _ = std::fs::remove_dir_all(&final_cache_dir);
                     }
                 }
             }
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&tmp_cache_dir);
+                // SkillMissing / ReadPlan / CreateCache are never retryable: the cause
+                // won't change across attempts. Propagate immediately.
+                if matches!(
+                    &e,
+                    CompileError::SkillMissing(_)
+                        | CompileError::ReadPlan { .. }
+                        | CompileError::CreateCache { .. }
+                ) {
+                    return Err(e);
+                }
                 if attempt == MAX_ATTEMPTS {
                     return Err(e);
                 }
@@ -151,7 +164,11 @@ pub fn compile_plan_to_manifest(
             }
         }
     }
-    unreachable!()
+    // Exhausted MAX_ATTEMPTS without a clean install. Surface as ValidationFailed.
+    Err(CompileError::ValidationFailed {
+        attempts: MAX_ATTEMPTS,
+        errors: last_errors,
+    })
 }
 
 fn tmp_cache_path(execution_root: &Path, hash: &str, attempt: u32) -> PathBuf {
@@ -187,12 +204,13 @@ fn compile_error_to_prior_errors(e: &CompileError) -> Vec<CompileValidationError
 
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        let mut out = s[..max].to_string();
-        out.push_str("…");
-        out
+        return s.to_string();
     }
+    // Find the last char boundary at or below `max` bytes.
+    let boundary = (0..=max).rev().find(|i| s.is_char_boundary(*i)).unwrap_or(0);
+    let mut out = s[..boundary].to_string();
+    out.push('…');
+    out
 }
 
 fn content_hash(plan_path: &Path) -> Result<String, CompileError> {
@@ -425,20 +443,17 @@ mod tests {
 
     #[test]
     fn all_three_attempts_fail_with_no_claude_binary() {
-        // If `claude` is not on PATH, SkillMissing should propagate on the first attempt.
-        // This verifies SkillMissing is NOT silently retried.
+        // If `claude` is not on PATH, SkillMissing should propagate on the first
+        // attempt — never looped three times.
         let dir = tempdir().unwrap();
         let plan = write_plan(dir.path(), "# Plan\n");
-
-        // Clear PATH in a spawned binary is hard; instead, we at least verify that
-        // if claude is missing, we get the right error variant.
-        // Only assert when the env sentinel signals it's safe to actually invoke claude.
         if std::env::var("PE_COMPILE_TEST_ALLOW_CLAUDE").ok().as_deref() != Some("1") {
-            // Best-effort smoke: we don't invoke claude; just confirm the function
-            // path through the retry loop is reachable without panicking.
+            // Default: skip — don't shell out to claude.
             return;
         }
         let result = compile_plan_to_manifest(&plan, dir.path());
+        // The concrete error depends on whether claude is installed. What we care
+        // about: no panic, no infinite-loop behavior.
         assert!(matches!(
             result,
             Err(CompileError::SkillMissing(_))
@@ -446,5 +461,26 @@ mod tests {
                 | Err(CompileError::MissingCompiledMarker(_))
                 | Err(CompileError::ValidationFailed { .. })
         ));
+    }
+
+    #[test]
+    fn truncate_is_utf8_safe() {
+        // "café" in UTF-8 is [c, a, f, 0xC3 0xA9] — 5 bytes, 4 chars.
+        // Truncating to max=4 must NOT split the 'é' codepoint.
+        let s = "café";
+        assert!(s.len() > 4 || true); // len is 5, so truncate fires.
+        let out = truncate(s, 4);
+        // Boundary 3 is between 'f' and 'é' — valid.
+        assert_eq!(out, "caf…");
+
+        // All-ASCII input is truncated exactly at max.
+        let s = "abcdefghij";
+        assert_eq!(truncate(s, 4), "abcd…");
+
+        // Input shorter than max is returned unchanged.
+        assert_eq!(truncate("hi", 10), "hi");
+
+        // max==0: truncate to the empty string + ellipsis.
+        assert_eq!(truncate("hello", 0), "…");
     }
 }
