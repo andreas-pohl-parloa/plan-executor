@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.34.0] - 2026-04-24
+
+### Features
+
+- Frame sub-agent prompts with identity to prevent orchestrator recursion ([854c84c](https://github.com/andreas-pohl-parloa/plan-executor/commit/854c84c8401b712526fff231d47fda4d2627d1f6))
 ## [0.33.2] - 2026-04-19
 
 ### Bug Fixes
