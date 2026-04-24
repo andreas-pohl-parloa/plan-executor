@@ -265,6 +265,26 @@ fn inject_streaming_flags(agent_type: &AgentType, args: &mut Vec<String>) {
     }
 }
 
+/// Builds the final positional argument passed to a sub-agent CLI.
+///
+/// For bash the script file itself is executed, so we pass the path
+/// unchanged. For LLM sub-agents (claude / codex / gemini) the CLI
+/// treats the positional argument as the user prompt string — sending
+/// a bare file path forces the model to guess its identity from a
+/// filename, which has caused sub-agents to load
+/// `plan-executor:execute-plan` and recurse into the orchestrator flow.
+/// We wrap the path in a one-line framing that establishes sub-agent
+/// identity before the model fires any Skill discovery.
+fn sub_agent_prompt_arg(agent_type: &AgentType, path: &str) -> String {
+    match agent_type {
+        AgentType::Bash => path.to_string(),
+        _ => format!(
+            "Sub-agent task: read and execute the instructions in {}. You are a plan-executor sub-agent — do NOT invoke plan-executor:* skills; they are orchestrator-only.",
+            path
+        ),
+    }
+}
+
 /// Scans a JSONL stream (Claude `--output-format stream-json`, Codex
 /// `--json`, Gemini `-o stream-json`) for the agent's terminal result
 /// message and returns its text. Returns `None` when no recognizable
@@ -449,7 +469,7 @@ async fn dispatch_agent(
 
     let (program, mut args) = crate::config::Config::parse_cmd(&cmd);
     inject_streaming_flags(&handoff.agent_type, &mut args);
-    args.push(path.clone());
+    args.push(sub_agent_prompt_arg(&handoff.agent_type, &path));
 
     let child_result = {
         let mut c = Command::new(&program);
@@ -1082,6 +1102,30 @@ mod tests {
         let before = args.clone();
         inject_streaming_flags(&AgentType::Bash, &mut args);
         assert_eq!(args, before);
+    }
+
+    #[test]
+    fn sub_agent_prompt_arg_wraps_llm_path_with_identity_frame() {
+        let arg = sub_agent_prompt_arg(&AgentType::Claude, "/tmp/.tmp-subtask-1.md");
+        assert!(arg.contains("/tmp/.tmp-subtask-1.md"));
+        assert!(arg.contains("Sub-agent task"));
+        assert!(arg.contains("plan-executor sub-agent"));
+        assert!(arg.contains("do NOT invoke plan-executor:"));
+        // Same framing applies to codex / gemini.
+        assert_eq!(
+            arg,
+            sub_agent_prompt_arg(&AgentType::Codex, "/tmp/.tmp-subtask-1.md"),
+        );
+        assert_eq!(
+            arg,
+            sub_agent_prompt_arg(&AgentType::Gemini, "/tmp/.tmp-subtask-1.md"),
+        );
+    }
+
+    #[test]
+    fn sub_agent_prompt_arg_passes_bash_path_through_unchanged() {
+        let arg = sub_agent_prompt_arg(&AgentType::Bash, "/tmp/script.sh");
+        assert_eq!(arg, "/tmp/script.sh");
     }
 
     #[test]
