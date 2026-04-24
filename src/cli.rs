@@ -59,6 +59,11 @@ pub enum Commands {
     },
     /// Interactive wizard to configure remote execution secrets
     RemoteSetup,
+    /// Validate a compiled tasks.json manifest against the schema and semantic rules.
+    Validate {
+        /// Path to tasks.json
+        tasks_json: PathBuf,
+    },
 }
 
 /// Prints a display line to the terminal, coloring plan-executor prefix lines
@@ -287,6 +292,42 @@ fn format_duration(total_seconds: u64) -> String {
     }
 }
 
+fn run_validate(tasks_json: &std::path::Path) {
+    let raw = match std::fs::read_to_string(tasks_json) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ERROR: cannot read {}: {}", tasks_json.display(), e);
+            std::process::exit(1);
+        }
+    };
+    let manifest: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("ERROR: {} is not valid JSON: {}", tasks_json.display(), e);
+            std::process::exit(1);
+        }
+    };
+
+    let schema_errors = crate::schema::validate_manifest(&manifest).err().unwrap_or_default();
+    let manifest_dir = tasks_json.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let semantic_errors = crate::validate::semantic_check(&manifest, manifest_dir)
+        .err()
+        .unwrap_or_default();
+
+    if schema_errors.is_empty() && semantic_errors.is_empty() {
+        println!("VALID: {}", tasks_json.display());
+        return;
+    }
+
+    for e in &schema_errors {
+        eprintln!("ERROR: schema: {} (at {})", e.message, e.path);
+    }
+    for e in &semantic_errors {
+        eprintln!("ERROR: {}: {}", e.category, e.message);
+    }
+    std::process::exit(1);
+}
+
 pub fn run() {
     let cli = Cli::parse();
 
@@ -299,6 +340,7 @@ pub fn run() {
         Commands::Kill   { job_id } => { daemon_job_request("kill",    job_id); return; }
         Commands::Pause  { job_id } => { daemon_job_request("pause",   job_id); return; }
         Commands::Unpause{ job_id } => { daemon_job_request("unpause", job_id); return; }
+        Commands::Validate { tasks_json } => { run_validate(tasks_json); return; }
         _ => {}
     }
 
@@ -341,7 +383,8 @@ pub fn run() {
         Commands::Output { job_id, follow } => rt.block_on(output_job(job_id, follow)),
         Commands::Retry { job_id } => rt.block_on(retry_job(job_id)),
         Commands::Stop | Commands::Jobs | Commands::Ensure | Commands::RemoteSetup
-        | Commands::Kill { .. } | Commands::Pause { .. } | Commands::Unpause { .. } => unreachable!(),
+        | Commands::Kill { .. } | Commands::Pause { .. } | Commands::Unpause { .. }
+        | Commands::Validate { .. } => unreachable!(),
     };
 
     if let Err(e) = result {
