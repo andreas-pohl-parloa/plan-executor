@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.35.0] - 2026-04-24
+
+### Features
+
+- Validate agent-type and kill on post-handoff tool_use ([e172e33](https://github.com/andreas-pohl-parloa/plan-executor/commit/e172e33b15bc9e38e263b86166a126f22a7faea1))
 ## [0.34.0] - 2026-04-24
 
 ### Features
