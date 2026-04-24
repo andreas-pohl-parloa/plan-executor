@@ -101,7 +101,7 @@
           "prompt_file": {
             "description": "Relative path (from tasks.json's directory) to the sub-task prompt markdown.",
             "type": "string",
-            "pattern": "^tasks/[A-Za-z0-9._/-]+\\.(md|sh)$"
+            "pattern": "^tasks/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\\.(md|sh)$"
           },
           "agent_type": {
             "description": "Dispatcher picks the CLI based on this value. Enum is locked to what handoff.rs::AgentType supports.",

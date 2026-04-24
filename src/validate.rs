@@ -123,7 +123,11 @@ pub fn semantic_check(
         });
     }
 
-    // Check 4 — prompt_file paths exist on disk.
+    // Check 4 — prompt_file paths exist on disk AND stay inside manifest_dir.
+    // Containment is defense-in-depth: the schema pattern already bans `.`
+    // segments, but canonicalization catches symlinks and any future schema
+    // loosening.
+    let manifest_dir_canon = manifest_dir.canonicalize().ok();
     for (tid, task_spec) in tasks {
         if let Some(pf) = task_spec.get("prompt_file").and_then(|v| v.as_str()) {
             let full = manifest_dir.join(pf);
@@ -135,6 +139,19 @@ pub fn semantic_check(
                         full.display()
                     ),
                 });
+                continue;
+            }
+            if let (Some(root), Ok(full_canon)) = (&manifest_dir_canon, full.canonicalize()) {
+                if !full_canon.starts_with(root) {
+                    errors.push(SemanticError {
+                        category: "prompt_file_escapes_manifest_dir".into(),
+                        message: format!(
+                            "task `{tid}` prompt_file `{pf}` resolves to `{}` which escapes manifest directory `{}`",
+                            full_canon.display(),
+                            root.display()
+                        ),
+                    });
+                }
             }
         }
     }
@@ -264,5 +281,30 @@ mod tests {
         );
         let dir = tempdir_with_prompt("tasks/t1.md");
         assert!(semantic_check(&m, dir.path()).is_ok());
+    }
+
+    #[test]
+    fn prompt_file_escaping_manifest_dir_via_symlink_is_reported() {
+        use std::os::unix::fs::symlink;
+
+        // Create a real file OUTSIDE the manifest dir.
+        let outside_dir = tempdir().unwrap();
+        let outside_file = outside_dir.path().join("outside.md");
+        std::fs::write(&outside_file, "dummy").unwrap();
+
+        // Create the manifest dir with a symlink pointing to the outside file.
+        let manifest_dir = tempdir().unwrap();
+        std::fs::create_dir_all(manifest_dir.path().join("tasks")).unwrap();
+        symlink(&outside_file, manifest_dir.path().join("tasks/escape.md")).unwrap();
+
+        let m = make_manifest(
+            serde_json::json!([{"id": 1, "task_ids": ["t1"], "depends_on": []}]),
+            serde_json::json!({"t1": {"prompt_file": "tasks/escape.md", "agent_type": "claude"}}),
+        );
+        let errs = semantic_check(&m, manifest_dir.path()).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.category == "prompt_file_escapes_manifest_dir"),
+            "expected prompt_file_escapes_manifest_dir, got: {errs:?}"
+        );
     }
 }
