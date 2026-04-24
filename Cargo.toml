@@ -53,6 +53,9 @@ libc = "0.2"
 # JSON Schema validation for compiled-plan manifests
 jsonschema = "0.46"
 
+# Content hashing for compiled-plan cache keys
+sha2 = "0.10"
+
 [dev-dependencies]
 tempfile = "3"
 tokio-test = "0.4"
