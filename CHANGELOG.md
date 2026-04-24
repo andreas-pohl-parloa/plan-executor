@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.35.1] - 2026-04-24
+
+### Miscellaneous
+
+- Raise remote-execution job timeout from 2h to 4h ([f842fe0](https://github.com/andreas-pohl-parloa/plan-executor/commit/f842fe00c64d8e73adf13dc51c91dabe68b6b8f2))
 ## [0.35.0] - 2026-04-24
 
 ### Features
