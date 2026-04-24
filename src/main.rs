@@ -9,6 +9,7 @@ mod jobs;
 mod plan;
 mod proctree;
 mod schema;
+mod validate;
 
 pub use config::Config;
 
