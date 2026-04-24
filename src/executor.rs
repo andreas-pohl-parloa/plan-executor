@@ -86,6 +86,37 @@ pub fn is_visually_blank(s: &str) -> bool {
 /// on an uncoordinated parallel track.
 pub const HANDOFF_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The only `agent-type` values the sub-agent dispatcher can run. Keep in
+/// lock-step with `crate::handoff::AgentType`. Exposed as a module constant so
+/// the streaming `call sub-agent` validator can reject fat-fingered or
+/// hallucinated values (e.g. the `Task` tool's `general-purpose`) the moment
+/// the line is emitted, instead of letting the session drift for 60s.
+pub const VALID_AGENT_TYPES: &[&str] = &["claude", "codex", "gemini", "bash"];
+
+/// Returns true if a raw stream-json line represents an assistant message
+/// containing at least one `tool_use` content block. Used to detect the
+/// "orchestrator kept working after emitting handoff lines" failure mode:
+/// after the first `call sub-agent` line arms the stop-deadline, any
+/// tool_use is a protocol violation even if it arrives before the 60s
+/// grace window expires.
+pub fn line_has_tool_use(line: &str) -> bool {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    if val.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+        return false;
+    }
+    val.get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+        .map(|arr| {
+            arr.iter().any(|b| {
+                b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Parses a `call sub-agent N (agent-type: <type>[, can-fail: true]): <path>` line
 /// into an (index, agentType, promptFile, canFail) tuple. Returns None if the
 /// line doesn't match the handoff format. Strips ANSI escapes before matching.
@@ -317,17 +348,25 @@ pub fn spawn_execution(
         // past the deadline, the agent didn't stop the turn — kill the
         // process group and fail the job as a protocol violation.
         let mut handoff_deadline: Option<tokio::time::Instant> = None;
-        let mut protocol_violation = false;
+        // Reason is Some(..) iff a violation was detected. Drives the kill
+        // path at EOF and the error message rendered to the user. Distinct
+        // reasons (stop-deadline, invalid agent-type, tool_use after handoff)
+        // carry their own text so the orchestrator gets actionable feedback
+        // on retry instead of a generic "you broke the protocol" line.
+        let mut violation_reason: Option<String> = None;
 
-        loop {
+        'stream: loop {
             let line_result = match handoff_deadline {
                 Some(deadline) => {
                     tokio::select! {
                         biased;
                         _ = tokio::time::sleep_until(deadline) => {
-                            protocol_violation = true;
+                            violation_reason = Some(format!(
+                                "agent did not stop within {}s of emitting `call sub-agent` lines",
+                                HANDOFF_STOP_GRACE.as_secs()
+                            ));
                             kill_pgroup(task_pgid);
-                            break;
+                            break 'stream;
                         }
                         r = reader.next_line() => r,
                     }
@@ -336,8 +375,21 @@ pub fn spawn_execution(
             };
             let line = match line_result {
                 Ok(Some(l)) => l,
-                _ => break,
+                _ => break 'stream,
             };
+
+            // Any tool_use event after the first `call sub-agent` line is
+            // a protocol violation — the skill contract demands the turn
+            // end immediately. Catching it at the first post-handoff
+            // tool_use saves 60s of wasted work that the stop-deadline
+            // alone would have allowed.
+            if handoff_deadline.is_some() && line_has_tool_use(&line) {
+                violation_reason = Some(
+                    "agent emitted a tool_use after `call sub-agent` lines in the same turn".to_string(),
+                );
+                kill_pgroup(task_pgid);
+                break 'stream;
+            }
 
             // Write to output file
             if let Some(ref mut f) = output_file {
@@ -385,6 +437,24 @@ pub fn spawn_execution(
                 last_display_blank = is_blank;
                 if display_line.contains("call sub-agent") {
                     if let Some(parsed) = parse_handoff_line(display_line) {
+                        // Reject unknown agent-types the moment they're
+                        // emitted. Silent fallback to `claude` would teach
+                        // the orchestrator that hallucinated values from the
+                        // Task tool enum (e.g. `general-purpose`, `Explore`)
+                        // are acceptable, and could mis-route reviewer
+                        // batches where diversity matters. A hard kill with
+                        // the exact bad value fed back to the agent is the
+                        // corrective signal the retry loop needs.
+                        if !VALID_AGENT_TYPES.iter().any(|v| *v == parsed.1) {
+                            violation_reason = Some(format!(
+                                "invalid agent-type `{}` on `call sub-agent {}` line — valid values: {}",
+                                parsed.1,
+                                parsed.0,
+                                VALID_AGENT_TYPES.join(", ")
+                            ));
+                            kill_pgroup(task_pgid);
+                            break 'stream;
+                        }
                         // Index 1 with existing entries = new batch (agent
                         // continued from one phase to the next in the same
                         // session). Keep only the latest batch.
@@ -416,14 +486,14 @@ pub fn spawn_execution(
         // only needs it for consume_handoffs (skill resume signal) and
         // crash recovery (retry_handoff_from_state).
         tracing::debug!(
-            "executor: stdout EOF — handoff_calls={} session_id={:?} protocol_violation={}",
-            handoff_calls.len(), job.session_id, protocol_violation
+            "executor: stdout EOF — handoff_calls={} session_id={:?} violation_reason={:?}",
+            handoff_calls.len(), job.session_id, violation_reason
         );
 
-        if protocol_violation {
+        if let Some(reason) = violation_reason.as_ref() {
             let err = format!(
-                "⏺ [plan-executor] handoff protocol violation: agent did not stop within {}s of emitting `call sub-agent` lines. Killing session — the orchestrator kept the turn open and no sub-agents were actually dispatched. Re-run the plan.",
-                HANDOFF_STOP_GRACE.as_secs()
+                "⏺ [plan-executor] handoff protocol violation: {}. Killing session. Re-run the plan.",
+                reason
             );
             if let Some(ref mut f) = display_file {
                 let _ = f.write_all(format!("{}\n", err).as_bytes()).await;
@@ -487,5 +557,48 @@ mod tests {
         // Change detector: widening or shrinking the grace window changes
         // the user-visible false-positive rate and must be intentional.
         assert_eq!(HANDOFF_STOP_GRACE.as_secs(), 60);
+    }
+
+    #[test]
+    fn valid_agent_types_match_handoff_enum() {
+        // Change detector: if a new AgentType is added in handoff.rs, this
+        // list must grow in lock-step or the streaming validator will kill
+        // valid handoffs. The executor deliberately compares agent-type
+        // strings instead of going through handoff::AgentType so it can
+        // emit the exact bad value in the error message.
+        assert_eq!(VALID_AGENT_TYPES, &["claude", "codex", "gemini", "bash"]);
+    }
+
+    #[test]
+    fn line_has_tool_use_matches_assistant_with_tool_use_block() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"},{"type":"tool_use","id":"x","name":"Bash","input":{}}]}}"#;
+        assert!(line_has_tool_use(line));
+    }
+
+    #[test]
+    fn line_has_tool_use_rejects_text_only_assistant() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"call sub-agent 1 (agent-type: claude): /tmp/x.md"}]}}"#;
+        assert!(!line_has_tool_use(line));
+    }
+
+    #[test]
+    fn line_has_tool_use_rejects_non_assistant_events() {
+        let system = r#"{"type":"system","subtype":"init"}"#;
+        let result = r#"{"type":"result","subtype":"success","result":"done"}"#;
+        let malformed = r#"not-json"#;
+        assert!(!line_has_tool_use(system));
+        assert!(!line_has_tool_use(result));
+        assert!(!line_has_tool_use(malformed));
+    }
+
+    #[test]
+    fn parse_handoff_line_exposes_invalid_agent_type_for_validation() {
+        // The validator lives at the call-site; parse_handoff_line itself
+        // stays lenient so diagnostic context (the bad value) survives.
+        let parsed = parse_handoff_line(
+            "call sub-agent 1 (agent-type: general-purpose): /tmp/x.md",
+        ).expect("line matches handoff shape");
+        assert_eq!(parsed.1, "general-purpose");
+        assert!(!VALID_AGENT_TYPES.iter().any(|v| *v == parsed.1));
     }
 }
