@@ -74,7 +74,8 @@ pub struct Config {
     pub stall_timeout_seconds: u64,
     /// Watchdog: absolute ceiling on total job runtime regardless of
     /// activity. Caps genuinely long runs that never go idle. Default:
-    /// 10800 (3h).
+    /// 14400 (4h). Chosen to match the default GHA `timeout-minutes` in
+    /// `docs/remote-execution/execute-plan.yml`; keep the two aligned.
     #[serde(default = "Config::default_hard_cap_seconds")]
     pub hard_cap_seconds: u64,
 }
@@ -92,7 +93,7 @@ impl Default for Config {
 
 impl Config {
     fn default_stall_timeout_seconds() -> u64 { 900 }
-    fn default_hard_cap_seconds() -> u64 { 10_800 }
+    fn default_hard_cap_seconds() -> u64 { 14_400 }
 
     /// Returns the base directory: `~/.plan-executor/`
     pub fn base_dir() -> PathBuf {
@@ -273,7 +274,7 @@ mod tests {
         let json = r#"{}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.stall_timeout_seconds, 900);
-        assert_eq!(config.hard_cap_seconds, 10_800);
+        assert_eq!(config.hard_cap_seconds, 14_400);
     }
 
     #[test]
