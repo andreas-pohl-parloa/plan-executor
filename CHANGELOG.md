@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.36.1] - 2026-04-27
+
+### Refactoring
+
+- Consume tasks.json directly via execute, drop inline compile + sha2 dep (#6) ([9d9fa4c](https://github.com/andreas-pohl-parloa/plan-executor/commit/9d9fa4cf9e0f3ba7d58267b8dbf990f309e8a490))
 ## [0.36.0] - 2026-04-27
 
 ### Features
