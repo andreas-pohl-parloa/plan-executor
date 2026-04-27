@@ -68,7 +68,7 @@ pub enum Commands {
     },
     /// Append fix waves to an existing tasks.json from reviewer findings.
     CompileFixWaves {
-        /// Absolute path to the plan markdown file (passed through; verified against manifest.plan.path).
+        /// Absolute path to the plan markdown file. MUST equal manifest.plan.path; the CLI hard-fails on mismatch.
         #[arg(long)]
         plan: PathBuf,
         /// Directory containing tasks.json. Manifest is read from `<execution_root>/tasks.json`.
@@ -424,13 +424,15 @@ pub(crate) fn run_compile_fix_waves_with_invoker(
         );
     }
 
-    // Cross-check plan path against manifest (warn-only).
+    // Cross-check plan path against manifest (hard-fail on explicit mismatch).
+    // If the manifest can't be read or parsed here, fall through — the actual
+    // `read_capped` in `append_fix_waves` will surface that error.
     if let Ok(raw) = std::fs::read_to_string(&manifest_path) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
             if let Some(manifest_plan_path) = v.pointer("/plan/path").and_then(|x| x.as_str()) {
                 if std::path::PathBuf::from(manifest_plan_path) != plan {
-                    eprintln!(
-                        "WARN: --plan {} disagrees with manifest.plan.path {}; using manifest's value via append_fix_waves",
+                    anyhow::bail!(
+                        "--plan {} disagrees with manifest.plan.path {}; either pass --plan matching the manifest, or re-derive the manifest first",
                         plan.display(),
                         manifest_plan_path
                     );
@@ -2016,6 +2018,45 @@ mod tests {
         let err = run_compile_fix_waves_with_invoker(&NeverInvoker, &plan_path, &exec_root, &findings_path)
             .expect_err("malformed findings must error");
         let _ = err;
+    }
+
+    #[test]
+    fn plan_mismatch_with_manifest_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exec_root = tmp.path().to_path_buf();
+        // Pre-write a manifest whose plan.path is /tmp/plan.md.
+        fs::write(
+            exec_root.join("tasks.json"),
+            serde_json::to_vec_pretty(&pre_manifest()).unwrap(),
+        )
+        .unwrap();
+
+        let findings_path = exec_root.join("f.json");
+        fs::write(&findings_path, br#"{"findings":[]}"#).unwrap();
+
+        struct NeverInvoker;
+        impl crate::compile::CompileInvoker for NeverInvoker {
+            fn invoke(&self, _: &[&Path]) -> Result<(), String> {
+                panic!("must not be called when --plan disagrees with manifest")
+            }
+        }
+
+        // Caller passes a different --plan than what is recorded in manifest.plan.path.
+        let plan_path = std::path::PathBuf::from("/tmp/different-plan.md");
+        let err = run_compile_fix_waves_with_invoker(
+            &NeverInvoker,
+            &plan_path,
+            &exec_root,
+            &findings_path,
+        )
+        .expect_err("plan vs manifest mismatch must hard-fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("/tmp/different-plan.md")
+                && msg.contains("/tmp/plan.md")
+                && msg.contains("disagrees"),
+            "msg was: {msg}"
+        );
     }
 
     #[test]
