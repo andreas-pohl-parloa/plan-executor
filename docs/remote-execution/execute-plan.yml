@@ -186,6 +186,15 @@ jobs:
           if [ -d prompt-files ]; then
             cp prompt-files/* "$PLAN_DIR/" 2>/dev/null || true
           fi
+          # Manifest-only execution: copy tasks.json into workspace next to the plan,
+          # then rewrite manifest.plan.path to the in-workspace plan location so the
+          # remote runner's read_manifest_plan_block resolves it correctly.
+          MANIFEST_DIR="workspace/.tmp-plan-compiled"
+          mkdir -p "$MANIFEST_DIR"
+          cp tasks.json "$MANIFEST_DIR/tasks.json"
+          NEW_PLAN_PATH="$(pwd)/$PLAN_DIR/$PLAN_FILENAME"
+          jq --arg p "$NEW_PLAN_PATH" '.plan.path = $p' "$MANIFEST_DIR/tasks.json" > "$MANIFEST_DIR/tasks.json.tmp"
+          mv "$MANIFEST_DIR/tasks.json.tmp" "$MANIFEST_DIR/tasks.json"
 
       - name: Execute plan
         id: execute
@@ -198,7 +207,7 @@ jobs:
           GH_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
         run: |
           cd workspace
-          plan-executor execute -f ".my/plans/$PLAN_FILENAME"
+          plan-executor execute -f .tmp-plan-compiled/tasks.json
 
       - name: Post result comment
         if: always()

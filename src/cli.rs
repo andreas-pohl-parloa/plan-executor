@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
@@ -22,10 +22,12 @@ pub enum Commands {
         #[arg(long)]
         foreground: bool,
     },
-    /// Execute a plan file or re-execute a job by ID prefix
+    /// Execute a compiled plan manifest. Pass tasks.json or its containing directory.
+    /// (To compile a plan markdown into a manifest, use the `plan-executor:handover`
+    /// + `plan-executor:compile-plan` skills from a Claude session.)
     Execute {
-        /// Plan file path or job ID prefix (from `plan-executor jobs`)
-        plan: String,
+        /// Path to tasks.json or the manifest directory containing it
+        manifest: String,
         /// Run in foreground without the daemon
         #[arg(short = 'f', long)]
         foreground: bool,
@@ -292,6 +294,53 @@ fn format_duration(total_seconds: u64) -> String {
     }
 }
 
+/// Resolve a user-supplied execute argument into an absolute `tasks.json` path.
+/// Accepts either a file path ending in `tasks.json` or a directory containing one.
+pub(crate) fn resolve_manifest_path(arg: &str) -> Result<PathBuf> {
+    let raw = PathBuf::from(arg);
+    let absolute = if raw.is_absolute() {
+        raw
+    } else {
+        let cwd = std::env::current_dir()
+            .with_context(|| "could not determine current working directory")?;
+        cwd.join(&raw)
+    };
+    let resolved = std::fs::canonicalize(&absolute).unwrap_or(absolute);
+    if resolved.is_file()
+        && resolved.file_name().and_then(|n| n.to_str()) == Some("tasks.json")
+    {
+        return Ok(resolved);
+    }
+    if resolved.is_dir() {
+        let candidate = resolved.join("tasks.json");
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!("Manifest not found at {}; expected tasks.json", arg)
+}
+
+/// Read `plan.path` and `plan.status` from a compiled manifest.
+pub(crate) fn read_manifest_plan_block(manifest_path: &Path) -> Result<(PathBuf, String)> {
+    let raw = std::fs::read_to_string(manifest_path)
+        .with_context(|| format!("read manifest {}", manifest_path.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parse manifest {}", manifest_path.display()))?;
+    let plan_path = v.pointer("/plan/path")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow::anyhow!(
+            "manifest {} missing plan.path", manifest_path.display()
+        ))?
+        .to_string();
+    let status = v.pointer("/plan/status")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow::anyhow!(
+            "manifest {} missing plan.status", manifest_path.display()
+        ))?
+        .to_string();
+    Ok((PathBuf::from(plan_path), status))
+}
+
 fn run_validate(tasks_json: &std::path::Path) {
     let raw = match std::fs::read_to_string(tasks_json) {
         Ok(s) => s,
@@ -372,11 +421,11 @@ pub fn run() {
 
     let result: Result<()> = match cli.command {
         Commands::Daemon { .. } => rt.block_on(crate::daemon::run_daemon(config)),
-        Commands::Execute { plan, foreground } => {
+        Commands::Execute { manifest, foreground } => {
             if foreground {
-                rt.block_on(execute_foreground(plan, config))
+                rt.block_on(execute_foreground(manifest, config))
             } else {
-                rt.block_on(execute_plan(plan, config))
+                rt.block_on(execute_plan(manifest, config))
             }
         }
         Commands::Status => rt.block_on(show_status()),
@@ -602,31 +651,30 @@ async fn retry_job(job_id_prefix: String) -> Result<()> {
     Ok(())
 }
 
-async fn execute_plan(plan_path: String, config: crate::config::Config) -> Result<()> {
-    // If the argument looks like a job ID prefix, resolve it to a plan path.
-    let resolved_path = resolve_plan_path(&plan_path);
+async fn execute_plan(manifest_arg: String, config: crate::config::Config) -> Result<()> {
+    let manifest_path = resolve_manifest_path(&manifest_arg)?;
+    let (plan_path, status) = read_manifest_plan_block(&manifest_path)?;
 
-    // Canonicalize to absolute path.
-    let plan = std::fs::canonicalize(&resolved_path)
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(&resolved_path));
-    if !plan.exists() {
-        anyhow::bail!("Plan file not found: {}", resolved_path);
+    if status != "READY" {
+        anyhow::bail!("Manifest plan.status is {}, expected READY", status);
     }
 
-    // Fail fast if the plan is not in READY state.
-    let status = crate::plan::parse_plan_status(&plan)?;
-    if status != crate::plan::PlanStatus::Ready {
-        anyhow::bail!("Plan status is {}, expected READY", status);
+    if !plan_path.exists() {
+        anyhow::bail!("Plan file referenced by manifest not found: {}", plan_path.display());
     }
 
-    // Both local and remote execution go through the daemon.
     if !crate::ipc::socket_path().exists() {
         anyhow::bail!("Daemon not running. Start with: plan-executor daemon");
     }
-    execute_via_daemon(plan, config).await
+
+    execute_via_daemon(plan_path, manifest_path, config).await
 }
 
-async fn trigger_remote(plan: PathBuf, config: crate::config::Config) -> Result<()> {
+async fn trigger_remote(
+    plan: PathBuf,
+    manifest_path: PathBuf,
+    config: crate::config::Config,
+) -> Result<()> {
     let remote_repo = config.remote_repo.as_deref()
         .ok_or_else(|| anyhow::anyhow!(
             "remote execution requires 'remote_repo' in config — run 'plan-executor remote-setup'"
@@ -653,11 +701,10 @@ async fn trigger_remote(plan: PathBuf, config: crate::config::Config) -> Result<
     // Push Codex OAuth token (idempotent, skips if no auth file)
     let _ = crate::remote::push_codex_auth(remote_repo);
 
-    let pr_url = crate::remote::trigger_remote_execution(remote_repo, &plan, &meta)?;
+    let pr_url = crate::remote::trigger_remote_execution(remote_repo, &plan, &manifest_path, &meta)?;
     let pr_num = crate::remote::pr_number_from_url(&pr_url);
 
-    // Update plan status and store PR number
-    let _ = crate::plan::set_plan_header(&plan, "status", "EXECUTING");
+    // Store PR number for daemon-side polling.
     if let Some(n) = pr_num {
         let _ = crate::plan::set_plan_header(&plan, "remote-pr", &n.to_string());
     }
@@ -688,55 +735,25 @@ async fn trigger_remote(plan: PathBuf, config: crate::config::Config) -> Result<
     Ok(())
 }
 
-/// If `arg` matches a job ID prefix in daemon state, returns the plan path.
-/// Otherwise returns `arg` unchanged (treat as plan file path).
-/// Never reads from disk.
-fn resolve_plan_path(arg: &str) -> String {
-    use crate::ipc::{DaemonEvent, TuiRequest};
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
-
-    if let Ok(mut s) = UnixStream::connect(crate::ipc::socket_path()) {
-        let gs = serde_json::to_string(&TuiRequest::GetState).unwrap_or_default();
-        let _ = s.write_all(format!("{}\n", gs).as_bytes());
-        let mut reader = BufReader::new(s);
-        let mut line = String::new();
-        let _ = reader.read_line(&mut line);
-        if let Ok(DaemonEvent::State { running_jobs, history, .. }) = serde_json::from_str(&line) {
-            // Match job ID prefix (history or running)
-            if let Some(job) = running_jobs.into_iter().chain(history)
-                .find(|j| j.id.starts_with(arg))
-            {
-                return job.plan_path.to_string_lossy().into_owned();
-            }
-        }
-    }
-    arg.to_string()
-}
-
-async fn execute_foreground(plan_path: String, config: crate::config::Config) -> Result<()> {
+async fn execute_foreground(manifest_arg: String, config: crate::config::Config) -> Result<()> {
     use crate::executor::{spawn_execution, ExecEvent};
     use crate::handoff;
     use crate::jobs::JobMetadata;
 
-    let resolved_path = std::fs::canonicalize(&plan_path)
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(&plan_path));
+    let manifest_path = resolve_manifest_path(&manifest_arg)?;
+    let (resolved_path, status) = read_manifest_plan_block(&manifest_path)?;
+
+    if status != "READY" {
+        anyhow::bail!("Manifest plan.status is {}, expected READY", status);
+    }
     if !resolved_path.exists() {
-        anyhow::bail!("Plan file not found: {}", plan_path);
+        anyhow::bail!("Plan file referenced by manifest not found: {}", resolved_path.display());
     }
 
-    // Remote plans trigger remotely unless PLAN_EXECUTOR_LOCAL=1 is set
-    // (used by the GitHub Actions runner to force local execution).
     if crate::plan::parse_execution_mode(&resolved_path) == crate::plan::ExecutionMode::Remote
         && std::env::var("PLAN_EXECUTOR_LOCAL").as_deref() != Ok("1")
     {
-        return trigger_remote(resolved_path, config).await;
-    }
-
-    // Fail fast if the plan is not in READY state.
-    let status = crate::plan::parse_plan_status(&resolved_path)?;
-    if status != crate::plan::PlanStatus::Ready {
-        anyhow::bail!("Plan status is {}, expected READY", status);
+        return trigger_remote(resolved_path, manifest_path, config).await;
     }
 
     let execution_root = find_repo_root(&resolved_path)
@@ -746,7 +763,7 @@ async fn execute_foreground(plan_path: String, config: crate::config::Config) ->
     let job_id = job.id.clone();
 
     let (mut child, _pgid, mut exec_rx) = spawn_execution(
-        job, execution_root.clone(), &config.agents.main,
+        job, execution_root.clone(), manifest_path.clone(), &config.agents.main,
     )?;
 
     let mut last_display_blank = false;
@@ -859,8 +876,8 @@ async fn execute_foreground(plan_path: String, config: crate::config::Config) ->
                     // EXECUTING, the skill bailed out mid-execution. Resume
                     // the session once with an explicit instruction to finish.
                     let plan_still_executing = is_success
-                        && crate::plan::parse_plan_status(&resolved_path)
-                            .map(|s| matches!(s, crate::plan::PlanStatus::Executing))
+                        && read_manifest_plan_block(&manifest_path)
+                            .map(|(_, status)| status == "EXECUTING")
                             .unwrap_or(false);
 
                     if plan_still_executing && !completion_retried {
@@ -934,7 +951,11 @@ fn find_repo_root(path: &std::path::Path) -> Option<std::path::PathBuf> {
 /// Sends Execute to the daemon, waits just long enough to identify the new
 /// job ID, prints it, and returns immediately.  Use `plan-executor output -f
 /// <job-id>` to watch the live output of local jobs.
-async fn execute_via_daemon(plan: PathBuf, _config: crate::config::Config) -> Result<()> {
+async fn execute_via_daemon(
+    plan: PathBuf,
+    manifest_path: PathBuf,
+    _config: crate::config::Config,
+) -> Result<()> {
     use crate::ipc::{DaemonEvent, TuiRequest};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
@@ -958,8 +979,8 @@ async fn execute_via_daemon(plan: PathBuf, _config: crate::config::Config) -> Re
     }
 
     // Trigger execution.
-    let plan_str = plan.to_string_lossy().to_string();
-    let req = serde_json::to_string(&TuiRequest::Execute { plan_path: plan_str.clone() })?;
+    let manifest_str = manifest_path.to_string_lossy().to_string();
+    let req = serde_json::to_string(&TuiRequest::Execute { manifest_path: manifest_str })?;
     write_half.write_all(format!("{}\n", req).as_bytes()).await?;
 
     let filename = plan.file_name().and_then(|n| n.to_str()).unwrap_or("?");

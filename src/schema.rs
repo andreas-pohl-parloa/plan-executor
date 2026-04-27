@@ -68,6 +68,8 @@ mod tests {
         serde_json::json!({
             "goal": "test",
             "type": "feature",
+            "path": "/tmp/plan.md",
+            "status": "READY",
             "flags": {
                 "merge": false, "merge_admin": false, "skip_pr": false,
                 "skip_code_review": false, "no_worktree": false, "draft_pr": false
@@ -109,9 +111,45 @@ mod tests {
             "version": 1,
             "plan": {
                 "goal": "t", "type": "feature",
+                "path": "/tmp/plan.md", "status": "READY",
                 "flags": {
                     "merge": false, "merge_admin": false, "skip_pr": false,
                     "skip_code_review": false, "no_worktree": false
+                }
+            },
+            "waves": [{"id": 1, "task_ids": ["t1"], "depends_on": []}],
+            "tasks": {"t1": {"prompt_file": "tasks/t1.md", "agent_type": "claude"}}
+        });
+        assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn missing_plan_path_rejected() {
+        let manifest = serde_json::json!({
+            "version": 1,
+            "plan": {
+                "goal": "t", "type": "feature", "status": "READY",
+                "flags": {
+                    "merge": false, "merge_admin": false, "skip_pr": false,
+                    "skip_code_review": false, "no_worktree": false, "draft_pr": false
+                }
+            },
+            "waves": [{"id": 1, "task_ids": ["t1"], "depends_on": []}],
+            "tasks": {"t1": {"prompt_file": "tasks/t1.md", "agent_type": "claude"}}
+        });
+        assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn invalid_plan_status_rejected() {
+        let manifest = serde_json::json!({
+            "version": 1,
+            "plan": {
+                "goal": "t", "type": "feature",
+                "path": "/tmp/plan.md", "status": "WHATEVER",
+                "flags": {
+                    "merge": false, "merge_admin": false, "skip_pr": false,
+                    "skip_code_review": false, "no_worktree": false, "draft_pr": false
                 }
             },
             "waves": [{"id": 1, "task_ids": ["t1"], "depends_on": []}],

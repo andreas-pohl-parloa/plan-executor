@@ -298,28 +298,11 @@ pub fn consume_handoffs(state_file: &std::path::Path) {
 pub fn spawn_execution(
     mut job: JobMetadata,
     execution_root: PathBuf,
+    compiled_manifest: PathBuf,
     main_cmd: &str,
 ) -> Result<(Child, u32, mpsc::Receiver<ExecEvent>)> {
     let plan_path = job.plan_path.to_string_lossy().to_string();
     let quoted_path = plan_path.replace('"', "\\\"");
-
-    // Pre-compile the plan into a schema-validated tasks.json manifest before
-    // handing off to the orchestrator. The orchestrator trusts the manifest and
-    // skips its own Phase 1/Phase 2 parsing.
-    let compiled_manifest = match crate::compile::compile_plan_to_manifest(
-        job.plan_path.as_path(),
-        execution_root.as_path(),
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!("compile-plan step failed: {e}");
-            return Err(anyhow::anyhow!("compile-plan step failed: {e}"));
-        }
-    };
-    tracing::info!(
-        "compiled manifest ready at {}",
-        compiled_manifest.display()
-    );
 
     let quoted_manifest = compiled_manifest.to_string_lossy().replace('"', "\\\"");
     let cmd_arg = format!(
