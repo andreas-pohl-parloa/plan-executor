@@ -298,9 +298,14 @@ fn format_duration(total_seconds: u64) -> String {
 /// Accepts either a file path ending in `tasks.json` or a directory containing one.
 pub(crate) fn resolve_manifest_path(arg: &str) -> Result<PathBuf> {
     let raw = PathBuf::from(arg);
-    let resolved = std::fs::canonicalize(&raw).unwrap_or_else(|_| {
-        std::env::current_dir().unwrap_or_default().join(&raw)
-    });
+    let absolute = if raw.is_absolute() {
+        raw
+    } else {
+        let cwd = std::env::current_dir()
+            .with_context(|| "could not determine current working directory")?;
+        cwd.join(&raw)
+    };
+    let resolved = std::fs::canonicalize(&absolute).unwrap_or(absolute);
     if resolved.is_file()
         && resolved.file_name().and_then(|n| n.to_str()) == Some("tasks.json")
     {
@@ -868,8 +873,8 @@ async fn execute_foreground(manifest_arg: String, config: crate::config::Config)
                     // EXECUTING, the skill bailed out mid-execution. Resume
                     // the session once with an explicit instruction to finish.
                     let plan_still_executing = is_success
-                        && crate::plan::parse_plan_status(&resolved_path)
-                            .map(|s| matches!(s, crate::plan::PlanStatus::Executing))
+                        && read_manifest_plan_block(&manifest_path)
+                            .map(|(_, status)| status == "EXECUTING")
                             .unwrap_or(false);
 
                     if plan_still_executing && !completion_retried {
