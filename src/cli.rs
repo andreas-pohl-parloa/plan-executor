@@ -427,7 +427,20 @@ pub(crate) fn run_compile_fix_waves_with_invoker(
     // Cross-check plan path against manifest (hard-fail on explicit mismatch).
     // If the manifest can't be read or parsed here, fall through — the actual
     // `read_capped` in `append_fix_waves` will surface that error.
-    if let Ok(raw) = std::fs::read_to_string(&manifest_path) {
+    //
+    // Cap the preflight read at 16 MiB to match the production cap enforced
+    // inside `append_fix_waves::read_capped`. Without this, a symlinked or
+    // maliciously-crafted oversized manifest could OOM the CLI before append
+    // begins. Over-cap manifests fall through to `append_fix_waves`, which
+    // surfaces a definitive `FileTooLarge` error.
+    const MANIFEST_PREFLIGHT_CAP_BYTES: u64 = 16 * 1024 * 1024;
+    let raw = match std::fs::metadata(&manifest_path) {
+        Ok(meta) if meta.len() <= MANIFEST_PREFLIGHT_CAP_BYTES => {
+            std::fs::read_to_string(&manifest_path).ok()
+        }
+        _ => None,
+    };
+    if let Some(raw) = raw {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
             if let Some(manifest_plan_path) = v.pointer("/plan/path").and_then(|x| x.as_str()) {
                 if std::path::PathBuf::from(manifest_plan_path) != plan {
@@ -2070,6 +2083,39 @@ mod tests {
                 && msg.contains("disagrees"),
             "msg was: {msg}"
         );
+    }
+
+    /// N2: oversized manifest must skip the preflight cross-check and let
+    /// `append_fix_waves` reject it definitively, rather than OOM-ing the CLI
+    /// via an uncapped `read_to_string` in the preflight path.
+    #[test]
+    fn oversized_manifest_skips_preflight_and_errors_via_append() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exec_root = tmp.path().to_path_buf();
+        // Write a manifest just barely over 16 MiB so the preflight cap
+        // skips the read and append's own read_capped surfaces FileTooLarge.
+        let oversized: Vec<u8> = vec![b'a'; 16 * 1024 * 1024 + 8];
+        fs::write(exec_root.join("tasks.json"), &oversized).unwrap();
+
+        let findings_path = exec_root.join("f.json");
+        fs::write(&findings_path, br#"{"findings":[]}"#).unwrap();
+
+        struct NeverInvoker;
+        impl crate::compile::CompileInvoker for NeverInvoker {
+            fn invoke(&self, _: &[&Path]) -> Result<(), String> {
+                panic!("must not be called when manifest exceeds cap")
+            }
+        }
+
+        let plan_path = std::path::PathBuf::from("/tmp/plan.md");
+        let err = run_compile_fix_waves_with_invoker(
+            &NeverInvoker,
+            &plan_path,
+            &exec_root,
+            &findings_path,
+        )
+        .expect_err("oversized manifest must error");
+        let _ = err;
     }
 
     #[test]
