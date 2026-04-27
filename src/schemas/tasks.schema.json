@@ -13,7 +13,7 @@
     },
     "plan": {
       "type": "object",
-      "required": ["goal", "type", "flags"],
+      "required": ["goal", "type", "path", "status", "flags"],
       "additionalProperties": false,
       "properties": {
         "goal": { "type": "string", "minLength": 1 },
@@ -34,6 +34,16 @@
         "target_branch": {
           "description": "Feature branch to create/checkout for this plan.",
           "type": ["string", "null"]
+        },
+        "path": {
+          "description": "Absolute path to the source plan markdown file. Embedded so the orchestrator can reference the plan without external lookups.",
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "description": "Execution state of the plan. Lives in the manifest, not in the plan markdown.",
+          "enum": ["READY", "EXECUTING", "COMPLETED", "FAILED"],
+          "default": "READY"
         },
         "flags": {
           "type": "object",
@@ -101,7 +111,7 @@
           "prompt_file": {
             "description": "Relative path (from tasks.json's directory) to the sub-task prompt markdown.",
             "type": "string",
-            "pattern": "^tasks/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\\.(md|sh)$"
+            "pattern": "^tasks/[A-Za-z0-9._/-]+\\.(md|sh)$"
           },
           "agent_type": {
             "description": "Dispatcher picks the CLI based on this value. Enum is locked to what handoff.rs::AgentType supports.",
