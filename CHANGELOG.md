@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.36.0] - 2026-04-27
+
+### Features
+
+- Add plan-executor validate CLI + wire compile-plan into execute (#5) ([5bfc0d1](https://github.com/andreas-pohl-parloa/plan-executor/commit/5bfc0d172861364e318d58f46cdabcc0ec0d87a0))
 ## [0.35.1] - 2026-04-24
 
 ### Miscellaneous
