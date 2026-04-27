@@ -14,25 +14,30 @@
 //! `findings.json` is consumed by an LLM-driven skill (`plan-executor:compile-plan`).
 //! Reviewer-supplied finding fields are sanitized in `sanitize_findings` before
 //! the file is written: oversized strings are truncated, ASCII control chars
-//! are stripped, and the array is capped. This is defense-in-depth against
-//! prompt injection (OWASP LLM01) — an attacker who can influence finding
-//! text MUST NOT be able to redirect the skill's behavior via embedded
-//! instructions or by exhausting context.
+//! and Unicode-format characters (BOM, bidi-override, zero-width) are stripped,
+//! the per-finding `files[]` array is capped, and the findings array is capped.
+//! This is defense-in-depth against prompt injection (OWASP LLM01) — an
+//! attacker who can influence finding text MUST NOT be able to redirect the
+//! skill's behavior via embedded instructions, deceive human review via
+//! invisible characters, or exhaust context with unbounded list growth.
 //!
 //! # Subprocess hardening
 //!
 //! `ClaudeInvoker` further restricts the spawned `claude` process: path args
-//! are validated UTF-8/whitespace/leading-dash free, the slash-command prompt
-//! is whitelist-only via `--allowed-tools`, sensitive credential env vars
-//! (AWS, GH/GitHub, OpenAI, Google) are scrubbed from the child env, and the
-//! wait is bounded by a timeout (default 600s, override via
-//! `PLAN_EXECUTOR_COMPILE_TIMEOUT_SECS`).
+//! are validated UTF-8/whitespace/control/format-char/leading-dash free, the
+//! slash-command prompt is whitelist-only via `--allowed-tools`, sensitive
+//! credential env vars are scrubbed from the child env (see
+//! [`scrubbed_env_command`] for the policy), and the wait is bounded by a
+//! timeout (default 600s, override via `PLAN_EXECUTOR_COMPILE_TIMEOUT_SECS`).
+//! stdout and stderr are drained concurrently in reader threads to avoid
+//! kernel pipe-buffer deadlocks on chatty subprocesses.
 
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -58,6 +63,9 @@ const FINDING_IDENT_FIELD_CAP_BYTES: usize = 256;
 
 /// Maximum number of findings accepted in a single APPEND call.
 const FINDINGS_MAX_ENTRIES: usize = 200;
+
+/// Maximum number of `files[]` entries kept per finding before truncation.
+const MAX_FILES_PER_FINDING: usize = 64;
 
 /// Marker appended when a string was truncated by `sanitize_findings`.
 const FINDING_TRUNCATION_MARKER: &str = "\n[...truncated for safety]";
@@ -108,6 +116,8 @@ pub enum AppendError {
     TooManyFindings { n: usize },
     #[error("file too large: {path} is {size} bytes (cap {cap})")]
     FileTooLarge { path: String, size: u64, cap: u64 },
+    #[error("path is not a regular file: {0}")]
+    NotRegularFile(String),
     #[error("compile-plan skill timed out after {0}s")]
     Timeout(u64),
 }
@@ -131,13 +141,15 @@ pub trait CompileInvoker {
 ///
 /// # Subprocess hardening
 ///
-/// - Path args are validated (UTF-8, no whitespace, no leading dash).
+/// - Path args are validated (UTF-8, no whitespace, no control or
+///   Unicode-format chars, no leading dash).
 /// - `--allowed-tools "Read,Write,Edit"` whitelists tool surface for the skill.
-/// - Sensitive credential env vars are scrubbed from the child process:
-///   `AWS_*`, `GITHUB_TOKEN`, `GH_TOKEN`, `OPENAI_*`, `GOOGLE_*`.
+/// - Sensitive credential env vars are scrubbed from the child process; see
+///   [`scrubbed_env_command`] for the full policy.
 /// - Wait is bounded by `PLAN_EXECUTOR_COMPILE_TIMEOUT_SECS` (default 600s).
-/// - stdout/stderr are size-capped (16 MiB each) and truncated in error
-///   messages.
+/// - stdout and stderr are drained concurrently by dedicated reader threads,
+///   each capped at 16 MiB; the kernel pipe-buffer deadlock that arises from
+///   waiting on a child without a concurrent reader is therefore avoided.
 pub struct ClaudeInvoker;
 
 impl CompileInvoker for ClaudeInvoker {
@@ -162,18 +174,46 @@ impl CompileInvoker for ClaudeInvoker {
             .spawn()
             .map_err(|e| format!("spawn failed: {e}"))?;
 
-        let status = match child.wait_timeout(Duration::from_secs(timeout_secs)) {
+        // Concurrent drainers — without these, the child blocks on `write()`
+        // once a 16-64 KiB pipe buffer fills, and `wait_timeout` cannot detect
+        // exit until the deadline. Spawning readers BEFORE waiting fixes the
+        // deadlock.
+        let stdout_handle = child
+            .stdout
+            .take()
+            .map(|s| spawn_drainer(s, SUBPROCESS_STREAM_CAP_BYTES as u64));
+        let stderr_handle = child
+            .stderr
+            .take()
+            .map(|s| spawn_drainer(s, SUBPROCESS_STREAM_CAP_BYTES as u64));
+
+        let wait_result = child.wait_timeout(Duration::from_secs(timeout_secs));
+
+        let timed_out = matches!(wait_result, Ok(None));
+        if timed_out {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        let stdout = stdout_handle
+            .map(join_drainer)
+            .unwrap_or_default();
+        let stderr = stderr_handle
+            .map(join_drainer)
+            .unwrap_or_default();
+
+        let status = match wait_result {
             Ok(Some(status)) => status,
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(AppendError::Timeout(timeout_secs).to_string());
+                return Err(AppendError::Timeout(timeout_secs).to_string()
+                    + &format!(
+                        "; stdout={}; stderr={}",
+                        truncate_for_error(stdout.trim(), ERROR_TRUNCATE_BYTES),
+                        truncate_for_error(stderr.trim(), ERROR_TRUNCATE_BYTES)
+                    ));
             }
             Err(e) => return Err(format!("wait failed: {e}")),
         };
-
-        let stdout = drain_stream(child.stdout.take());
-        let stderr = drain_stream(child.stderr.take());
 
         if !status.success() {
             return Err(AppendError::InvokeExit(format!(
@@ -190,6 +230,25 @@ impl CompileInvoker for ClaudeInvoker {
             ));
         }
         Ok(())
+    }
+}
+
+/// Spawns a background thread that drains `reader` into a `Vec<u8>` of at
+/// most `cap` bytes. The thread joins cleanly once the pipe reaches EOF.
+fn spawn_drainer<R: Read + Send + 'static>(reader: R, cap: u64) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::with_capacity(8 * 1024);
+        let mut limited = reader.take(cap);
+        let _ = limited.read_to_end(&mut buf);
+        buf
+    })
+}
+
+/// Joins a drainer thread, returning the captured bytes as a lossy UTF-8 string.
+fn join_drainer(handle: JoinHandle<Vec<u8>>) -> String {
+    match handle.join() {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => String::new(),
     }
 }
 
@@ -365,31 +424,52 @@ fn write_synthetic_meta(path: &Path, manifest: &serde_json::Value) -> Result<(),
     Ok(())
 }
 
-/// Materializes the embedded `tasks.schema.json` to a stable temp file once
-/// per process and returns the path.
+/// Materializes the embedded `tasks.schema.json` to a per-process temp file
+/// once and returns the cached path.
 ///
-/// Replaces a previous design that baked `CARGO_MANIFEST_DIR` into the binary;
-/// the build-host source path does not exist on the user's machine after
-/// `cargo install` or any release distribution.
+/// # Security
+///
+/// Earlier designs wrote to a fixed predictable path under `temp_dir()`,
+/// which on shared `/tmp` allowed an attacker to pre-create that name as a
+/// symlink to a sensitive file (e.g. `~/.aws/credentials`); `std::fs::write`
+/// would then follow the symlink and overwrite the target (CWE-377/CWE-378).
+///
+/// The current implementation:
+/// - creates an unpredictable per-process subdirectory via `tempfile::TempDir`
+///   (cleaned up on process exit via `Drop`),
+/// - opens the schema file inside that dir with `create_new(true)`
+///   (`O_CREAT | O_EXCL`), defeating any pre-create TOCTOU race,
+/// - caches the materialized `(TempDir, PathBuf)` for the process lifetime.
+///
+/// Replaces a previous design that also baked `CARGO_MANIFEST_DIR` into the
+/// binary; that build-host source path does not exist on the user's machine
+/// after `cargo install` or any release distribution.
 fn embedded_schema_path() -> Result<&'static PathBuf, AppendError> {
-    static MATERIALIZED: OnceLock<PathBuf> = OnceLock::new();
-    if let Some(p) = MATERIALIZED.get() {
+    static MATERIALIZED: OnceLock<(tempfile::TempDir, PathBuf)> = OnceLock::new();
+    if let Some((_, p)) = MATERIALIZED.get() {
         return Ok(p);
     }
-    let target = std::env::temp_dir().join("plan-executor-tasks.schema.json");
+    let dir = tempfile::Builder::new()
+        .prefix("plan-executor-schema-")
+        .tempdir()
+        .map_err(AppendError::SchemaMaterialize)?;
+    let target = dir.path().join("tasks.schema.json");
     let payload = crate::schema::embedded_schema_json();
-    if let Ok(existing) = std::fs::read(&target) {
-        if existing == payload.as_bytes() {
-            return Ok(MATERIALIZED.get_or_init(|| target));
-        }
-    }
-    std::fs::write(&target, payload).map_err(AppendError::SchemaMaterialize)?;
-    Ok(MATERIALIZED.get_or_init(|| target))
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)
+        .map_err(AppendError::SchemaMaterialize)?;
+    std::io::Write::write_all(&mut file, payload.as_bytes())
+        .map_err(AppendError::SchemaMaterialize)?;
+    let stored = MATERIALIZED.get_or_init(|| (dir, target));
+    Ok(&stored.1)
 }
 
 /// Validates path arguments before they are interpolated into a slash-command
 /// prompt. Each path must be UTF-8 and contain no whitespace, no control
-/// chars, and no leading `-` (which could re-bind to a flag inside the skill).
+/// chars, no Unicode-format chars (BOM, bidi-override, zero-width), and no
+/// leading `-` (which could re-bind to a flag inside the skill).
 fn validate_path_args<'a>(args: &'a [&'a Path]) -> Result<Vec<&'a str>, AppendError> {
     args.iter()
         .enumerate()
@@ -408,7 +488,10 @@ fn validate_path_args<'a>(args: &'a [&'a Path]) -> Result<Vec<&'a str>, AppendEr
                     "arg {idx}: path may not start with `-` ({s})"
                 )));
             }
-            if let Some(c) = s.chars().find(|c| c.is_whitespace() || c.is_control()) {
+            if let Some(c) = s
+                .chars()
+                .find(|c| c.is_whitespace() || is_disallowed_control_or_format(*c))
+            {
                 return Err(AppendError::InvalidPathArg(format!(
                     "arg {idx}: path contains forbidden character {c:?} ({s})"
                 )));
@@ -416,6 +499,23 @@ fn validate_path_args<'a>(args: &'a [&'a Path]) -> Result<Vec<&'a str>, AppendEr
             Ok(s)
         })
         .collect()
+}
+
+/// Returns true for ASCII control chars and Unicode-format characters that
+/// are invisible to humans yet alter rendering or semantics for downstream
+/// consumers — BOM, bidi-override (LRO/RLO/LRE/RLE/PDF/LRI/RLI/FSI/PDI),
+/// zero-width spaces (ZWSP/ZWNJ/ZWJ), LRM/RLM, word joiner, invisible
+/// separators. These bypass the prior `char::is_control()`/`is_whitespace()`
+/// gate entirely yet defeat audit logs and human review.
+fn is_disallowed_control_or_format(c: char) -> bool {
+    if c.is_control() {
+        return true;
+    }
+    let code = c as u32;
+    matches!(
+        code,
+        0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x2069 | 0xFEFF
+    )
 }
 
 /// Truncates `s` to at most `max_bytes` (cut on a char boundary) and appends
@@ -437,8 +537,11 @@ fn truncate_for_error(s: &str, max_bytes: usize) -> String {
 ///
 /// - Caps free-form fields (`description`, `suggested_fix`, `files[i]`) at 4 KiB.
 /// - Caps identifier fields (`id`, `category`) at 256 B.
-/// - Strips ASCII control chars except `\n`.
-/// - Caps the array at `FINDINGS_MAX_ENTRIES` entries.
+/// - Strips ASCII control chars and Unicode-format chars (`\n` preserved
+///   only in `description` / `suggested_fix`).
+/// - Caps the per-finding `files[]` array at `MAX_FILES_PER_FINDING`,
+///   appending a synthetic marker entry when truncation occurred.
+/// - Caps the findings array at `FINDINGS_MAX_ENTRIES` entries.
 fn sanitize_findings(findings: &[Finding]) -> Result<Vec<Finding>, AppendError> {
     if findings.len() > FINDINGS_MAX_ENTRIES {
         return Err(AppendError::TooManyFindings { n: findings.len() });
@@ -450,11 +553,7 @@ fn sanitize_findings(findings: &[Finding]) -> Result<Vec<Finding>, AppendError> 
             severity: f.severity,
             category: clamp_field(&f.category, FINDING_IDENT_FIELD_CAP_BYTES, false),
             description: clamp_field(&f.description, FINDING_FREEFORM_FIELD_CAP_BYTES, true),
-            files: f
-                .files
-                .iter()
-                .map(|p| clamp_field(p, FINDING_FREEFORM_FIELD_CAP_BYTES, false))
-                .collect(),
+            files: clamp_files_array(&f.files),
             suggested_fix: f
                 .suggested_fix
                 .as_deref()
@@ -463,13 +562,36 @@ fn sanitize_findings(findings: &[Finding]) -> Result<Vec<Finding>, AppendError> 
         .collect())
 }
 
-/// Strips ASCII control chars (preserving `\n` only when `keep_newline`) and
-/// truncates to `cap` bytes (cut on a char boundary), appending the safety
-/// marker on truncation.
+/// Clamps a finding's `files[]` array to `MAX_FILES_PER_FINDING` entries
+/// (each clamped to 4 KiB), appending a synthetic marker entry when the
+/// caller exceeded the cap so the downstream skill sees the truncation.
+fn clamp_files_array(files: &[String]) -> Vec<String> {
+    let total = files.len();
+    let kept_count = total.min(MAX_FILES_PER_FINDING);
+    let mut out: Vec<String> = files
+        .iter()
+        .take(kept_count)
+        .map(|p| clamp_field(p, FINDING_FREEFORM_FIELD_CAP_BYTES, false))
+        .collect();
+    if total > kept_count {
+        let dropped = total - kept_count;
+        out.push(format!("[+{dropped} more files truncated for safety]"));
+    }
+    out
+}
+
+/// Strips ASCII control chars and Unicode-format chars (preserving `\n` only
+/// when `keep_newline`) and truncates to `cap` bytes (cut on a char boundary),
+/// appending the safety marker on truncation.
 fn clamp_field(input: &str, cap: usize, keep_newline: bool) -> String {
     let cleaned: String = input
         .chars()
-        .filter(|c| !c.is_control() || (keep_newline && *c == '\n'))
+        .filter(|c| {
+            if keep_newline && *c == '\n' {
+                return true;
+            }
+            !is_disallowed_control_or_format(*c)
+        })
         .collect();
     if cleaned.len() <= cap {
         return cleaned;
@@ -484,10 +606,15 @@ fn clamp_field(input: &str, cap: usize, keep_newline: bool) -> String {
     out
 }
 
-/// Reads `path` after asserting its size is at most `max_bytes`. Avoids
-/// loading attacker-influenced files into memory unbounded.
+/// Reads `path` after asserting its size is at most `max_bytes` and that
+/// `path` resolves to a regular file. Avoids loading attacker-influenced
+/// content into memory unbounded; also defeats the FIFO/procfs bypass where
+/// `metadata.len()` reports `0` for a stream that would block forever.
 fn read_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, AppendError> {
     let metadata = std::fs::metadata(path).map_err(AppendError::ManifestRead)?;
+    if !metadata.file_type().is_file() {
+        return Err(AppendError::NotRegularFile(path.display().to_string()));
+    }
     if metadata.len() > max_bytes {
         return Err(AppendError::FileTooLarge {
             path: path.display().to_string(),
@@ -495,15 +622,23 @@ fn read_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, AppendError> {
             cap: max_bytes,
         });
     }
-    std::fs::read(path).map_err(AppendError::ManifestRead)
-}
-
-/// Drains a captured subprocess stream up to `SUBPROCESS_STREAM_CAP_BYTES`.
-fn drain_stream<R: Read>(reader: Option<R>) -> String {
-    let Some(mut r) = reader else { return String::new() };
-    let mut buf = Vec::with_capacity(8 * 1024);
-    let _ = (&mut r).take(SUBPROCESS_STREAM_CAP_BYTES as u64).read_to_end(&mut buf);
-    String::from_utf8_lossy(&buf).into_owned()
+    let file = std::fs::File::open(path).map_err(AppendError::ManifestRead)?;
+    let mut buf = Vec::with_capacity(metadata.len() as usize);
+    let read_limit = max_bytes
+        .checked_add(1)
+        .unwrap_or(max_bytes);
+    let bytes_read = file
+        .take(read_limit)
+        .read_to_end(&mut buf)
+        .map_err(AppendError::ManifestRead)? as u64;
+    if bytes_read > max_bytes {
+        return Err(AppendError::FileTooLarge {
+            path: path.display().to_string(),
+            size: bytes_read,
+            cap: max_bytes,
+        });
+    }
+    Ok(buf)
 }
 
 /// Returns the configured subprocess timeout in seconds, falling back to
@@ -515,25 +650,103 @@ fn timeout_seconds_from_env() -> u64 {
         .unwrap_or(DEFAULT_COMPILE_TIMEOUT_SECS)
 }
 
+/// Explicit prefix denylist: any env var whose name begins with one of these
+/// is scrubbed from the child process. Aimed at common cloud-provider, CI,
+/// observability, and SaaS credential namespaces.
+const SCRUB_ENV_PREFIXES: &[&str] = &[
+    "AWS_",
+    "OPENAI_",
+    "GOOGLE_",
+    "GCP_",
+    "AZURE_",
+    "DD_",
+    "DATADOG_",
+    "SLACK_",
+    "JFROG_",
+    "OP_",
+    "HUGGINGFACE_",
+    "HF_",
+    "CIRCLECI_",
+    "BUILDKITE_",
+    "JENKINS_",
+    "JIRA_",
+    "CONFLUENCE_",
+    "NOTION_",
+];
+
+/// Exact-match denylist: env vars that don't share a credential namespace
+/// prefix but are well-known token names.
+const SCRUB_ENV_EXACT: &[&str] = &[
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITLAB_TOKEN",
+    "NPM_TOKEN",
+    "CARGO_REGISTRY_TOKEN",
+    "PYPI_TOKEN",
+];
+
+/// Suffix denylist: catches custom credential vars (`MYAPP_API_KEY`, etc.)
+/// that don't match a known prefix.
+const SCRUB_ENV_SUFFIXES: &[&str] = &[
+    "_TOKEN",
+    "_SECRET",
+    "_API_KEY",
+    "_PASSWORD",
+    "_PASSWD",
+    "_PWD",
+];
+
 /// Returns a `Command::new("claude")` with sensitive credential env vars
 /// removed. Inherits everything else (the child still needs `PATH`, `HOME`,
 /// claude config dirs, and the user's chosen authentication env).
+///
+/// # Scrub policy
+///
+/// An env var is removed when its name:
+/// - matches a known cloud / CI / SaaS prefix (`AWS_*`, `OPENAI_*`,
+///   `GOOGLE_*`, `GCP_*`, `AZURE_*`, `DD_*`/`DATADOG_*`, `SLACK_*`,
+///   `JFROG_*`, `OP_*` (1Password), `HUGGINGFACE_*`/`HF_*`, `CIRCLECI_*`,
+///   `BUILDKITE_*`, `JENKINS_*`, `JIRA_*`, `CONFLUENCE_*`, `NOTION_*`),
+/// - is a well-known exact token name (`GITHUB_TOKEN`, `GH_TOKEN`,
+///   `GITLAB_TOKEN`, `NPM_TOKEN`, `CARGO_REGISTRY_TOKEN`, `PYPI_TOKEN`),
+/// - or ends with `_TOKEN`, `_SECRET`, `_API_KEY`, `_PASSWORD`, `_PASSWD`,
+///   `_PWD`.
+///
+/// `ANTHROPIC_*` is intentionally inherited — the child `claude` process
+/// requires `ANTHROPIC_API_KEY` (or equivalent) to authenticate. Operators
+/// who run on a different auth mechanism may unset these explicitly before
+/// invoking `plan-executor`.
 fn scrubbed_env_command() -> Command {
     let mut cmd = Command::new("claude");
-    let to_remove: Vec<String> = std::env::vars()
-        .map(|(k, _)| k)
-        .filter(|k| {
-            k.starts_with("AWS_")
-                || k == "GITHUB_TOKEN"
-                || k == "GH_TOKEN"
-                || k.starts_with("OPENAI_")
-                || k.starts_with("GOOGLE_")
-        })
-        .collect();
-    for k in to_remove {
+    let names: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
+    for k in vars_to_scrub(names.iter().map(String::as_str)) {
         cmd.env_remove(k);
     }
     cmd
+}
+
+/// Pure helper used by [`scrubbed_env_command`] and unit tests. Given an
+/// iterator of env var names, returns the subset that match the scrub policy.
+fn vars_to_scrub<'a>(vars: impl Iterator<Item = &'a str>) -> Vec<String> {
+    vars.filter(|name| should_scrub_env(name))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Predicate: returns true when `name` matches the scrub policy described in
+/// [`scrubbed_env_command`]. `ANTHROPIC_*` is intentionally allow-listed so
+/// the child `claude` can still authenticate.
+fn should_scrub_env(name: &str) -> bool {
+    if name.starts_with("ANTHROPIC_") {
+        return false;
+    }
+    if SCRUB_ENV_PREFIXES.iter().any(|p| name.starts_with(p)) {
+        return true;
+    }
+    if SCRUB_ENV_EXACT.contains(&name) {
+        return true;
+    }
+    SCRUB_ENV_SUFFIXES.iter().any(|s| name.ends_with(s))
 }
 
 /// Enforces the post-append invariants the plan's APPEND-mode rules require.
@@ -1019,7 +1232,7 @@ mod tests {
         assert_eq!(meta["flags"]["merge"], false);
     }
 
-    // ---- F1: embedded_schema_path materialization ----
+    // ---- F1 / SEC-11: embedded_schema_path materialization ----
 
     #[test]
     fn embedded_schema_path_materializes_to_temp_file_with_id() {
@@ -1029,6 +1242,16 @@ mod tests {
         assert!(p1.is_file(), "schema must exist on disk");
         let body = fs::read_to_string(&p1).unwrap();
         assert!(body.contains("\"$id\""), "materialized schema must contain $id");
+
+        // SEC-11: parent must be a per-process subdirectory, NOT temp_dir()
+        // directly — that would let an attacker pre-create the path as a
+        // symlink and redirect the schema write.
+        let parent = p1.parent().expect("materialized schema must have a parent");
+        assert_ne!(
+            parent,
+            std::env::temp_dir().as_path(),
+            "schema must live in a per-process subdirectory of temp_dir(), not directly in temp_dir()"
+        );
     }
 
     // ---- F2: ClaudeInvoker path-arg validation ----
@@ -1252,5 +1475,101 @@ mod tests {
             None => unsafe { std::env::remove_var(COMPILE_TIMEOUT_ENV); },
         }
         assert_eq!(got, DEFAULT_COMPILE_TIMEOUT_SECS);
+    }
+
+    // ---- N1: spawn_drainer bounded read ----
+
+    #[test]
+    fn spawn_drainer_caps_read_at_limit() {
+        use std::io::Cursor;
+        let cap: u64 = 1024;
+        let payload: Vec<u8> = vec![b'x'; (cap as usize) + 5_000];
+        let cursor = Cursor::new(payload);
+        let handle = spawn_drainer(cursor, cap);
+        let bytes = handle.join().expect("drainer thread must join cleanly");
+        assert_eq!(bytes.len(), cap as usize);
+    }
+
+    // ---- N3: read_capped rejects non-regular files and enforces cap during read ----
+
+    #[test]
+    fn read_capped_rejects_non_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A directory is not a regular file; metadata.file_type().is_file() == false.
+        let err = read_capped(tmp.path(), 1024).expect_err("directory must reject");
+        assert!(matches!(err, AppendError::NotRegularFile(_)));
+    }
+
+    #[test]
+    fn read_capped_enforces_cap_during_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("over.bin");
+        let cap: u64 = 4096;
+        let buf = vec![0u8; (cap as usize) + 100];
+        fs::write(&path, &buf).unwrap();
+        let err = read_capped(&path, cap).expect_err("over-cap regular file must reject");
+        assert!(matches!(err, AppendError::FileTooLarge { .. }));
+    }
+
+    // ---- N4: per-finding files[] cap ----
+
+    #[test]
+    fn sanitize_findings_caps_files_array_per_finding() {
+        let many_files: Vec<String> = (0..1000).map(|i| format!("src/x{i}.rs")).collect();
+        let f = vec![Finding {
+            id: "F1".into(),
+            severity: Severity::Major,
+            category: "c".into(),
+            description: "d".into(),
+            files: many_files,
+            suggested_fix: None,
+        }];
+        let out = sanitize_findings(&f).unwrap();
+        assert!(out[0].files.len() <= MAX_FILES_PER_FINDING + 1);
+        let last = out[0].files.last().expect("files must not be empty");
+        assert!(
+            last.contains("more files truncated for safety"),
+            "last entry should be the truncation marker; got: {last}"
+        );
+    }
+
+    // ---- SEC-9: Unicode-format chars ----
+
+    #[test]
+    fn validate_path_args_rejects_bidi_override() {
+        let p = PathBuf::from("/safe/dir/\u{202E}gpj.exe");
+        let plain = PathBuf::from("/tmp/ok.md");
+        let args: [&Path; 5] = [&plain, &p, &plain, &plain, &plain];
+        let err = validate_path_args(&args).expect_err("bidi override must reject");
+        assert!(matches!(err, AppendError::InvalidPathArg(_)));
+    }
+
+    #[test]
+    fn clamp_field_strips_unicode_format_chars() {
+        let out = clamp_field("hello\u{200B}world\u{FEFF}", 4096, false);
+        assert_eq!(out, "helloworld");
+    }
+
+    // ---- SEC-10: scrubbed_env policy ----
+
+    #[test]
+    fn scrubbed_env_command_removes_known_token_patterns() {
+        let names = [
+            "SLACK_BOT_TOKEN",
+            "NPM_TOKEN",
+            "MY_CUSTOM_API_KEY",
+            "MY_LEAVE_THIS_ALONE",
+            "ANTHROPIC_API_KEY",
+            "PATH",
+        ];
+        let scrubbed = vars_to_scrub(names.iter().copied());
+        assert_eq!(
+            scrubbed,
+            vec![
+                "SLACK_BOT_TOKEN".to_string(),
+                "NPM_TOKEN".to_string(),
+                "MY_CUSTOM_API_KEY".to_string(),
+            ]
+        );
     }
 }

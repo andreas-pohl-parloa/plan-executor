@@ -56,7 +56,9 @@ jsonschema = "0.46"
 # Subprocess wait with timeout (used by compile::ClaudeInvoker)
 wait-timeout = "0.2"
 
-[dev-dependencies]
+# Secure temp directory creation (used by compile::embedded_schema_path)
 tempfile = "3"
+
+[dev-dependencies]
 tokio-test = "0.4"
 dirs = "6"
