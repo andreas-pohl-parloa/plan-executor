@@ -363,6 +363,7 @@ fn push_workflow_via_pr(remote_repo: &str, repo_dir: &Path) -> Result<()> {
 pub fn trigger_remote_execution(
     remote_repo: &str,
     plan_path: &Path,
+    manifest_path: &Path,
     meta: &ExecutionMetadata,
 ) -> Result<String> {
     let plan_content = std::fs::read_to_string(plan_path)?;
@@ -384,6 +385,10 @@ pub fn trigger_remote_execution(
 
     // Push plan.md
     push_file_to_branch(remote_repo, &branch, "plan.md", &plan_content)?;
+
+    let manifest_content = std::fs::read_to_string(manifest_path)
+        .with_context(|| format!("read manifest {}", manifest_path.display()))?;
+    push_file_to_branch(remote_repo, &branch, "tasks.json", &manifest_content)?;
 
     // Push prompt files
     for pf in &prompt_files {

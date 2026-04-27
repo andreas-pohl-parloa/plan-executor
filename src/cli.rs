@@ -670,7 +670,11 @@ async fn execute_plan(manifest_arg: String, config: crate::config::Config) -> Re
     execute_via_daemon(plan_path, manifest_path, config).await
 }
 
-async fn trigger_remote(plan: PathBuf, config: crate::config::Config) -> Result<()> {
+async fn trigger_remote(
+    plan: PathBuf,
+    manifest_path: PathBuf,
+    config: crate::config::Config,
+) -> Result<()> {
     let remote_repo = config.remote_repo.as_deref()
         .ok_or_else(|| anyhow::anyhow!(
             "remote execution requires 'remote_repo' in config — run 'plan-executor remote-setup'"
@@ -697,11 +701,10 @@ async fn trigger_remote(plan: PathBuf, config: crate::config::Config) -> Result<
     // Push Codex OAuth token (idempotent, skips if no auth file)
     let _ = crate::remote::push_codex_auth(remote_repo);
 
-    let pr_url = crate::remote::trigger_remote_execution(remote_repo, &plan, &meta)?;
+    let pr_url = crate::remote::trigger_remote_execution(remote_repo, &plan, &manifest_path, &meta)?;
     let pr_num = crate::remote::pr_number_from_url(&pr_url);
 
-    // Update plan status and store PR number
-    let _ = crate::plan::set_plan_header(&plan, "status", "EXECUTING");
+    // Store PR number for daemon-side polling.
     if let Some(n) = pr_num {
         let _ = crate::plan::set_plan_header(&plan, "remote-pr", &n.to_string());
     }
@@ -750,7 +753,7 @@ async fn execute_foreground(manifest_arg: String, config: crate::config::Config)
     if crate::plan::parse_execution_mode(&resolved_path) == crate::plan::ExecutionMode::Remote
         && std::env::var("PLAN_EXECUTOR_LOCAL").as_deref() != Ok("1")
     {
-        return trigger_remote(resolved_path, config).await;
+        return trigger_remote(resolved_path, manifest_path, config).await;
     }
 
     let execution_root = find_repo_root(&resolved_path)
