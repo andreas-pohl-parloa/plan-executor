@@ -1899,6 +1899,19 @@ mod tests {
             let target = output_dir.join("tasks.json");
             fs::write(target, serde_json::to_vec_pretty(&self.post_manifest).unwrap())
                 .map_err(|e| format!("fake write: {e}"))?;
+            // Materialize every referenced prompt_file so the post-append
+            // semantic_check (added per F4) accepts the synthetic manifest.
+            if let Some(tasks) = self.post_manifest.get("tasks").and_then(|v| v.as_object()) {
+                for (_tid, spec) in tasks {
+                    if let Some(pf) = spec.get("prompt_file").and_then(|v| v.as_str()) {
+                        let full = output_dir.join(pf);
+                        if let Some(parent) = full.parent() {
+                            let _ = fs::create_dir_all(parent);
+                        }
+                        let _ = fs::write(&full, "dummy");
+                    }
+                }
+            }
             Ok(())
         }
     }

@@ -7,18 +7,70 @@
 //! synthesizing the meta.json sidecar from the manifest's `plan` block,
 //! writing findings.json, validating the post-append manifest, and
 //! enforcing structural invariants (original waves preserved, fix-wave
-//! IDs >= 100, fix-wave depends_on includes last impl wave).
+//! IDs >= 100, fix-wave depends_on references existing waves).
+//!
+//! # Trust boundary
+//!
+//! `findings.json` is consumed by an LLM-driven skill (`plan-executor:compile-plan`).
+//! Reviewer-supplied finding fields are sanitized in `sanitize_findings` before
+//! the file is written: oversized strings are truncated, ASCII control chars
+//! are stripped, and the array is capped. This is defense-in-depth against
+//! prompt injection (OWASP LLM01) — an attacker who can influence finding
+//! text MUST NOT be able to redirect the skill's behavior via embedded
+//! instructions or by exhausting context.
+//!
+//! # Subprocess hardening
+//!
+//! `ClaudeInvoker` further restricts the spawned `claude` process: path args
+//! are validated UTF-8/whitespace/leading-dash free, the slash-command prompt
+//! is whitelist-only via `--allowed-tools`, sensitive credential env vars
+//! (AWS, GH/GitHub, OpenAI, Google) are scrubbed from the child env, and the
+//! wait is bounded by a timeout (default 600s, override via
+//! `PLAN_EXECUTOR_COMPILE_TIMEOUT_SECS`).
 
+use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use thiserror::Error;
+use wait_timeout::ChildExt;
 
 use crate::finding::Finding;
 use crate::schema::{validate_manifest, ValidationError};
 
+/// Maximum bytes of any single subprocess stream embedded in error messages.
+const ERROR_TRUNCATE_BYTES: usize = 2048;
+
+/// Maximum size of an on-disk manifest the fix-loop will read into memory.
+const MANIFEST_READ_CAP_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Maximum bytes captured from each subprocess stream after a timeout/exit.
+const SUBPROCESS_STREAM_CAP_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum bytes per free-form reviewer field (description / suggested_fix / files entries).
+const FINDING_FREEFORM_FIELD_CAP_BYTES: usize = 4 * 1024;
+
+/// Maximum bytes per identifier-like reviewer field (id / category).
+const FINDING_IDENT_FIELD_CAP_BYTES: usize = 256;
+
+/// Maximum number of findings accepted in a single APPEND call.
+const FINDINGS_MAX_ENTRIES: usize = 200;
+
+/// Marker appended when a string was truncated by `sanitize_findings`.
+const FINDING_TRUNCATION_MARKER: &str = "\n[...truncated for safety]";
+
+/// Default subprocess timeout in seconds when the env override is absent or unparseable.
+const DEFAULT_COMPILE_TIMEOUT_SECS: u64 = 600;
+
+/// Env var consulted to override `DEFAULT_COMPILE_TIMEOUT_SECS`.
+const COMPILE_TIMEOUT_ENV: &str = "PLAN_EXECUTOR_COMPILE_TIMEOUT_SECS";
+
 /// Errors surfaced by `append_fix_waves`.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum AppendError {
     #[error("manifest read failed: {0}")]
     ManifestRead(std::io::Error),
@@ -44,8 +96,20 @@ pub enum AppendError {
     PostReread(std::io::Error),
     #[error("post-append manifest invalid: {0}")]
     PostInvalid(String),
+    #[error("post-append semantic check failed: {0}")]
+    PostSemantic(String),
     #[error("post-append invariant violated: {0}")]
     InvariantViolation(String),
+    #[error("schema materialize failed: {0}")]
+    SchemaMaterialize(std::io::Error),
+    #[error("invalid path argument: {0}")]
+    InvalidPathArg(String),
+    #[error("too many findings: {n} (cap {cap})", cap = FINDINGS_MAX_ENTRIES)]
+    TooManyFindings { n: usize },
+    #[error("file too large: {path} is {size} bytes (cap {cap})")]
+    FileTooLarge { path: String, size: u64, cap: u64 },
+    #[error("compile-plan skill timed out after {0}s")]
+    Timeout(u64),
 }
 
 /// Trait used to invoke the compile-plan skill. Production callers use the
@@ -53,12 +117,27 @@ pub enum AppendError {
 /// post-append manifest.
 pub trait CompileInvoker {
     /// Run the compile-plan skill with the given arguments.
+    ///
     /// `args` is `[plan_path, schema_path, output_dir, meta_json_path, findings_json_path]`.
-    /// Returns Ok(()) on success or Err(message) on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(message)` on spawn failure, non-zero exit, timeout, or
+    /// missing `COMPILED:` line in stdout.
     fn invoke(&self, args: &[&Path]) -> Result<(), String>;
 }
 
 /// Production implementation: spawns `claude -p "/plan-executor:compile-plan ..."`.
+///
+/// # Subprocess hardening
+///
+/// - Path args are validated (UTF-8, no whitespace, no leading dash).
+/// - `--allowed-tools "Read,Write,Edit"` whitelists tool surface for the skill.
+/// - Sensitive credential env vars are scrubbed from the child process:
+///   `AWS_*`, `GITHUB_TOKEN`, `GH_TOKEN`, `OPENAI_*`, `GOOGLE_*`.
+/// - Wait is bounded by `PLAN_EXECUTOR_COMPILE_TIMEOUT_SECS` (default 600s).
+/// - stdout/stderr are size-capped (16 MiB each) and truncated in error
+///   messages.
 pub struct ClaudeInvoker;
 
 impl CompileInvoker for ClaudeInvoker {
@@ -66,38 +145,60 @@ impl CompileInvoker for ClaudeInvoker {
         if args.len() != 5 {
             return Err(format!("expected 5 args, got {}", args.len()));
         }
+        let validated = validate_path_args(args).map_err(|e| e.to_string())?;
         let prompt = format!(
             "/plan-executor:compile-plan {} {} {} {} {}",
-            args[0].display(),
-            args[1].display(),
-            args[2].display(),
-            args[3].display(),
-            args[4].display(),
+            validated[0], validated[1], validated[2], validated[3], validated[4],
         );
-        let out = Command::new("claude")
+
+        let timeout_secs = timeout_seconds_from_env();
+        let mut child = scrubbed_env_command()
             .arg("-p")
             .arg(&prompt)
-            .output()
+            .arg("--allowed-tools")
+            .arg("Read,Write,Edit")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| format!("spawn failed: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
+
+        let status = match child.wait_timeout(Duration::from_secs(timeout_secs)) {
+            Ok(Some(status)) => status,
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(AppendError::Timeout(timeout_secs).to_string());
+            }
+            Err(e) => return Err(format!("wait failed: {e}")),
+        };
+
+        let stdout = drain_stream(child.stdout.take());
+        let stderr = drain_stream(child.stderr.take());
+
+        if !status.success() {
+            return Err(AppendError::InvokeExit(format!(
                 "claude exited {:?}; stderr={}",
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+                status.code(),
+                truncate_for_error(&stderr, ERROR_TRUNCATE_BYTES)
+            ))
+            .to_string());
         }
-        let stdout = String::from_utf8_lossy(&out.stdout);
         if !stdout.lines().any(|l| l.starts_with("COMPILED:")) {
             return Err(format!(
                 "compile-plan did not emit COMPILED: line; stdout was: {}",
-                stdout.trim()
+                truncate_for_error(stdout.trim(), ERROR_TRUNCATE_BYTES)
             ));
         }
         Ok(())
     }
 }
 
-/// Public entry point. Production callers pass &ClaudeInvoker.
+/// Public entry point. Production callers pass `&ClaudeInvoker`.
+///
+/// # Errors
+///
+/// Returns any [`AppendError`] surfaced during read, sanitize, invoke, or
+/// post-append validation steps.
 pub fn append_fix_waves(
     manifest_path: &Path,
     findings: &[Finding],
@@ -106,13 +207,22 @@ pub fn append_fix_waves(
 }
 
 /// Test-injection variant. Splits invoker out so unit tests can supply a fake.
+///
+/// # Errors
+///
+/// Returns any [`AppendError`] surfaced during read, sanitize, invoke, or
+/// post-append validation steps.
 pub fn append_fix_waves_with_invoker(
     invoker: &dyn CompileInvoker,
     manifest_path: &Path,
     findings: &[Finding],
 ) -> Result<PathBuf, AppendError> {
-    // Step 1 — read existing manifest.
-    let manifest_bytes = std::fs::read(manifest_path).map_err(AppendError::ManifestRead)?;
+    // Sanitize early — any over-cap or malformed input is rejected before
+    // we touch the filesystem.
+    let safe_findings = sanitize_findings(findings)?;
+
+    // Step 1 — read existing manifest (size-capped).
+    let manifest_bytes = read_capped(manifest_path, MANIFEST_READ_CAP_BYTES)?;
     let manifest: serde_json::Value =
         serde_json::from_slice(&manifest_bytes).map_err(AppendError::ManifestParse)?;
     if let Err(errors) = validate_manifest(&manifest) {
@@ -125,10 +235,10 @@ pub fn append_fix_waves_with_invoker(
         .and_then(|v| v.as_array())
         .cloned()
         .ok_or_else(|| AppendError::ManifestField("waves".into()))?;
-    let pre_tasks_keys: Vec<String> = manifest
+    let pre_tasks: serde_json::Map<String, serde_json::Value> = manifest
         .get("tasks")
         .and_then(|v| v.as_object())
-        .map(|o| o.keys().cloned().collect())
+        .cloned()
         .ok_or_else(|| AppendError::ManifestField("tasks".into()))?;
     let pre_max_fix_wave_id = max_fix_wave_id(&pre_waves);
     let pre_last_impl_wave_id = last_implementation_wave_id(&pre_waves)
@@ -141,11 +251,9 @@ pub fn append_fix_waves_with_invoker(
         .ok_or_else(|| AppendError::ManifestField("plan.path".into()))?;
     let plan_path = PathBuf::from(plan_path_str);
 
-    // Step 4 — schema path. Use the embedded schema's filesystem location next
-    // to the binary's source. For the runtime, `tasks.schema.json` lives at
-    // `src/schemas/tasks.schema.json` relative to the crate root. Production
-    // code resolves it via `CARGO_MANIFEST_DIR` at compile time.
-    let schema_path = embedded_schema_path();
+    // Step 4 — schema path. Materialized from the embedded copy at runtime so
+    // released binaries do not depend on `CARGO_MANIFEST_DIR`.
+    let schema_path = embedded_schema_path()?.clone();
 
     // Step 5 — output-dir is the manifest's parent.
     let manifest_dir = manifest_path
@@ -157,9 +265,9 @@ pub fn append_fix_waves_with_invoker(
     let meta_path = manifest_dir.join(".append-meta.json");
     write_synthetic_meta(&meta_path, &manifest)?;
 
-    // Step 7 — write findings.json.
+    // Step 7 — write findings.json (sanitized).
     let findings_path = manifest_dir.join("findings.json");
-    let findings_doc = serde_json::json!({ "findings": findings });
+    let findings_doc = serde_json::json!({ "findings": safe_findings });
     let findings_bytes =
         serde_json::to_vec_pretty(&findings_doc).map_err(AppendError::FindingsSerialize)?;
     std::fs::write(&findings_path, &findings_bytes).map_err(AppendError::FindingsWrite)?;
@@ -174,19 +282,26 @@ pub fn append_fix_waves_with_invoker(
     ];
     invoker.invoke(&args).map_err(AppendError::Invoke)?;
 
-    // Step 9 — re-read updated manifest.
-    let updated_bytes = std::fs::read(manifest_path).map_err(AppendError::PostReread)?;
+    // Step 9 — re-read updated manifest (size-capped). Map IO failures to
+    // `PostReread` so callers can distinguish step-1 vs step-9 read failures.
+    let updated_bytes = read_capped(manifest_path, MANIFEST_READ_CAP_BYTES).map_err(|e| match e {
+        AppendError::ManifestRead(io) => AppendError::PostReread(io),
+        other => other,
+    })?;
     let updated: serde_json::Value =
         serde_json::from_slice(&updated_bytes).map_err(AppendError::ManifestParse)?;
     if let Err(errors) = validate_manifest(&updated) {
         return Err(AppendError::PostInvalid(errors_summary(&errors)));
+    }
+    if let Err(sem_errors) = crate::validate::semantic_check(&updated, &manifest_dir) {
+        return Err(AppendError::PostSemantic(semantic_errors_summary(&sem_errors)));
     }
 
     // Step 10 — invariants.
     enforce_post_append_invariants(
         &updated,
         &pre_waves,
-        &pre_tasks_keys,
+        &pre_tasks,
         pre_last_impl_wave_id,
         pre_max_fix_wave_id,
     )?;
@@ -250,16 +365,182 @@ fn write_synthetic_meta(path: &Path, manifest: &serde_json::Value) -> Result<(),
     Ok(())
 }
 
-/// Resolves the path to the embedded `tasks.schema.json` at runtime.
-fn embedded_schema_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/schemas/tasks.schema.json")
+/// Materializes the embedded `tasks.schema.json` to a stable temp file once
+/// per process and returns the path.
+///
+/// Replaces a previous design that baked `CARGO_MANIFEST_DIR` into the binary;
+/// the build-host source path does not exist on the user's machine after
+/// `cargo install` or any release distribution.
+fn embedded_schema_path() -> Result<&'static PathBuf, AppendError> {
+    static MATERIALIZED: OnceLock<PathBuf> = OnceLock::new();
+    if let Some(p) = MATERIALIZED.get() {
+        return Ok(p);
+    }
+    let target = std::env::temp_dir().join("plan-executor-tasks.schema.json");
+    let payload = crate::schema::embedded_schema_json();
+    if let Ok(existing) = std::fs::read(&target) {
+        if existing == payload.as_bytes() {
+            return Ok(MATERIALIZED.get_or_init(|| target));
+        }
+    }
+    std::fs::write(&target, payload).map_err(AppendError::SchemaMaterialize)?;
+    Ok(MATERIALIZED.get_or_init(|| target))
+}
+
+/// Validates path arguments before they are interpolated into a slash-command
+/// prompt. Each path must be UTF-8 and contain no whitespace, no control
+/// chars, and no leading `-` (which could re-bind to a flag inside the skill).
+fn validate_path_args<'a>(args: &'a [&'a Path]) -> Result<Vec<&'a str>, AppendError> {
+    args.iter()
+        .enumerate()
+        .map(|(idx, p)| {
+            let s = p.to_str().ok_or_else(|| {
+                AppendError::InvalidPathArg(format!(
+                    "arg {idx}: path is not valid UTF-8 ({})",
+                    p.display()
+                ))
+            })?;
+            if s.is_empty() {
+                return Err(AppendError::InvalidPathArg(format!("arg {idx}: empty path")));
+            }
+            if s.starts_with('-') {
+                return Err(AppendError::InvalidPathArg(format!(
+                    "arg {idx}: path may not start with `-` ({s})"
+                )));
+            }
+            if let Some(c) = s.chars().find(|c| c.is_whitespace() || c.is_control()) {
+                return Err(AppendError::InvalidPathArg(format!(
+                    "arg {idx}: path contains forbidden character {c:?} ({s})"
+                )));
+            }
+            Ok(s)
+        })
+        .collect()
+}
+
+/// Truncates `s` to at most `max_bytes` (cut on a char boundary) and appends
+/// a `... (truncated, N more bytes)` suffix when truncation occurred.
+fn truncate_for_error(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let extra = s.len() - cut;
+    format!("{}... (truncated, {} more bytes)", &s[..cut], extra)
+}
+
+/// Sanitizes reviewer-supplied findings before they are written to disk and
+/// consumed by the LLM-driven compile-plan skill.
+///
+/// - Caps free-form fields (`description`, `suggested_fix`, `files[i]`) at 4 KiB.
+/// - Caps identifier fields (`id`, `category`) at 256 B.
+/// - Strips ASCII control chars except `\n`.
+/// - Caps the array at `FINDINGS_MAX_ENTRIES` entries.
+fn sanitize_findings(findings: &[Finding]) -> Result<Vec<Finding>, AppendError> {
+    if findings.len() > FINDINGS_MAX_ENTRIES {
+        return Err(AppendError::TooManyFindings { n: findings.len() });
+    }
+    Ok(findings
+        .iter()
+        .map(|f| Finding {
+            id: clamp_field(&f.id, FINDING_IDENT_FIELD_CAP_BYTES, false),
+            severity: f.severity,
+            category: clamp_field(&f.category, FINDING_IDENT_FIELD_CAP_BYTES, false),
+            description: clamp_field(&f.description, FINDING_FREEFORM_FIELD_CAP_BYTES, true),
+            files: f
+                .files
+                .iter()
+                .map(|p| clamp_field(p, FINDING_FREEFORM_FIELD_CAP_BYTES, false))
+                .collect(),
+            suggested_fix: f
+                .suggested_fix
+                .as_deref()
+                .map(|s| clamp_field(s, FINDING_FREEFORM_FIELD_CAP_BYTES, true)),
+        })
+        .collect())
+}
+
+/// Strips ASCII control chars (preserving `\n` only when `keep_newline`) and
+/// truncates to `cap` bytes (cut on a char boundary), appending the safety
+/// marker on truncation.
+fn clamp_field(input: &str, cap: usize, keep_newline: bool) -> String {
+    let cleaned: String = input
+        .chars()
+        .filter(|c| !c.is_control() || (keep_newline && *c == '\n'))
+        .collect();
+    if cleaned.len() <= cap {
+        return cleaned;
+    }
+    let mut cut = cap;
+    while cut > 0 && !cleaned.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = String::with_capacity(cut + FINDING_TRUNCATION_MARKER.len());
+    out.push_str(&cleaned[..cut]);
+    out.push_str(FINDING_TRUNCATION_MARKER);
+    out
+}
+
+/// Reads `path` after asserting its size is at most `max_bytes`. Avoids
+/// loading attacker-influenced files into memory unbounded.
+fn read_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, AppendError> {
+    let metadata = std::fs::metadata(path).map_err(AppendError::ManifestRead)?;
+    if metadata.len() > max_bytes {
+        return Err(AppendError::FileTooLarge {
+            path: path.display().to_string(),
+            size: metadata.len(),
+            cap: max_bytes,
+        });
+    }
+    std::fs::read(path).map_err(AppendError::ManifestRead)
+}
+
+/// Drains a captured subprocess stream up to `SUBPROCESS_STREAM_CAP_BYTES`.
+fn drain_stream<R: Read>(reader: Option<R>) -> String {
+    let Some(mut r) = reader else { return String::new() };
+    let mut buf = Vec::with_capacity(8 * 1024);
+    let _ = (&mut r).take(SUBPROCESS_STREAM_CAP_BYTES as u64).read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Returns the configured subprocess timeout in seconds, falling back to
+/// `DEFAULT_COMPILE_TIMEOUT_SECS` when the env var is unset or unparseable.
+fn timeout_seconds_from_env() -> u64 {
+    std::env::var(COMPILE_TIMEOUT_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_COMPILE_TIMEOUT_SECS)
+}
+
+/// Returns a `Command::new("claude")` with sensitive credential env vars
+/// removed. Inherits everything else (the child still needs `PATH`, `HOME`,
+/// claude config dirs, and the user's chosen authentication env).
+fn scrubbed_env_command() -> Command {
+    let mut cmd = Command::new("claude");
+    let to_remove: Vec<String> = std::env::vars()
+        .map(|(k, _)| k)
+        .filter(|k| {
+            k.starts_with("AWS_")
+                || k == "GITHUB_TOKEN"
+                || k == "GH_TOKEN"
+                || k.starts_with("OPENAI_")
+                || k.starts_with("GOOGLE_")
+        })
+        .collect();
+    for k in to_remove {
+        cmd.env_remove(k);
+    }
+    cmd
 }
 
 /// Enforces the post-append invariants the plan's APPEND-mode rules require.
 fn enforce_post_append_invariants(
     updated: &serde_json::Value,
     pre_waves: &[serde_json::Value],
-    pre_tasks_keys: &[String],
+    pre_tasks: &serde_json::Map<String, serde_json::Value>,
     pre_last_impl_wave_id: u64,
     pre_max_fix_wave_id: Option<u64>,
 ) -> Result<(), AppendError> {
@@ -293,14 +574,28 @@ fn enforce_post_append_invariants(
         }
     }
 
-    // Invariant 2: every original task key preserved.
-    for k in pre_tasks_keys {
-        if !post_tasks_obj.contains_key(k) {
-            return Err(AppendError::InvariantViolation(format!(
-                "original task `{k}` was dropped by APPEND"
-            )));
+    // Invariant 2: every original task preserved verbatim (full value equality).
+    for (k, pre_val) in pre_tasks {
+        match post_tasks_obj.get(k) {
+            Some(post_val) if post_val == pre_val => {}
+            Some(_) => {
+                return Err(AppendError::InvariantViolation(format!(
+                    "original task `{k}` was modified by APPEND"
+                )));
+            }
+            None => {
+                return Err(AppendError::InvariantViolation(format!(
+                    "original task `{k}` was dropped by APPEND"
+                )));
+            }
         }
     }
+
+    // Build the post-append wave-id set up front for invariant 5.
+    let post_wave_ids: HashSet<u64> = post_waves
+        .iter()
+        .filter_map(|w| w.get("id").and_then(serde_json::Value::as_u64))
+        .collect();
 
     // Invariant 3: there is at least one new wave with id >= 100 and kind == "fix".
     let new_fix_waves: Vec<&serde_json::Value> = post_waves
@@ -340,19 +635,22 @@ fn enforce_post_append_invariants(
     }
 
     // Invariant 5: every new fix-wave's depends_on includes pre_last_impl_wave_id
-    // OR a later fix-wave id. (Round-2 fix-waves may depend on round-1 fix-waves.)
+    // OR an id present in the post-append wave set. (Round-2 fix-waves may
+    // depend on round-1 fix-waves; non-existent ids are rejected.)
     for w in &new_fix_waves {
         let deps: Vec<u64> = w
             .get("depends_on")
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(serde_json::Value::as_u64).collect())
             .unwrap_or_default();
-        let ok = deps.iter().any(|d| *d == pre_last_impl_wave_id || *d >= 100);
+        let ok = deps
+            .iter()
+            .any(|d| *d == pre_last_impl_wave_id || post_wave_ids.contains(d));
         if !ok {
             let id = w.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
             return Err(AppendError::InvariantViolation(format!(
                 "fix-wave {id} depends_on must include the last impl wave \
-                 ({pre_last_impl_wave_id}) or a prior fix-wave id; got {deps:?}"
+                 ({pre_last_impl_wave_id}) or a wave id present in the post-append manifest; got {deps:?}"
             )));
         }
     }
@@ -365,6 +663,15 @@ fn errors_summary(errors: &[ValidationError]) -> String {
         .iter()
         .take(5)
         .map(|e| format!("{}: {}", e.path, e.message))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn semantic_errors_summary(errors: &[crate::validate::SemanticError]) -> String {
+    errors
+        .iter()
+        .take(5)
+        .map(|e| format!("{}: {}", e.category, e.message))
         .collect::<Vec<_>>()
         .join("; ")
 }
@@ -398,13 +705,14 @@ mod tests {
                 { "id": 2, "task_ids": ["2.1"], "depends_on": [1], "kind": "implementation" }
             ],
             "tasks": {
-                "1.1": { "prompt_file": "tasks/task-1.1.md", "agent_type": "claude" },
-                "2.1": { "prompt_file": "tasks/task-2.1.md", "agent_type": "claude" }
+                "1.1": { "prompt_file": "tasks/1.1.md", "agent_type": "claude" },
+                "2.1": { "prompt_file": "tasks/2.1.md", "agent_type": "claude" }
             }
         })
     }
 
-    /// Fake invoker that writes a caller-supplied manifest to the output dir.
+    /// Fake invoker that writes a caller-supplied manifest to the output dir
+    /// and (optionally) materializes prompt_file paths so semantic_check passes.
     struct FakeInvoker {
         write_manifest: serde_json::Value,
         capture_args: RefCell<Vec<PathBuf>>,
@@ -416,6 +724,18 @@ mod tests {
             let target = output_dir.join("tasks.json");
             let bytes = serde_json::to_vec_pretty(&self.write_manifest).unwrap();
             fs::write(&target, &bytes).unwrap();
+            // Materialize every referenced prompt_file so semantic_check passes.
+            if let Some(tasks) = self.write_manifest.get("tasks").and_then(|v| v.as_object()) {
+                for (_tid, spec) in tasks {
+                    if let Some(pf) = spec.get("prompt_file").and_then(|v| v.as_str()) {
+                        let full = output_dir.join(pf);
+                        if let Some(parent) = full.parent() {
+                            let _ = fs::create_dir_all(parent);
+                        }
+                        let _ = fs::write(&full, "dummy");
+                    }
+                }
+            }
             Ok(())
         }
     }
@@ -423,7 +743,18 @@ mod tests {
     fn write_pre_manifest(dir: &Path, manifest: &serde_json::Value) -> PathBuf {
         let path = dir.join("tasks.json");
         fs::write(&path, serde_json::to_vec_pretty(manifest).unwrap()).unwrap();
-        // mock plan.md so plan.path existence checks succeed if added later
+        // Materialize prompt_files so semantic_check accepts the post-manifest.
+        if let Some(tasks) = manifest.get("tasks").and_then(|v| v.as_object()) {
+            for (_tid, spec) in tasks {
+                if let Some(pf) = spec.get("prompt_file").and_then(|v| v.as_str()) {
+                    let full = dir.join(pf);
+                    if let Some(parent) = full.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let _ = fs::write(&full, "dummy");
+                }
+            }
+        }
         path
     }
 
@@ -568,7 +899,12 @@ mod tests {
         };
         let err = append_fix_waves_with_invoker(&invoker, &manifest_path, &fresh_findings())
             .expect_err("dropping a pre-existing wave must fail");
-        assert!(matches!(err, AppendError::InvariantViolation(_)));
+        // PostSemantic may fire first (wave 2's dangling depends_on:[1])
+        // before the invariant check spots the dropped wave; either is correct.
+        assert!(matches!(
+            err,
+            AppendError::InvariantViolation(_) | AppendError::PostSemantic(_)
+        ));
     }
 
     #[test]
@@ -630,10 +966,13 @@ mod tests {
         let pre = fixture_pre_append_manifest();
         let manifest_path = write_pre_manifest(tmp.path(), &pre);
 
-        // Bad: fix-wave depends only on wave 1, not last impl wave (2) or a prior fix-wave
+        // Bad: fix-wave depends_on a wave id that does not exist in the post
+        // manifest. Per F4 the rule changed from ">=100 OR pre-last-impl" to
+        // "exists in post-wave-set OR pre-last-impl"; a phantom id satisfies
+        // neither.
         let mut post = pre.clone();
         post["waves"].as_array_mut().unwrap().push(serde_json::json!({
-            "id": 100, "task_ids": ["fix-100-1"], "depends_on": [1], "kind": "fix"
+            "id": 100, "task_ids": ["fix-100-1"], "depends_on": [42], "kind": "fix"
         }));
         post["tasks"]["fix-100-1"] = serde_json::json!({
             "prompt_file": "tasks/task-fix-100-1.md", "agent_type": "claude"
@@ -645,7 +984,10 @@ mod tests {
         };
         let err = append_fix_waves_with_invoker(&invoker, &manifest_path, &fresh_findings())
             .expect_err("fix-wave with bad depends_on must fail");
-        assert!(matches!(err, AppendError::InvariantViolation(_)));
+        assert!(matches!(
+            err,
+            AppendError::InvariantViolation(_) | AppendError::PostSemantic(_)
+        ));
     }
 
     #[test]
@@ -675,5 +1017,240 @@ mod tests {
         assert_eq!(meta["type"], "feature");
         assert_eq!(meta["jira"], "");
         assert_eq!(meta["flags"]["merge"], false);
+    }
+
+    // ---- F1: embedded_schema_path materialization ----
+
+    #[test]
+    fn embedded_schema_path_materializes_to_temp_file_with_id() {
+        let p1 = embedded_schema_path().unwrap().clone();
+        let p2 = embedded_schema_path().unwrap().clone();
+        assert_eq!(p1, p2);
+        assert!(p1.is_file(), "schema must exist on disk");
+        let body = fs::read_to_string(&p1).unwrap();
+        assert!(body.contains("\"$id\""), "materialized schema must contain $id");
+    }
+
+    // ---- F2: ClaudeInvoker path-arg validation ----
+
+    #[test]
+    fn validate_path_args_rejects_path_with_space() {
+        let p = PathBuf::from("/tmp/has space/file");
+        let plain = PathBuf::from("/tmp/ok.md");
+        let args: [&Path; 5] = [&plain, &p, &plain, &plain, &plain];
+        let err = validate_path_args(&args).expect_err("space must reject");
+        assert!(matches!(err, AppendError::InvalidPathArg(_)));
+    }
+
+    #[test]
+    fn validate_path_args_rejects_leading_dash() {
+        let p = PathBuf::from("-rf");
+        let plain = PathBuf::from("/tmp/ok.md");
+        let args: [&Path; 5] = [&plain, &plain, &plain, &plain, &p];
+        let err = validate_path_args(&args).expect_err("leading dash must reject");
+        assert!(matches!(err, AppendError::InvalidPathArg(_)));
+    }
+
+    // ---- F3: original tasks preserved verbatim (full equality) ----
+
+    #[test]
+    fn rejects_post_append_that_modifies_original_task_prompt_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pre = fixture_pre_append_manifest();
+        let manifest_path = write_pre_manifest(tmp.path(), &pre);
+
+        // Bad: rewrite original task `1.1`'s prompt_file.
+        let mut post = pre.clone();
+        post["tasks"]["1.1"] = serde_json::json!({
+            "prompt_file": "tasks/hijacked.md",
+            "agent_type": "claude"
+        });
+        post["waves"].as_array_mut().unwrap().push(serde_json::json!({
+            "id": 100, "task_ids": ["fix-100-1"], "depends_on": [2], "kind": "fix"
+        }));
+        post["tasks"]["fix-100-1"] = serde_json::json!({
+            "prompt_file": "tasks/task-fix-100-1.md", "agent_type": "claude"
+        });
+
+        let invoker = FakeInvoker {
+            write_manifest: post,
+            capture_args: RefCell::new(vec![]),
+        };
+        let err = append_fix_waves_with_invoker(&invoker, &manifest_path, &fresh_findings())
+            .expect_err("modifying an original task must fail");
+        assert!(matches!(err, AppendError::InvariantViolation(_)));
+    }
+
+    // ---- F4: dep-target existence + duplicate wave id ----
+
+    #[test]
+    fn rejects_post_append_with_dep_on_nonexistent_wave() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pre = fixture_pre_append_manifest();
+        let manifest_path = write_pre_manifest(tmp.path(), &pre);
+
+        let mut post = pre.clone();
+        post["waves"].as_array_mut().unwrap().push(serde_json::json!({
+            "id": 100, "task_ids": ["fix-100-1"], "depends_on": [999], "kind": "fix"
+        }));
+        post["tasks"]["fix-100-1"] = serde_json::json!({
+            "prompt_file": "tasks/task-fix-100-1.md", "agent_type": "claude"
+        });
+
+        let invoker = FakeInvoker {
+            write_manifest: post,
+            capture_args: RefCell::new(vec![]),
+        };
+        let err = append_fix_waves_with_invoker(&invoker, &manifest_path, &fresh_findings())
+            .expect_err("dep on non-existent wave must fail");
+        assert!(matches!(
+            err,
+            AppendError::InvariantViolation(_) | AppendError::PostSemantic(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_post_append_with_duplicate_wave_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pre = fixture_pre_append_manifest();
+        let manifest_path = write_pre_manifest(tmp.path(), &pre);
+
+        // Two waves both with id 100.
+        let mut post = pre.clone();
+        post["waves"].as_array_mut().unwrap().push(serde_json::json!({
+            "id": 100, "task_ids": ["fix-100-1"], "depends_on": [2], "kind": "fix"
+        }));
+        post["waves"].as_array_mut().unwrap().push(serde_json::json!({
+            "id": 100, "task_ids": ["fix-100-2"], "depends_on": [2], "kind": "fix"
+        }));
+        post["tasks"]["fix-100-1"] = serde_json::json!({
+            "prompt_file": "tasks/task-fix-100-1.md", "agent_type": "claude"
+        });
+        post["tasks"]["fix-100-2"] = serde_json::json!({
+            "prompt_file": "tasks/task-fix-100-2.md", "agent_type": "claude"
+        });
+
+        let invoker = FakeInvoker {
+            write_manifest: post,
+            capture_args: RefCell::new(vec![]),
+        };
+        let err = append_fix_waves_with_invoker(&invoker, &manifest_path, &fresh_findings())
+            .expect_err("duplicate wave id must fail");
+        assert!(matches!(err, AppendError::PostSemantic(_)));
+    }
+
+    // ---- F6: truncate_for_error helper ----
+
+    #[test]
+    fn truncate_for_error_appends_suffix_with_remaining_byte_count() {
+        let input: String = "a".repeat(5000);
+        let out = truncate_for_error(&input, 2048);
+        assert!(out.starts_with(&"a".repeat(2048)));
+        assert!(
+            out.contains("(truncated, 2952 more bytes)"),
+            "missing suffix; got: {}",
+            &out[out.len().saturating_sub(80)..]
+        );
+    }
+
+    // ---- F7: sanitize_findings ----
+
+    #[test]
+    fn sanitize_findings_truncates_overlong_description() {
+        let big = "x".repeat(10_000);
+        let f = vec![Finding {
+            id: "F1".into(),
+            severity: Severity::Major,
+            category: "c".into(),
+            description: big.clone(),
+            files: vec![],
+            suggested_fix: None,
+        }];
+        let out = sanitize_findings(&f).unwrap();
+        assert!(out[0].description.len() < big.len());
+        assert!(out[0].description.ends_with(FINDING_TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn sanitize_findings_strips_control_chars_in_description() {
+        let f = vec![Finding {
+            id: "F1".into(),
+            severity: Severity::Minor,
+            category: "c".into(),
+            description: "ok\u{0007}\u{001b}[31mbad".into(),
+            files: vec![],
+            suggested_fix: None,
+        }];
+        let out = sanitize_findings(&f).unwrap();
+        assert_eq!(out[0].description, "ok[31mbad");
+    }
+
+    #[test]
+    fn sanitize_findings_rejects_too_many_entries() {
+        let one = Finding {
+            id: "F".into(),
+            severity: Severity::Nit,
+            category: "c".into(),
+            description: "d".into(),
+            files: vec![],
+            suggested_fix: None,
+        };
+        let many: Vec<Finding> = (0..(FINDINGS_MAX_ENTRIES + 1)).map(|_| one.clone()).collect();
+        let err = sanitize_findings(&many).expect_err("over-cap must reject");
+        assert!(matches!(err, AppendError::TooManyFindings { .. }));
+    }
+
+    // ---- F9: read_capped ----
+
+    #[test]
+    fn read_capped_rejects_oversize_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("big.bin");
+        let cap: u64 = 16 * 1024 * 1024;
+        // Write cap + 1 MiB to comfortably exceed.
+        let buf = vec![0u8; (cap as usize) + 1024 * 1024];
+        fs::write(&path, &buf).unwrap();
+        let err = read_capped(&path, cap).expect_err("oversize must reject");
+        assert!(matches!(err, AppendError::FileTooLarge { .. }));
+    }
+
+    // ---- F10: timeout_seconds_from_env ----
+
+    #[test]
+    fn timeout_seconds_from_env_defaults_when_unset() {
+        // SAFETY: tests in this module are not parallel-sensitive to this env
+        // var; we remove it for the duration of the assertion. Restoration is
+        // best-effort.
+        let prior = std::env::var(COMPILE_TIMEOUT_ENV).ok();
+        unsafe { std::env::remove_var(COMPILE_TIMEOUT_ENV); }
+        let got = timeout_seconds_from_env();
+        if let Some(p) = prior {
+            unsafe { std::env::set_var(COMPILE_TIMEOUT_ENV, p); }
+        }
+        assert_eq!(got, DEFAULT_COMPILE_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn timeout_seconds_from_env_uses_override_when_set() {
+        let prior = std::env::var(COMPILE_TIMEOUT_ENV).ok();
+        unsafe { std::env::set_var(COMPILE_TIMEOUT_ENV, "42"); }
+        let got = timeout_seconds_from_env();
+        match prior {
+            Some(p) => unsafe { std::env::set_var(COMPILE_TIMEOUT_ENV, p); },
+            None => unsafe { std::env::remove_var(COMPILE_TIMEOUT_ENV); },
+        }
+        assert_eq!(got, 42);
+    }
+
+    #[test]
+    fn timeout_seconds_from_env_defaults_on_unparseable() {
+        let prior = std::env::var(COMPILE_TIMEOUT_ENV).ok();
+        unsafe { std::env::set_var(COMPILE_TIMEOUT_ENV, "not-a-number"); }
+        let got = timeout_seconds_from_env();
+        match prior {
+            Some(p) => unsafe { std::env::set_var(COMPILE_TIMEOUT_ENV, p); },
+            None => unsafe { std::env::remove_var(COMPILE_TIMEOUT_ENV); },
+        }
+        assert_eq!(got, DEFAULT_COMPILE_TIMEOUT_SECS);
     }
 }

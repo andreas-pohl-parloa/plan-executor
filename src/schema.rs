@@ -8,6 +8,14 @@ use thiserror::Error;
 /// Baked-in schema JSON — single source of truth matches the plugin-repo copy.
 const SCHEMA_JSON: &str = include_str!("schemas/tasks.schema.json");
 
+/// Returns the embedded `tasks.schema.json` content as a static string.
+///
+/// Crate-internal accessor used by `compile::embedded_schema_path` to
+/// materialize the schema to a temp file at runtime.
+pub(crate) fn embedded_schema_json() -> &'static str {
+    SCHEMA_JSON
+}
+
 #[derive(Debug, Error)]
 pub enum SchemaError {
     #[error("schema JSON failed to parse: {0}")]
