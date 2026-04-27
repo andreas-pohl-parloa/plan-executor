@@ -189,8 +189,8 @@ impl CompileInvoker for ClaudeInvoker {
 
         let wait_result = child.wait_timeout(Duration::from_secs(timeout_secs));
 
-        let timed_out = matches!(wait_result, Ok(None));
-        if timed_out {
+        let needs_kill = matches!(wait_result, Ok(None) | Err(_));
+        if needs_kill {
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -435,11 +435,16 @@ fn write_synthetic_meta(path: &Path, manifest: &serde_json::Value) -> Result<(),
 /// would then follow the symlink and overwrite the target (CWE-377/CWE-378).
 ///
 /// The current implementation:
-/// - creates an unpredictable per-process subdirectory via `tempfile::TempDir`
-///   (cleaned up on process exit via `Drop`),
+/// - creates an unpredictable per-process subdirectory via `tempfile::TempDir`,
 /// - opens the schema file inside that dir with `create_new(true)`
 ///   (`O_CREAT | O_EXCL`), defeating any pre-create TOCTOU race,
 /// - caches the materialized `(TempDir, PathBuf)` for the process lifetime.
+///
+/// The `TempDir` lives in a process-static `OnceLock`, so it is NOT dropped
+/// on normal process exit (Rust statics are not dropped). Cleanup of the
+/// per-process subdirectory is delegated to the OS temp reaper
+/// (e.g. `systemd-tmpfiles`). The schema content is the public embedded
+/// JSON — no secret material is leaked by deferred cleanup.
 ///
 /// Replaces a previous design that also baked `CARGO_MANIFEST_DIR` into the
 /// binary; that build-host source path does not exist on the user's machine
