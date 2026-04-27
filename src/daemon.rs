@@ -622,27 +622,33 @@ async fn poll_remote_executions(state: &Arc<Mutex<DaemonState>>) {
     }
 }
 
-pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str) {
-    let plan = PathBuf::from(plan_path);
-
-    // Fail fast if the plan is not in READY state.
-    match crate::plan::parse_plan_status(&plan) {
-        Ok(status) if status != crate::plan::PlanStatus::Ready => {
-            let msg = format!("Plan status is {}, expected READY", status);
-            tracing::error!(plan = %plan_path, "{}", msg);
-            let st = state.lock().await;
-            let _ = st.event_tx.send(DaemonEvent::Error { message: msg });
-            return;
-        }
+pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, manifest_path: &str) {
+    let manifest = match crate::cli::resolve_manifest_path(manifest_path) {
+        Ok(p) => p,
         Err(e) => {
-            let msg = format!("Could not read plan status: {}", e);
-            tracing::error!(plan = %plan_path, "{}", msg);
+            tracing::error!("trigger_execution: {e}");
             let st = state.lock().await;
-            let _ = st.event_tx.send(DaemonEvent::Error { message: msg });
+            let _ = st.event_tx.send(DaemonEvent::Error { message: format!("{e}") });
             return;
         }
-        _ => {} // READY — proceed
+    };
+    let (plan, status) = match crate::cli::read_manifest_plan_block(&manifest) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("trigger_execution: {e}");
+            let st = state.lock().await;
+            let _ = st.event_tx.send(DaemonEvent::Error { message: format!("{e}") });
+            return;
+        }
+    };
+    if status != "READY" {
+        let msg = format!("trigger_execution: manifest plan.status is {}, expected READY", status);
+        tracing::error!("{}", msg);
+        let st = state.lock().await;
+        let _ = st.event_tx.send(DaemonEvent::Error { message: msg });
+        return;
     }
+    let plan_path = plan.to_string_lossy().to_string();
 
     // Route remote plans to GitHub PR trigger instead of local execution.
     if crate::plan::parse_execution_mode(&plan) == crate::plan::ExecutionMode::Remote {
@@ -725,7 +731,9 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, plan_path: &str)
         st.agents.main.clone()
     };
 
-    let Ok((child, pgid, exec_rx)) = spawn_execution(job.clone(), execution_root.clone(), &main_cmd) else {
+    let Ok((child, pgid, exec_rx)) = spawn_execution(
+        job.clone(), execution_root.clone(), manifest.clone(), &main_cmd,
+    ) else {
         tracing::error!("failed to spawn execution for plan: {}", plan_path);
         return;
     };
@@ -1496,8 +1504,8 @@ async fn handle_tui_request(
 ) {
     use tokio::io::AsyncWriteExt;
     match req {
-        TuiRequest::Execute { plan_path } => {
-            trigger_execution(state, &plan_path).await;
+        TuiRequest::Execute { manifest_path } => {
+            trigger_execution(state, &manifest_path).await;
         }
         TuiRequest::KillJob { job_id } => {
             let mut st = state.lock().await;

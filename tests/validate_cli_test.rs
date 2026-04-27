@@ -6,6 +6,7 @@ fn valid_manifest(prompt_rel: &str) -> String {
     let v = serde_json::json!({
         "version": 1,
         "plan": {
+            "path": "/tmp/plan.md", "status": "READY",
             "goal": "x", "type": "feature",
             "flags": {
                 "merge": false, "merge_admin": false, "skip_pr": false,
@@ -45,6 +46,7 @@ fn validate_cli_reports_missing_task_id() {
     let bad = serde_json::json!({
         "version": 1,
         "plan": {
+            "path": "/tmp/plan.md", "status": "READY",
             "goal": "x", "type": "feature",
             "flags": {
                 "merge": false, "merge_admin": false, "skip_pr": false,

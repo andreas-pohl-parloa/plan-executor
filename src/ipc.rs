@@ -14,7 +14,7 @@ pub enum TuiRequest {
     /// Subscribe to state updates (daemon streams responses)
     Subscribe,
     /// Execute a plan immediately
-    Execute { plan_path: String },
+    Execute { manifest_path: String },
     /// Kill a running job
     KillJob { job_id: String },
     /// Pause a running job — handoff sub-agents are held until ResumeJob
