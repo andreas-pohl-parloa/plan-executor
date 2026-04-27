@@ -67,3 +67,16 @@ fn validate_cli_reports_missing_task_id() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("missing_task"), "stderr was: {stderr}");
 }
+
+#[test]
+fn compile_fix_waves_help_lists_required_flags() {
+    let out = Command::new(env!("CARGO_BIN_EXE_plan-executor"))
+        .args(["compile-fix-waves", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--plan"), "stdout was: {stdout}");
+    assert!(stdout.contains("--execution-root"), "stdout was: {stdout}");
+    assert!(stdout.contains("--findings-json"), "stdout was: {stdout}");
+}

@@ -66,6 +66,18 @@ pub enum Commands {
         /// Path to tasks.json
         tasks_json: PathBuf,
     },
+    /// Append fix waves to an existing tasks.json from reviewer findings.
+    CompileFixWaves {
+        /// Absolute path to the plan markdown file (passed through; verified against manifest.plan.path).
+        #[arg(long)]
+        plan: PathBuf,
+        /// Directory containing tasks.json. Manifest is read from `<execution_root>/tasks.json`.
+        #[arg(long = "execution-root")]
+        execution_root: PathBuf,
+        /// Absolute path to the findings.json file (conforms to findings.schema.json).
+        #[arg(long = "findings-json")]
+        findings_json: PathBuf,
+    },
 }
 
 /// Prints a display line to the terminal, coloring plan-executor prefix lines
@@ -377,6 +389,69 @@ fn run_validate(tasks_json: &std::path::Path) {
     std::process::exit(1);
 }
 
+fn run_compile_fix_waves(plan: &Path, execution_root: &Path, findings_json: &Path) {
+    if let Err(e) = run_compile_fix_waves_with_invoker(
+        &crate::compile::ClaudeInvoker,
+        plan,
+        execution_root,
+        findings_json,
+    ) {
+        eprintln!("ERROR: {}", e);
+        std::process::exit(1);
+    }
+}
+
+/// Test-injectable variant. Production calls this with `&ClaudeInvoker`.
+pub(crate) fn run_compile_fix_waves_with_invoker(
+    invoker: &dyn crate::compile::CompileInvoker,
+    plan: &Path,
+    execution_root: &Path,
+    findings_json: &Path,
+) -> anyhow::Result<()> {
+    use crate::finding::FindingsFile;
+    use anyhow::Context;
+
+    // Load and parse findings file.
+    let findings_file = FindingsFile::from_path(findings_json)
+        .with_context(|| format!("read findings {}", findings_json.display()))?;
+
+    // Resolve manifest path.
+    let manifest_path = execution_root.join("tasks.json");
+    if !manifest_path.is_file() {
+        anyhow::bail!(
+            "manifest not found at {}; expected tasks.json in execution_root",
+            manifest_path.display()
+        );
+    }
+
+    // Cross-check plan path against manifest (warn-only).
+    if let Ok(raw) = std::fs::read_to_string(&manifest_path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(manifest_plan_path) = v.pointer("/plan/path").and_then(|x| x.as_str()) {
+                if std::path::PathBuf::from(manifest_plan_path) != plan {
+                    eprintln!(
+                        "WARN: --plan {} disagrees with manifest.plan.path {}; using manifest's value via append_fix_waves",
+                        plan.display(),
+                        manifest_plan_path
+                    );
+                }
+            }
+        }
+    }
+
+    // Invoke the actual append.
+    let updated = crate::compile::append_fix_waves_with_invoker(
+        invoker,
+        &manifest_path,
+        &findings_file.findings,
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    // Stdout contract: single line with the updated manifest path.
+    println!("{}", updated.display());
+    Ok(())
+}
+
 pub fn run() {
     let cli = Cli::parse();
 
@@ -390,6 +465,10 @@ pub fn run() {
         Commands::Pause  { job_id } => { daemon_job_request("pause",   job_id); return; }
         Commands::Unpause{ job_id } => { daemon_job_request("unpause", job_id); return; }
         Commands::Validate { tasks_json } => { run_validate(tasks_json); return; }
+        Commands::CompileFixWaves { plan, execution_root, findings_json } => {
+            run_compile_fix_waves(plan, execution_root, findings_json);
+            return;
+        }
         _ => {}
     }
 
@@ -433,7 +512,8 @@ pub fn run() {
         Commands::Retry { job_id } => rt.block_on(retry_job(job_id)),
         Commands::Stop | Commands::Jobs | Commands::Ensure | Commands::RemoteSetup
         | Commands::Kill { .. } | Commands::Pause { .. } | Commands::Unpause { .. }
-        | Commands::Validate { .. } => unreachable!(),
+        | Commands::Validate { .. }
+        | Commands::CompileFixWaves { .. } => unreachable!(),
     };
 
     if let Err(e) = result {
@@ -1801,6 +1881,142 @@ fn gh_secret_set(repo: &str, name: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::fs;
+
+    /// Local fake invoker — duplicates the test pattern from compile.rs to
+    /// avoid exposing a public test type from that module.
+    struct FakeInvoker {
+        post_manifest: serde_json::Value,
+        captured_args: RefCell<Vec<std::path::PathBuf>>,
+    }
+    impl crate::compile::CompileInvoker for FakeInvoker {
+        fn invoke(&self, args: &[&Path]) -> Result<(), String> {
+            *self.captured_args.borrow_mut() = args.iter().map(|p| p.to_path_buf()).collect();
+            let output_dir = args[2];
+            let target = output_dir.join("tasks.json");
+            fs::write(target, serde_json::to_vec_pretty(&self.post_manifest).unwrap())
+                .map_err(|e| format!("fake write: {e}"))?;
+            Ok(())
+        }
+    }
+
+    fn pre_manifest() -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "plan": {
+                "goal": "g", "type": "feature", "jira": "",
+                "target_repo": null, "target_branch": null,
+                "path": "/tmp/plan.md", "status": "READY",
+                "flags": {
+                    "merge": false, "merge_admin": false, "skip_pr": false,
+                    "skip_code_review": false, "no_worktree": false, "draft_pr": false
+                }
+            },
+            "waves": [
+                {"id": 1, "task_ids": ["1.1"], "depends_on": [], "kind": "implementation"}
+            ],
+            "tasks": {
+                "1.1": {"prompt_file": "tasks/task-1.1.md", "agent_type": "claude"}
+            }
+        })
+    }
+
+    #[test]
+    fn end_to_end_with_fake_invoker_writes_manifest_and_returns_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exec_root = tmp.path().to_path_buf();
+        // Pre-write tasks.json
+        let pre = pre_manifest();
+        fs::write(exec_root.join("tasks.json"), serde_json::to_vec_pretty(&pre).unwrap()).unwrap();
+
+        // Pre-write findings.json
+        let findings_path = exec_root.join("findings-input.json");
+        fs::write(
+            &findings_path,
+            br#"{"findings":[{"id":"F1","severity":"major","category":"x","description":"y"}]}"#,
+        )
+        .unwrap();
+
+        // Build the post-append manifest the fake will write.
+        let mut post = pre.clone();
+        post["waves"].as_array_mut().unwrap().push(serde_json::json!({
+            "id": 100, "task_ids": ["fix-100-1"], "depends_on": [1], "kind": "fix"
+        }));
+        post["tasks"]["fix-100-1"] = serde_json::json!({
+            "prompt_file": "tasks/task-fix-100-1.md", "agent_type": "claude"
+        });
+
+        let invoker = FakeInvoker {
+            post_manifest: post,
+            captured_args: RefCell::new(vec![]),
+        };
+
+        let plan_path = std::path::PathBuf::from("/tmp/plan.md");
+        run_compile_fix_waves_with_invoker(&invoker, &plan_path, &exec_root, &findings_path)
+            .expect("must succeed");
+
+        // Verify manifest was rewritten with fix-wave 100
+        let reread: serde_json::Value =
+            serde_json::from_slice(&fs::read(exec_root.join("tasks.json")).unwrap()).unwrap();
+        assert!(reread["waves"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["id"].as_u64() == Some(100) && w["kind"] == "fix"));
+
+        // Verify the fake captured 5 args
+        let captured = invoker.captured_args.borrow();
+        assert_eq!(captured.len(), 5);
+    }
+
+    #[test]
+    fn missing_manifest_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exec_root = tmp.path().to_path_buf();
+        let findings_path = exec_root.join("f.json");
+        fs::write(&findings_path, br#"{"findings":[]}"#).unwrap();
+
+        struct NeverInvoker;
+        impl crate::compile::CompileInvoker for NeverInvoker {
+            fn invoke(&self, _: &[&Path]) -> Result<(), String> {
+                panic!("must not be called when manifest missing")
+            }
+        }
+
+        let plan_path = std::path::PathBuf::from("/tmp/plan.md");
+        let err = run_compile_fix_waves_with_invoker(&NeverInvoker, &plan_path, &exec_root, &findings_path)
+            .expect_err("missing manifest must error");
+        let msg = format!("{err}");
+        assert!(msg.contains("manifest not found"), "msg was: {msg}");
+    }
+
+    #[test]
+    fn malformed_findings_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exec_root = tmp.path().to_path_buf();
+        // Pre-write a valid manifest
+        fs::write(
+            exec_root.join("tasks.json"),
+            serde_json::to_vec_pretty(&pre_manifest()).unwrap(),
+        )
+        .unwrap();
+
+        let findings_path = exec_root.join("f.json");
+        fs::write(&findings_path, b"not json {}").unwrap();
+
+        struct NeverInvoker;
+        impl crate::compile::CompileInvoker for NeverInvoker {
+            fn invoke(&self, _: &[&Path]) -> Result<(), String> {
+                panic!("must not be called when findings malformed")
+            }
+        }
+
+        let plan_path = std::path::PathBuf::from("/tmp/plan.md");
+        let err = run_compile_fix_waves_with_invoker(&NeverInvoker, &plan_path, &exec_root, &findings_path)
+            .expect_err("malformed findings must error");
+        let _ = err;
+    }
 
     #[test]
     fn format_duration_seconds_only() {
