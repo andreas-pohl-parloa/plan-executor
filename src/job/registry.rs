@@ -40,9 +40,11 @@ fn merge_mode_to_runtime(wire: WireMergeMode) -> RuntimeMergeMode {
 #[must_use]
 pub fn steps_for(kind: &JobKind) -> Vec<Box<dyn Step>> {
     match kind {
-        JobKind::Plan { .. } => vec![
+        JobKind::Plan { manifest_path } => vec![
             Box::new(steps::plan::PreflightStep),
-            Box::new(steps::plan::WaveExecutionStep),
+            Box::new(steps::plan::WaveExecutionStep {
+                manifest_path: manifest_path.clone(),
+            }),
             Box::new(steps::plan::IntegrationTestingStep),
             Box::new(steps::plan::CodeReviewStep),
             Box::new(steps::plan::ValidationStep),

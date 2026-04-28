@@ -1,13 +1,18 @@
-//! Stub `Step` implementations for `JobKind::Plan`.
+//! `Step` implementations for `JobKind::Plan`.
 //!
-//! Each step is a unit struct with a trivial `Step` impl that returns
-//! `AttemptOutcome::Pending`. Real bodies arrive in Phase A2.2 and Phase D.
+//! `WaveExecutionStep` is the only step with real wave-traversal logic in
+//! Phase D3.1; it loads the compiled manifest from disk and delegates to
+//! [`crate::scheduler::run_wave_execution`]. The remaining steps are still
+//! shells and will receive bodies in D3.2 / D3.3.
+
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 
 use crate::job::recovery::RecoveryPolicy;
 use crate::job::step::{Step, StepContext};
 use crate::job::types::AttemptOutcome;
+use crate::scheduler;
 
 /// Stub. Real preflight logic lands in Phase D (D3).
 ///
@@ -31,8 +36,18 @@ impl Step for PreflightStep {
     }
 }
 
-/// Stub. Phase A2.2 wires this to `executor::run_compiled_manifest`.
-pub struct WaveExecutionStep;
+/// Real wave-traversal step for `JobKind::Plan`.
+///
+/// Loads the compiled manifest from `manifest_path`, then drives every wave
+/// through [`scheduler::run_wave_execution`]. Sub-agent dispatch flows through
+/// [`crate::handoff::dispatch_all`] — no orchestrator subprocess is spawned;
+/// the previous LLM-driven slash-command flow has been removed in favor of
+/// Rust-side wave traversal.
+#[derive(Debug, Clone)]
+pub struct WaveExecutionStep {
+    /// Absolute path to the compiled `tasks.json` manifest.
+    pub manifest_path: PathBuf,
+}
 
 #[async_trait]
 impl Step for WaveExecutionStep {
@@ -45,8 +60,21 @@ impl Step for WaveExecutionStep {
     fn recovery_policy(&self) -> RecoveryPolicy {
         RecoveryPolicy::None
     }
-    async fn run(&self, _ctx: &mut StepContext) -> AttemptOutcome {
-        AttemptOutcome::Pending
+    async fn run(&self, ctx: &mut StepContext) -> AttemptOutcome {
+        let manifest = match scheduler::load_manifest(&self.manifest_path) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!(
+                    path = %self.manifest_path.display(),
+                    error = %e,
+                    "wave_execution: manifest load failed",
+                );
+                return AttemptOutcome::HardInfra {
+                    error: format!("manifest load failed: {e}"),
+                };
+            }
+        };
+        scheduler::run_wave_execution(ctx, &manifest).await
     }
 }
 
