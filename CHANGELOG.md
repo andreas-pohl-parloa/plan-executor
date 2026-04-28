@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.39.0] - 2026-04-28
+
+### Bug Fixes
+
+- Address Phase C+D+F2 code-review findings ([ed19911](https://github.com/andreas-pohl-parloa/plan-executor/commit/ed199112ed2f41dc1ecd3fa4284c8ecc143aa924))
+
+### Features
+
+- JobKind::PrFinalize step structs (Phase C1.1) ([4350f79](https://github.com/andreas-pohl-parloa/plan-executor/commit/4350f79250126f357ea28cdaeea44a092c38e9b9))
+- JobMetrics struct + per-job metrics writer (Phase F2.1) ([4ff234f](https://github.com/andreas-pohl-parloa/plan-executor/commit/4ff234fde0df3860ac2f79770ee9d74de8b10b43))
+- Plan-executor run pr-finalize CLI subcommand (Phase C1.2) ([026cf7a](https://github.com/andreas-pohl-parloa/plan-executor/commit/026cf7a2e916e4469bcb931e5d8ca8cf46943dc4))
+- Invoke_helper Rust subroutine for structured helper-skill calls (Phase D2.1) ([c04a0b1](https://github.com/andreas-pohl-parloa/plan-executor/commit/c04a0b1c654e49297bc5e29d1c583e6c512bd0dc))
+- Plan-executor jobs metrics CLI subcommand (Phase F2.2) ([49952db](https://github.com/andreas-pohl-parloa/plan-executor/commit/49952db1efc0bf70605491e0598821c316c15aeb))
+- GHA workflow dispatches by job-spec kind (Phase C2.1) ([6f6dc5f](https://github.com/andreas-pohl-parloa/plan-executor/commit/6f6dc5fc7cf76e2a1de51b644aac244aa0b4dbae))
+- Typed wrappers for invoke_helper (Phase D2.2) ([15b63c2](https://github.com/andreas-pohl-parloa/plan-executor/commit/15b63c202432b6df5b86fc1374f95623c3ceb59e))
+- Rust wave-execution scheduler replaces orchestrator skill (Phase D3.1) ([05767ee](https://github.com/andreas-pohl-parloa/plan-executor/commit/05767ee68da106b7ec388e12774fa8a566acf816))
+- Replace 5 plan-job step shells with real Rust impls (Phase D3.2+D3.3) ([19097cb](https://github.com/andreas-pohl-parloa/plan-executor/commit/19097cbf271e67516c16ca583a52ada4bbd53623))
+
+### Testing
+
+- Integration tests for JobKind::PrFinalize 5-step pipeline (Phase C1.3) ([e839aca](https://github.com/andreas-pohl-parloa/plan-executor/commit/e839aca91181a64863182e2fa2c9bacb8a602de4))
+- Per-job metrics writer + jobs metrics CLI aggregation (Phase F2.3) ([1a7b798](https://github.com/andreas-pohl-parloa/plan-executor/commit/1a7b7983850bb1fd3c469298e6d9448e250de3d0))
+- GHA workflow dispatcher logic + metadata validation (Phase C2.2) ([2e13111](https://github.com/andreas-pohl-parloa/plan-executor/commit/2e13111dd600f5dedd185a3c5ca233b0e791b473))
+- Invoke_helper + typed wrappers (Phase D2.3) ([fba4dfc](https://github.com/andreas-pohl-parloa/plan-executor/commit/fba4dfc0cb4b1350d7c6b0c9cc24c9de2d4dff7d))
+- End-to-end Rust scheduler runs without orchestrator skill (Phase D3.4) ([1baee75](https://github.com/andreas-pohl-parloa/plan-executor/commit/1baee75d44d0b67cc05fe21ee083599e17509ad2))
 ## [0.38.0] - 2026-04-28
 
 ### Bug Fixes
