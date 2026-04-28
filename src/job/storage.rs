@@ -71,6 +71,28 @@ pub struct AttemptHandle {
     pub dir: PathBuf,
 }
 
+/// Lightweight handle on either a new-layout (`job.json`) or legacy-layout
+/// (`metadata.json` only) job. The `jobs list` / `jobs show` commands use
+/// this to render both in one table during the migration grace window.
+#[derive(Debug, Clone)]
+pub enum JobStoreEntry {
+    /// New-layout job; `summary` is parsed from `job.json`.
+    New {
+        /// Parsed summary of the new-layout job.
+        summary: JobSummary,
+        /// Filesystem path to the job directory.
+        path: PathBuf,
+    },
+    /// Legacy-layout job with `metadata.json` but no `job.json`. The id is
+    /// the directory name; the caller decides how to render the rest.
+    Legacy {
+        /// Directory-name id for the legacy job.
+        id: String,
+        /// Filesystem path to the legacy job directory.
+        path: PathBuf,
+    },
+}
+
 /// Errors produced by `JobStore` and `JobDir` operations.
 #[derive(Debug, Error)]
 pub enum JobStoreError {
@@ -228,6 +250,69 @@ impl JobStore {
         out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(out)
     }
+
+    /// Lists every job directory under `base`, classifying each as `New`
+    /// (has `job.json`) or `Legacy` (has `metadata.json` only). Sorted with
+    /// new-layout entries first (by `created_at` descending), then legacy
+    /// entries by directory name descending.
+    ///
+    /// # Errors
+    ///
+    /// Returns `JobStoreError::Io` if the base directory cannot be read.
+    pub fn list_all(&self) -> Result<Vec<JobStoreEntry>> {
+        let mut out = Vec::new();
+        let entries = match fs::read_dir(&self.base) {
+            Ok(e) => e,
+            Err(source) => {
+                return Err(JobStoreError::Io {
+                    path: self.base.clone(),
+                    source,
+                });
+            }
+        };
+        for entry in entries.flatten() {
+            let job_path = entry.path();
+            if !job_path.is_dir() {
+                continue;
+            }
+            let job_json = job_path.join("job.json");
+            if job_json.is_file() {
+                if let Ok(raw) = fs::read_to_string(&job_json) {
+                    if let Ok(job) = serde_json::from_str::<Job>(&raw) {
+                        out.push(JobStoreEntry::New {
+                            summary: JobSummary {
+                                id: job.id,
+                                state: job.state,
+                                created_at: job.created_at,
+                                kind_tag: kind_tag(&job.kind),
+                            },
+                            path: job_path,
+                        });
+                        continue;
+                    }
+                }
+            }
+            if job_path.join("metadata.json").is_file() {
+                let id = job_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                out.push(JobStoreEntry::Legacy { id, path: job_path });
+            }
+        }
+        out.sort_by(|a, b| match (a, b) {
+            (JobStoreEntry::New { summary: a, .. }, JobStoreEntry::New { summary: b, .. }) => {
+                b.created_at.cmp(&a.created_at)
+            }
+            (JobStoreEntry::New { .. }, JobStoreEntry::Legacy { .. }) => std::cmp::Ordering::Less,
+            (JobStoreEntry::Legacy { .. }, JobStoreEntry::New { .. }) => {
+                std::cmp::Ordering::Greater
+            }
+            (JobStoreEntry::Legacy { id: a, .. }, JobStoreEntry::Legacy { id: b, .. }) => b.cmp(a),
+        });
+        Ok(out)
+    }
 }
 
 fn kind_tag(kind: &crate::job::types::JobKind) -> String {
@@ -376,6 +461,39 @@ impl JobDir {
             &dir.join("output.json"),
             serde_json::to_string_pretty(output)?.as_bytes(),
         )
+    }
+
+    /// Returns `<job>/steps/NNN-<name>/attempts/M/sub-agents/`, creating the
+    /// directory if it does not exist. Used by future Phase B+ daemon code
+    /// that knows the current step seq and attempt number; the legacy daemon
+    /// still uses `legacy_sub_agent_dir()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `JobStoreError::Io` if the directory cannot be created.
+    pub fn sub_agent_dir_for_attempt(
+        &self,
+        seq: u32,
+        name: &str,
+        attempt_n: u32,
+    ) -> Result<PathBuf> {
+        let dir = step_dir_for(&self.path, seq, name)
+            .join("attempts")
+            .join(attempt_n.to_string())
+            .join("sub-agents");
+        fs::create_dir_all(&dir).map_err(|source| JobStoreError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(dir)
+    }
+
+    /// Returns `<job>/sub-agents/` — the pre-Job-framework layout. Used by
+    /// the upcoming `jobs show` command to render historical sub-agent
+    /// outputs that predate Phase A. Does not create the directory.
+    #[must_use]
+    pub fn legacy_sub_agent_dir(&self) -> PathBuf {
+        self.path.join("sub-agents")
     }
 
     /// Returns the seq of the next step that has no `output.json` yet,
@@ -606,6 +724,133 @@ mod tests {
         let ids: Vec<JobId> = summaries.into_iter().map(|s| s.id).collect();
 
         assert_eq!(ids, vec![JobId("job-only".to_string())]);
+    }
+
+    #[test]
+    fn sub_agent_dir_for_attempt_creates_and_returns_expected_path() {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = JobStore::with_base(tmp.path().to_path_buf()).expect("store");
+        let job = sample_job("job-sa", vec![(2, "wave_execution")]);
+        let dir = store.create(&job).expect("create");
+
+        let path = dir
+            .sub_agent_dir_for_attempt(2, "wave_execution", 3)
+            .expect("sub_agent_dir");
+
+        let suffix: PathBuf = ["steps", "002-wave_execution", "attempts", "3", "sub-agents"]
+            .iter()
+            .collect();
+        let suffix_match = path.ends_with(&suffix);
+        assert_eq!((suffix_match, path.is_dir()), (true, true));
+    }
+
+    #[test]
+    fn sub_agent_dir_for_attempt_is_idempotent() {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = JobStore::with_base(tmp.path().to_path_buf()).expect("store");
+        let job = sample_job("job-sa-idem", vec![(1, "preflight")]);
+        let dir = store.create(&job).expect("create");
+
+        let p1 = dir
+            .sub_agent_dir_for_attempt(1, "preflight", 1)
+            .expect("first");
+        let p2 = dir
+            .sub_agent_dir_for_attempt(1, "preflight", 1)
+            .expect("second");
+
+        assert_eq!((p1.clone(), p1.is_dir()), (p2, true));
+    }
+
+    #[test]
+    fn legacy_sub_agent_dir_returns_path_without_creating() {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = JobStore::with_base(tmp.path().to_path_buf()).expect("store");
+        let job = sample_job("job-legacy-sa", vec![(1, "preflight")]);
+        let dir = store.create(&job).expect("create");
+
+        let path = dir.legacy_sub_agent_dir();
+
+        let expected = dir.path().join("sub-agents");
+        assert_eq!((path.clone(), path.is_dir()), (expected, false));
+    }
+
+    #[test]
+    fn list_all_returns_only_new_layout_when_no_legacy_dirs() {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = JobStore::with_base(tmp.path().to_path_buf()).expect("store");
+        let mut older = sample_job("job-la-old", vec![(1, "preflight")]);
+        older.created_at = "2026-01-01T00:00:00Z".to_string();
+        let mut newer = sample_job("job-la-new", vec![(1, "preflight")]);
+        newer.created_at = "2026-04-01T00:00:00Z".to_string();
+        store.create(&older).expect("create old");
+        store.create(&newer).expect("create new");
+
+        let entries = store.list_all().expect("list_all");
+        let ids: Vec<JobId> = entries
+            .into_iter()
+            .map(|e| match e {
+                JobStoreEntry::New { summary, .. } => summary.id,
+                JobStoreEntry::Legacy { id, .. } => JobId(id),
+            })
+            .collect();
+
+        assert_eq!(ids, vec![newer.id.clone(), older.id.clone()]);
+    }
+
+    #[test]
+    fn list_all_classifies_metadata_only_dirs_as_legacy() {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = JobStore::with_base(tmp.path().to_path_buf()).expect("store");
+        let legacy_dir = tmp.path().join("legacy-job-1");
+        fs::create_dir_all(&legacy_dir).expect("legacy dir");
+        fs::write(legacy_dir.join("metadata.json"), b"{\"any\":\"json\"}").expect("metadata");
+
+        let entries = store.list_all().expect("list_all");
+        let classified: Vec<(String, bool)> = entries
+            .into_iter()
+            .map(|e| match e {
+                JobStoreEntry::New { summary, .. } => (summary.id.0, true),
+                JobStoreEntry::Legacy { id, .. } => (id, false),
+            })
+            .collect();
+
+        assert_eq!(classified, vec![("legacy-job-1".to_string(), false)]);
+    }
+
+    #[test]
+    fn list_all_sorts_new_entries_before_legacy_entries() {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = JobStore::with_base(tmp.path().to_path_buf()).expect("store");
+        let new_job = sample_job("job-new-mixed", vec![(1, "preflight")]);
+        store.create(&new_job).expect("create new");
+        let legacy_dir = tmp.path().join("zzz-legacy");
+        fs::create_dir_all(&legacy_dir).expect("legacy dir");
+        fs::write(legacy_dir.join("metadata.json"), b"{}").expect("metadata");
+
+        let entries = store.list_all().expect("list_all");
+        let kinds: Vec<&'static str> = entries
+            .iter()
+            .map(|e| match e {
+                JobStoreEntry::New { .. } => "new",
+                JobStoreEntry::Legacy { .. } => "legacy",
+            })
+            .collect();
+
+        assert_eq!(kinds, vec!["new", "legacy"]);
+    }
+
+    #[test]
+    fn list_all_skips_dirs_that_are_neither_new_nor_legacy() {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = JobStore::with_base(tmp.path().to_path_buf()).expect("store");
+        fs::create_dir_all(tmp.path().join("empty-orphan")).expect("empty");
+        let with_other = tmp.path().join("other-file-orphan");
+        fs::create_dir_all(&with_other).expect("with_other");
+        fs::write(with_other.join("README"), b"hi").expect("readme");
+
+        let entries = store.list_all().expect("list_all");
+
+        assert_eq!(entries.len(), 0);
     }
 
     #[test]
