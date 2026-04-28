@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.41.2] - 2026-04-28
+
+### Bug Fixes
+
+- **workflow:** Guard post-comment summary find against missing workspace/ ([9b69483](https://github.com/andreas-pohl-parloa/plan-executor/commit/9b69483366351a6ebd3a15285c2cecfbcb1f3937))
 ## [0.41.1] - 2026-04-28
 
 ### CI/CD
