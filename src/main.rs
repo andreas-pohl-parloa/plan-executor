@@ -5,6 +5,7 @@ mod daemon;
 mod executor;
 mod finding;
 mod handoff;
+mod helper;
 mod ipc;
 mod job;
 mod jobs;

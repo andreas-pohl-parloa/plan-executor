@@ -46,11 +46,19 @@ pub fn steps_for(kind: &JobKind) -> Vec<Box<dyn Step>> {
                 manifest_path: manifest_path.clone(),
             }),
             Box::new(steps::plan::IntegrationTestingStep),
-            Box::new(steps::plan::CodeReviewStep),
-            Box::new(steps::plan::ValidationStep),
-            Box::new(steps::plan::PrCreationStep),
+            Box::new(steps::plan::CodeReviewStep {
+                manifest_path: manifest_path.clone(),
+            }),
+            Box::new(steps::plan::ValidationStep {
+                manifest_path: manifest_path.clone(),
+            }),
+            Box::new(steps::plan::PrCreationStep {
+                manifest_path: manifest_path.clone(),
+            }),
             Box::new(steps::plan::PrFinalizeStep),
-            Box::new(steps::plan::SummaryStep),
+            Box::new(steps::plan::SummaryStep {
+                manifest_path: manifest_path.clone(),
+            }),
         ],
         JobKind::PrFinalize {
             owner,
@@ -134,10 +142,17 @@ mod tests {
             vec![
                 ("preflight", true),
                 ("wave_execution", false),
-                ("integration_testing", false),
-                ("code_review", false),
-                ("validation", false),
-                ("pr_creation", false),
+                // D3.3: integration_testing became idempotent — re-running
+                // `cargo test --workspace` is safe.
+                ("integration_testing", true),
+                // D3.2: code_review and validation became idempotent — the
+                // helper-driven steps re-issue the same helper invocations
+                // on retry without external compensation.
+                ("code_review", true),
+                ("validation", true),
+                // D3.3: pr_creation became idempotent — `gh pr view` short
+                // circuits to the existing PR URL when one already exists.
+                ("pr_creation", true),
                 ("pr_finalize", true),
                 ("summary", true),
             ]
@@ -145,13 +160,57 @@ mod tests {
     }
 
     #[test]
-    fn steps_for_plan_all_recovery_policies_are_none() {
+    fn steps_for_plan_recovery_policies_match_documentation() {
+        use crate::job::recovery::{Backoff, CorrectivePromptKey};
         let kind = JobKind::Plan {
             manifest_path: PathBuf::from("/tmp/x"),
         };
         let steps = steps_for(&kind);
         let policies: Vec<RecoveryPolicy> = steps.iter().map(|s| s.recovery_policy()).collect();
-        assert_eq!(policies, vec![RecoveryPolicy::None; 8]);
+        let helper_compose = |corrective: &str| RecoveryPolicy::Compose {
+            policies: vec![
+                RecoveryPolicy::RetryTransient {
+                    max: 3,
+                    backoff: Backoff::Exponential {
+                        initial_ms: 500,
+                        max_ms: 8_000,
+                        factor: 2.0,
+                    },
+                },
+                RecoveryPolicy::RetryProtocol {
+                    max: 1,
+                    corrective: CorrectivePromptKey(corrective.to_string()),
+                },
+            ],
+        };
+        let expected = vec![
+            RecoveryPolicy::None, // preflight
+            RecoveryPolicy::None, // wave_execution
+            // D3.3: integration_testing surfaces TransientInfra on
+            // retry-able test failures; one retry gives flaky / network-
+            // bound suites a single chance to recover.
+            RecoveryPolicy::RetryTransient {
+                max: 1,
+                backoff: Backoff::Fixed { ms: 0 },
+            },
+            helper_compose("code_review_protocol"), // code_review (D3.2)
+            helper_compose("validation_protocol"),  // validation (D3.2)
+            // D3.3: pr_creation runs `gh pr create`; exponential backoff
+            // matches the cadence already used elsewhere for `gh` API
+            // hiccups (see pr_finalize::default_backoff).
+            RecoveryPolicy::RetryTransient {
+                max: 3,
+                backoff: Backoff::Exponential {
+                    initial_ms: 500,
+                    max_ms: 8_000,
+                    factor: 2.0,
+                },
+            },
+            RecoveryPolicy::None, // pr_finalize (placeholder; the dedicated
+            // JobKind::PrFinalize pipeline owns finalize)
+            RecoveryPolicy::None, // summary (D3.3 — best-effort)
+        ];
+        assert_eq!(policies, expected);
     }
 
     #[test]
