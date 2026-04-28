@@ -844,8 +844,21 @@ fn run_subcommand(command: RunCommand, config_path: Option<&Path>) -> Result<()>
             if remote {
                 run_pr_finalize_remote(pr, owner, repo, merge, merge_admin, config_path)
             } else {
+                // Initialize tracing so step traces from the pipeline are
+                // visible (e.g. on a CI runner where stderr is the
+                // workflow log). RUST_LOG defaults to info-level for
+                // plan-executor crates.
+                if std::env::var("RUST_LOG").is_err() {
+                    // SAFETY: single-threaded entry point before the
+                    // tokio runtime is built; no other thread can race.
+                    unsafe {
+                        std::env::set_var("RUST_LOG", "plan_executor=info");
+                    }
+                }
+                let _ = tracing_subscriber::fmt::try_init();
+
                 // The pipeline awaits sub-step async work (gh subprocesses,
-                // monitor wait). Spin up a single-threaded runtime locally
+                // monitor wait). Spin up a multi-thread runtime locally
                 // so this stays a synchronous CLI entry point.
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
@@ -1336,28 +1349,36 @@ pub(crate) async fn run_rust_scheduler_pipeline(
             attempt_n: 1,
             workdir: workdir.clone(),
         };
-        tracing::info!(step = step.name(), seq, "running step");
+        let step_name = step.name();
+        tracing::info!(step = step_name, seq, "running step");
+        eprintln!("[plan-executor] step {seq:03} {step_name}: running");
         let outcome = step.run(&mut ctx).await;
         match outcome {
             AttemptOutcome::Success => {
-                tracing::info!(step = step.name(), seq, "step succeeded");
+                tracing::info!(step = step_name, seq, "step succeeded");
+                eprintln!("[plan-executor] step {seq:03} {step_name}: success");
             }
             AttemptOutcome::Pending => {
                 // `Pending` is currently emitted by the placeholder
                 // `PreflightStep` and `PrFinalizeStep` shells. Treat as
                 // a no-op pass so the rest of the pipeline can run.
                 tracing::info!(
-                    step = step.name(),
+                    step = step_name,
                     seq,
                     "step returned Pending (placeholder); continuing",
                 );
+                eprintln!("[plan-executor] step {seq:03} {step_name}: pending (placeholder)");
             }
             other => {
                 tracing::error!(
-                    step = step.name(),
+                    step = step_name,
                     seq,
                     outcome = ?other,
                     "step failed; aborting pipeline",
+                );
+                eprintln!(
+                    "[plan-executor] step {seq:03} {step_name}: FAILED — {other:?}\n[plan-executor] aborting pipeline. attempt log: {}/steps/{seq:03}-{step_name}/attempts/1/",
+                    job_dir.display()
                 );
                 return false;
             }
