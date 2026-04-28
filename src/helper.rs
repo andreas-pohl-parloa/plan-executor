@@ -17,8 +17,10 @@
 //! | [`HelperError::ProtocolViolation { .. }`] | `RetryProtocol { max, corrective }` — the helper produced output that violates the schema; the corrective prompt steers it back to a valid envelope. |
 //! | [`HelperError::SemanticFailure { .. }`]   | Caller-specific. The helper finished cleanly but reported `fix_required` / `blocked` / `abort`; the caller pattern-matches on `status` to decide between dispatching a fix wave, escalating, or terminating. |
 //!
-//! Per-helper wrapper functions (e.g. `run_reviewer_team`) live in a
-//! follow-up task (D2.2). Tests live in D2.3.
+//! Per-helper wrapper functions ([`invoke_review_team`],
+//! [`invoke_review_triage`], [`invoke_validator`], [`invoke_pr_finalize`])
+//! provide strongly-typed input/output structs around [`invoke_helper`].
+//! Tests live in D2.3.
 //!
 //! # Subprocess hardening
 //!
@@ -562,4 +564,355 @@ fn compiled_validator(skill: HelperSkill) -> Result<&'static jsonschema::Validat
         ))
     })?;
     Ok(cell.get_or_init(|| validator))
+}
+
+// ---------------------------------------------------------------------------
+// Per-helper typed wrappers (Task D2.2)
+//
+// Each wrapper:
+//   1. Accepts a strongly-typed input struct (Serialize).
+//   2. Builds the JSON envelope and calls `invoke_helper`.
+//   3. Decodes `HelperOutput::state_updates` into a typed output struct.
+//   4. Surfaces `HelperError` unchanged.
+//
+// The input shapes follow the corresponding helper SKILL contracts'
+// `Required Inputs`. The output shapes mirror the `state_updates` shape in
+// `src/schemas/helpers/<helper>/output.schema.json` (Task D1.1).
+// ---------------------------------------------------------------------------
+
+/// Decodes `state_updates` from a [`HelperOutput`] into the caller's typed
+/// output struct, mapping serde failures into [`HelperError::ProtocolViolation`].
+fn decode_state_updates<T: serde::de::DeserializeOwned>(
+    output: HelperOutput,
+) -> Result<T, HelperError> {
+    serde_json::from_value(output.state_updates).map_err(|e| HelperError::ProtocolViolation {
+        category: "state_updates_shape".to_string(),
+        detail: format!("decode state_updates failed: {e}"),
+    })
+}
+
+/// Serializes a wrapper input struct into the JSON envelope passed to
+/// [`invoke_helper`], mapping serde failures into
+/// [`HelperError::ProtocolViolation`] so callers see a uniform error type.
+fn serialize_wrapper_input<T: Serialize>(input: &T) -> Result<serde_json::Value, HelperError> {
+    serde_json::to_value(input).map_err(|e| HelperError::ProtocolViolation {
+        category: "input_serialize".to_string(),
+        detail: format!("serialize wrapper input failed: {e}"),
+    })
+}
+
+// ----- run-reviewer-team-non-interactive -----------------------------------
+
+/// Input envelope for [`invoke_review_team`].
+///
+/// Fields mirror the `Required Inputs` listed in the
+/// `plan-executor:run-reviewer-team-non-interactive` SKILL contract.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewTeamInput {
+    /// Plan path or relevant plan excerpts that define the expected implementation.
+    pub plan_context: String,
+    /// Description or summary of what was built or changed during execution.
+    pub execution_outputs: String,
+    /// Files created or modified during the wave under review.
+    pub changed_files: Vec<PathBuf>,
+    /// Detected primary language of the changed files (lower-case, e.g. `"rust"`).
+    pub language: String,
+    /// Recipe skills relevant to the changed code (used to build reviewer prompts).
+    pub recipe_list: Vec<String>,
+    /// Prior triage history for this review loop. Pass an empty object on the first run.
+    pub prior_review_context: serde_json::Value,
+    /// Absolute path to the directory where prompt files are written.
+    pub execution_root: PathBuf,
+    /// 1-based attempt number; used in prompt-file names to prevent clobbering.
+    pub attempt: u32,
+}
+
+/// One row of [`ReviewTeamOutput::reviewer_runs`].
+///
+/// Mirrors the schema item under `state_updates.reviewer_runs[*]` in the
+/// run-reviewer-team output schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ReviewerRun {
+    /// Reviewer slot identifier (`claude`, `codex`, `gemini`, `security`).
+    pub reviewer: String,
+    /// Sub-agent exit code reported by the harness for this reviewer.
+    pub exit_code: i32,
+    /// Number of findings produced by this reviewer.
+    pub findings_count: u32,
+}
+
+/// Typed output for [`invoke_review_team`].
+///
+/// Mirrors the `state_updates` shape in the run-reviewer-team output schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ReviewTeamOutput {
+    /// Path to the consolidated findings file produced by the reviewer team.
+    pub findings_path: PathBuf,
+    /// Per-reviewer run summary; the schema fixes this at four entries
+    /// (claude, codex, gemini, security).
+    pub reviewer_runs: Vec<ReviewerRun>,
+}
+
+/// Invokes `plan-executor:run-reviewer-team-non-interactive` and returns its
+/// typed `state_updates` payload.
+///
+/// # Errors
+///
+/// Surfaces every [`HelperError`] from [`invoke_helper`] unchanged, plus
+/// [`HelperError::ProtocolViolation`] with category `state_updates_shape`
+/// when the helper's `state_updates` field cannot be decoded into
+/// [`ReviewTeamOutput`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::PathBuf;
+/// use plan_executor::helper::{invoke_review_team, ReviewTeamInput};
+/// use plan_executor::job::step::StepContext;
+///
+/// fn dispatch(ctx: &StepContext) -> Result<(), Box<dyn std::error::Error>> {
+///     let input = ReviewTeamInput {
+///         plan_context: "see PLAN.md".to_string(),
+///         execution_outputs: "wave 100 produced 3 files".to_string(),
+///         changed_files: vec![PathBuf::from("src/lib.rs")],
+///         language: "rust".to_string(),
+///         recipe_list: vec!["rust-services:production-code-recipe".to_string()],
+///         prior_review_context: serde_json::json!({}),
+///         execution_root: ctx.workdir.clone(),
+///         attempt: 1,
+///     };
+///     let team = invoke_review_team(input, ctx)?;
+///     println!("findings at {}", team.findings_path.display());
+///     Ok(())
+/// }
+/// ```
+pub fn invoke_review_team(
+    input: ReviewTeamInput,
+    ctx: &StepContext,
+) -> Result<ReviewTeamOutput, HelperError> {
+    let json = serialize_wrapper_input(&input)?;
+    let raw = invoke_helper(HelperSkill::RunReviewerTeam, json, ctx)?;
+    decode_state_updates(raw)
+}
+
+// ----- review-execution-output-non-interactive -----------------------------
+
+/// Input envelope for [`invoke_review_triage`].
+///
+/// Fields mirror the `Required Inputs` listed in the
+/// `plan-executor:review-execution-output-non-interactive` SKILL contract.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewTriageInput {
+    /// Absolute plan path.
+    pub plan_path: PathBuf,
+    /// Absolute execution root.
+    pub execution_root: PathBuf,
+    /// Files created or modified during execution.
+    pub changed_files: Vec<PathBuf>,
+    /// Detected language for the changed code.
+    pub language: String,
+    /// Recipe skills relevant to the changed code.
+    pub recipe_list: Vec<String>,
+    /// Explicit review-skip flag.
+    pub skip_code_review: bool,
+    /// Absolute path to `.tmp-execute-plan-state.json`.
+    pub state_file_path: PathBuf,
+    /// Current persisted orchestrator state.
+    pub execution_state: serde_json::Value,
+    /// Current persisted helper-owned review state, if any.
+    pub review_state: serde_json::Value,
+    /// Persisted helper-owned review-state path when stored outside the payload.
+    pub review_state_path: Option<PathBuf>,
+    /// Prior review findings, triage notes, and fix history.
+    pub prior_review_notes: serde_json::Value,
+}
+
+/// Typed output for [`invoke_review_triage`].
+///
+/// Mirrors the `state_updates` shape in the review-execution-output schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ReviewTriageOutput {
+    /// Path to the triaged findings file produced by the helper.
+    pub triaged_findings_path: PathBuf,
+    /// Identifier of the fix wave the orchestrator should dispatch, when the
+    /// helper concluded that a fix wave is required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wave_id_for_fix: Option<u32>,
+}
+
+/// Invokes `plan-executor:review-execution-output-non-interactive` and
+/// returns its typed `state_updates` payload.
+///
+/// # Errors
+///
+/// Same as [`invoke_review_team`] but for the review-triage helper.
+pub fn invoke_review_triage(
+    input: ReviewTriageInput,
+    ctx: &StepContext,
+) -> Result<ReviewTriageOutput, HelperError> {
+    let json = serialize_wrapper_input(&input)?;
+    let raw = invoke_helper(HelperSkill::ReviewExecutionOutput, json, ctx)?;
+    decode_state_updates(raw)
+}
+
+// ----- validate-execution-plan-non-interactive -----------------------------
+
+/// Input envelope for [`invoke_validator`].
+///
+/// Fields mirror the `Required inputs` listed in the
+/// `plan-executor:validate-execution-plan-non-interactive` SKILL contract.
+#[derive(Debug, Clone, Serialize)]
+pub struct ValidatorInput {
+    /// Full plan path.
+    pub plan_path: PathBuf,
+    /// Execution root.
+    pub execution_root: PathBuf,
+    /// Changed files.
+    pub changed_files: Vec<PathBuf>,
+    /// Language.
+    pub language: String,
+    /// Recipe list.
+    pub recipe_list: Vec<String>,
+    /// Skip-code-review flag.
+    pub skip_code_review: bool,
+    /// State file path.
+    pub state_file_path: PathBuf,
+    /// Execution orchestration state.
+    pub execution_state: serde_json::Value,
+    /// Current helper-owned validation state when already available.
+    pub validation_state: serde_json::Value,
+    /// Persisted helper-owned validation-state path when state is resumed from storage.
+    pub validation_state_path: Option<PathBuf>,
+    /// Current validation attempt.
+    pub current_validation_attempt: u32,
+    /// Prior validation notes, including prior GAPS and DEVIATIONS.
+    pub prior_validation_notes: serde_json::Value,
+    /// Prior helper outcomes needed to continue the same validation loop deterministically.
+    pub prior_helper_outcomes: serde_json::Value,
+}
+
+/// One row of [`ValidatorOutput::gaps`].
+///
+/// Mirrors the schema item under `state_updates.gaps[*]` in the
+/// validate-execution-plan output schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ValidationGap {
+    /// Plan goal or acceptance item that is not yet satisfied.
+    pub goal: String,
+    /// Description of the missing evidence preventing the goal from being satisfied.
+    pub missing_evidence: String,
+}
+
+/// Typed output for [`invoke_validator`].
+///
+/// Mirrors the `state_updates` shape in the validate-execution-plan schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ValidatorOutput {
+    /// Path to the validation report produced by the helper.
+    pub validation_report_path: PathBuf,
+    /// Outstanding plan-vs-output gaps; empty when the validator passed.
+    pub gaps: Vec<ValidationGap>,
+}
+
+/// Invokes `plan-executor:validate-execution-plan-non-interactive` and
+/// returns its typed `state_updates` payload.
+///
+/// # Errors
+///
+/// Same as [`invoke_review_team`] but for the validator helper.
+pub fn invoke_validator(
+    input: ValidatorInput,
+    ctx: &StepContext,
+) -> Result<ValidatorOutput, HelperError> {
+    let json = serialize_wrapper_input(&input)?;
+    let raw = invoke_helper(HelperSkill::ValidateExecutionPlan, json, ctx)?;
+    decode_state_updates(raw)
+}
+
+// ----- pr-finalize ---------------------------------------------------------
+
+/// Merge intent passed to [`invoke_pr_finalize`].
+///
+/// Mirrors the CLI surface of the `pr-finalize` skill (`--merge`,
+/// `--merge-admin`); kept as an enum (not a `bool`) so the wire shape is
+/// extensible without breaking callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PrFinalizeMergeMode {
+    /// Do not merge after finalization.
+    None,
+    /// Merge with `gh pr merge --merge` after finalization.
+    Merge,
+    /// Merge with `gh pr merge --merge --admin` after finalization.
+    MergeAdmin,
+}
+
+/// PR lifecycle state reported by [`invoke_pr_finalize`].
+///
+/// Mirrors the `state_updates.pr_state` enum in the pr-finalize output schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+#[non_exhaustive]
+pub enum PrState {
+    /// PR is open and not merged.
+    Open,
+    /// PR has been merged.
+    Merged,
+    /// PR was closed without merging.
+    Closed,
+    /// PR state could not be determined from the helper output.
+    Unknown,
+}
+
+/// Input envelope for [`invoke_pr_finalize`].
+///
+/// The pr-finalize skill is currently CLI-shaped; the wrapper exposes the
+/// minimal subset the orchestrator needs to identify the PR plus an explicit
+/// merge intent.
+#[derive(Debug, Clone, Serialize)]
+pub struct PrFinalizeInput {
+    /// PR owner (e.g. `parloa`).
+    pub owner: String,
+    /// PR repository name (e.g. `plan-executor`).
+    pub repo: String,
+    /// PR number.
+    pub pr: u32,
+    /// Whether (and how) to attempt the merge after finalization.
+    pub merge_mode: PrFinalizeMergeMode,
+}
+
+/// Typed output for [`invoke_pr_finalize`].
+///
+/// Mirrors the `state_updates` shape in the pr-finalize output schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PrFinalizeOutput {
+    /// Lifecycle state of the PR after finalization.
+    pub pr_state: PrState,
+    /// 40-character lower-hex SHA of the merge commit, when the PR was merged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_sha: Option<String>,
+    /// Number of Bugbot comments the helper resolved during finalization.
+    pub bugbot_comments_addressed: u32,
+}
+
+/// Invokes `plan-executor:pr-finalize` and returns its typed `state_updates`
+/// payload.
+///
+/// # Errors
+///
+/// Same as [`invoke_review_team`] but for the pr-finalize helper.
+pub fn invoke_pr_finalize(
+    input: PrFinalizeInput,
+    ctx: &StepContext,
+) -> Result<PrFinalizeOutput, HelperError> {
+    let json = serialize_wrapper_input(&input)?;
+    let raw = invoke_helper(HelperSkill::PrFinalize, json, ctx)?;
+    decode_state_updates(raw)
 }
