@@ -5,6 +5,7 @@ mod daemon;
 mod executor;
 mod finding;
 mod handoff;
+mod helper;
 mod ipc;
 mod job;
 mod jobs;
@@ -12,6 +13,7 @@ mod plan;
 mod proctree;
 mod remote;
 mod schema;
+mod scheduler;
 mod supervisor;
 mod validate;
 

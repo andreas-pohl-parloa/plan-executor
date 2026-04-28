@@ -83,6 +83,44 @@ pub enum Commands {
         #[arg(long = "findings-json")]
         findings_json: PathBuf,
     },
+    /// Run a standalone framework job (Phase C / Phase D entry point).
+    Run {
+        #[command(subcommand)]
+        command: RunCommand,
+    },
+}
+
+/// Subcommands for the `plan-executor run` group.
+///
+/// Each variant constructs and persists a [`crate::job::types::Job`] via
+/// [`crate::job::storage::JobStore`] — the same storage pathway used by
+/// `JobKind::Plan` in Phase A. The dispatch loop (running the steps) is
+/// owned by the daemon and is added in Phase D; this CLI surface only
+/// needs to materialize a valid `job.json` on disk.
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum RunCommand {
+    /// Finalize a PR: lookup → mark-ready → monitor → merge (optional) → report.
+    PrFinalize {
+        /// Pull request number.
+        #[arg(long)]
+        pr: u32,
+        /// Repository owner. Defaults to the `owner.login` reported by
+        /// `gh repo view --json owner,name` in the current directory.
+        #[arg(long)]
+        owner: Option<String>,
+        /// Repository name. Defaults to the `name` reported by
+        /// `gh repo view --json owner,name` in the current directory.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Run `gh pr merge` after monitor succeeds. Mutually exclusive
+        /// with `--merge-admin`.
+        #[arg(long, conflicts_with = "merge_admin")]
+        merge: bool,
+        /// Run `gh pr merge --admin` after monitor succeeds (bypasses
+        /// required-reviewer checks). Mutually exclusive with `--merge`.
+        #[arg(long = "merge-admin")]
+        merge_admin: bool,
+    },
 }
 
 /// Subcommands for the `plan-executor jobs` group.
@@ -114,6 +152,8 @@ pub enum JobsCommand {
         #[arg(long)]
         from_step: Option<u32>,
     },
+    /// Aggregate persisted job metrics across the store.
+    Metrics(crate::job::cli::MetricsArgs),
 }
 
 /// Prints a display line to the terminal, coloring plan-executor prefix lines
@@ -503,6 +543,159 @@ pub(crate) fn run_compile_fix_waves_with_invoker(
     Ok(())
 }
 
+/// Resolve `(owner, repo)` for the current working directory by invoking
+/// `gh repo view --json owner,name`. Returns `None` if `gh` is missing,
+/// the command fails, or the JSON shape is unexpected.
+///
+/// We deliberately use `gh` (not `git remote get-url`) because gh respects
+/// the user's auth context and `gh-resolved` remote settings, which matters
+/// when the local clone has multiple remotes (fork + upstream). This matches
+/// the recommendation in the C1.2 task description.
+fn detect_owner_repo_via_gh() -> Option<(String, String)> {
+    let output = std::process::Command::new("gh")
+        .args(["repo", "view", "--json", "owner,name"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let owner = v
+        .pointer("/owner/login")
+        .and_then(|x| x.as_str())?
+        .to_string();
+    let name = v.pointer("/name").and_then(|x| x.as_str())?.to_string();
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some((owner, name))
+}
+
+/// Build a [`crate::job::types::Job`] for the standalone `pr-finalize`
+/// CLI subcommand and persist it via [`crate::job::storage::JobStore`].
+///
+/// Steps are sourced from [`crate::job::registry::steps_for`] so this CLI
+/// surface stays in sync with the registry's step list. Each
+/// `Box<dyn Step>` is projected into a [`crate::job::types::StepInstance`]
+/// (`status: Pending`, no attempts yet) before persisting; the daemon
+/// dispatch loop (Phase D) reads `job.json` back and re-hydrates the
+/// runtime steps via the registry.
+///
+/// # Errors
+///
+/// Returns an error when `gh repo view` cannot resolve the repo (and the
+/// caller did not pass `--owner`/`--repo`), when the job store cannot be
+/// opened, or when persisting `job.json` fails.
+fn run_pr_finalize(
+    pr: u32,
+    owner: Option<String>,
+    repo: Option<String>,
+    merge: bool,
+    merge_admin: bool,
+) -> Result<()> {
+    use crate::job::registry;
+    use crate::job::storage::JobStore;
+    use crate::job::types::{
+        Job, JobId, JobKind, JobState, MergeMode as WireMergeMode, StepInstance, StepStatus,
+    };
+
+    // Resolve owner/repo: prefer explicit CLI args, fall back to gh detection.
+    let (resolved_owner, resolved_repo) = match (owner, repo) {
+        (Some(o), Some(r)) => (o, r),
+        (o_opt, r_opt) => {
+            let detected = detect_owner_repo_via_gh().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "could not detect owner/repo from `gh repo view` — pass --owner and --repo explicitly, or run from a directory with a configured gh remote"
+                )
+            })?;
+            (o_opt.unwrap_or(detected.0), r_opt.unwrap_or(detected.1))
+        }
+    };
+
+    // Defense-in-depth (Sec F-4): validate owner/repo charset against the same
+    // shape the GHA workflow enforces (`^[A-Za-z0-9._-]+$`). Reuses
+    // `crate::remote::validate_repo_slug`, which checks both halves of the
+    // slug and rejects `..`, slashes, or other injection-prone characters.
+    let combined_slug = format!("{resolved_owner}/{resolved_repo}");
+    if !crate::remote::validate_repo_slug(&combined_slug) {
+        anyhow::bail!(
+            "invalid owner/repo: '{combined_slug}' — must match ^[A-Za-z0-9._-]+$ for both owner and repo"
+        );
+    }
+
+    // Clap's `conflicts_with` already rejects `--merge` + `--merge-admin`,
+    // but a defensive check here makes the precondition explicit and
+    // shields the registry against future plumbing changes.
+    let merge_mode = match (merge, merge_admin) {
+        (false, false) => WireMergeMode::None,
+        (true, false) => WireMergeMode::Merge,
+        (false, true) => WireMergeMode::MergeAdmin,
+        (true, true) => {
+            anyhow::bail!("--merge and --merge-admin are mutually exclusive")
+        }
+    };
+
+    let kind = JobKind::PrFinalize {
+        owner: resolved_owner,
+        repo: resolved_repo,
+        pr,
+        merge_mode,
+    };
+
+    let runtime_steps = registry::steps_for(&kind);
+    let step_instances: Vec<StepInstance> = runtime_steps
+        .iter()
+        .enumerate()
+        .map(|(idx, step)| {
+            let seq = u32::try_from(idx + 1).unwrap_or(u32::MAX);
+            StepInstance {
+                seq,
+                name: step.name().to_string(),
+                status: StepStatus::Pending,
+                attempts: Vec::new(),
+                idempotent: step.idempotent(),
+            }
+        })
+        .collect();
+
+    let job = Job {
+        id: JobId(uuid::Uuid::new_v4().to_string()),
+        kind,
+        state: JobState::Pending,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        steps: step_instances,
+    };
+
+    let store = JobStore::new().context("opening job store")?;
+    let dir = store.create(&job).context("persisting job.json")?;
+
+    let short_id = &job.id.0[..job.id.0.len().min(8)];
+    println!(
+        "Queued pr-finalize job (id {}) at {}",
+        short_id,
+        dir.path().display()
+    );
+    Ok(())
+}
+
+/// Dispatch entry point for the `plan-executor run <subcommand>` CLI group.
+///
+/// # Errors
+///
+/// Propagates the underlying handler's error (currently only
+/// `RunCommand::PrFinalize`).
+fn run_subcommand(command: RunCommand) -> Result<()> {
+    match command {
+        RunCommand::PrFinalize {
+            pr,
+            owner,
+            repo,
+            merge,
+            merge_admin,
+        } => run_pr_finalize(pr, owner, repo, merge, merge_admin),
+    }
+}
+
 pub fn run() {
     let cli = Cli::parse();
 
@@ -553,6 +746,13 @@ pub fn run() {
             findings_json,
         } => {
             run_compile_fix_waves(plan, execution_root, findings_json);
+            return;
+        }
+        Commands::Run { command } => {
+            if let Err(e) = run_subcommand(command.clone()) {
+                eprintln!("Error: {:#}", e);
+                std::process::exit(1);
+            }
             return;
         }
         _ => {}
@@ -609,7 +809,8 @@ pub fn run() {
         | Commands::Pause { .. }
         | Commands::Unpause { .. }
         | Commands::Validate { .. }
-        | Commands::CompileFixWaves { .. } => unreachable!(),
+        | Commands::CompileFixWaves { .. }
+        | Commands::Run { .. } => unreachable!(),
     };
 
     if let Err(e) = result {

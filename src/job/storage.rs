@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::config::Config;
+use crate::job::metrics::JobMetrics;
 use crate::job::types::{AttemptOutcome, Job, JobId, JobState};
 
 /// Top-level handle on `~/.plan-executor/jobs/`.
@@ -366,6 +367,44 @@ impl JobDir {
             source,
         })?;
         Ok(serde_json::from_str(&raw)?)
+    }
+
+    /// Persist a [`JobMetrics`] snapshot to `metrics.json`.
+    ///
+    /// Uses the same atomic write-temp + rename strategy as `job.json` so a
+    /// crash mid-write cannot leave a torn file behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns `JobStoreError::Io` or `JobStoreError::Serde` on failure.
+    pub fn write_metrics(&self, metrics: &JobMetrics) -> Result<()> {
+        let path = self.path.join("metrics.json");
+        let json = serde_json::to_string_pretty(metrics)?;
+        write_atomic(&path, json.as_bytes())
+    }
+
+    /// Read the persisted [`JobMetrics`] snapshot if present.
+    ///
+    /// Returns `Ok(None)` when `metrics.json` does not exist (e.g., a job
+    /// that has not yet recorded any attempts).
+    ///
+    /// # Errors
+    ///
+    /// Returns `JobStoreError::Io` for read errors other than `NotFound`,
+    /// and `JobStoreError::Serde` if the file cannot be parsed.
+    pub fn read_metrics(&self) -> Result<Option<JobMetrics>> {
+        let path = self.path.join("metrics.json");
+        let raw = match fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(JobStoreError::Io {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        };
+        Ok(Some(serde_json::from_str(&raw)?))
     }
 
     /// Write the immutable per-step input.

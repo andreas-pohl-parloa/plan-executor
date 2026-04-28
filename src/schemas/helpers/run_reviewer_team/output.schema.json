@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parloa.dev/plan-executor/skills/run-reviewer-team-non-interactive/output.schema.json",
+  "title": "run-reviewer-team-non-interactive output",
+  "description": "Structured output envelope returned by run-reviewer-team-non-interactive to the Rust caller.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "next_step", "notes", "state_updates"],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["success", "fix_required", "blocked", "abort"]
+    },
+    "next_step": {
+      "type": "string",
+      "enum": ["proceed", "dispatch_fix_wave", "escalate", "terminate"]
+    },
+    "notes": {
+      "type": "string"
+    },
+    "state_updates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["findings_path", "reviewer_runs"],
+      "properties": {
+        "findings_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reviewer_runs": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["reviewer", "exit_code", "findings_count"],
+            "properties": {
+              "reviewer": {
+                "type": "string",
+                "enum": ["claude", "codex", "gemini", "security"]
+              },
+              "exit_code": {
+                "type": "integer"
+              },
+              "findings_count": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

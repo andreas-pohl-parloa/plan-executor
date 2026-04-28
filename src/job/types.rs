@@ -11,6 +11,29 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize, Serialize)]
 pub struct JobId(pub String);
 
+/// Wire-format merge mode carried inside [`JobKind::PrFinalize`].
+///
+/// Mirrors the runtime `crate::job::steps::pr_finalize::MergeMode` but adds
+/// `Serialize`/`Deserialize` so the merge intent persists across daemon
+/// restarts and `job.json` round-trips. Translation to the runtime type
+/// happens in `crate::job::registry::steps_for` when the registry hydrates
+/// the `MergeStep` from the persisted `JobKind`.
+///
+/// Defined here (rather than alongside the step impls) so the `pr_finalize`
+/// step module remains free of serde derives — only wire-format types in
+/// the `types` module carry that obligation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeMode {
+    /// Do not attempt a merge; the merge step short-circuits to `Success`.
+    #[default]
+    None,
+    /// Run `gh pr merge` with the standard squash-and-delete flags.
+    Merge,
+    /// Run `gh pr merge --admin` (bypasses required-reviewer checks).
+    MergeAdmin,
+}
+
 /// Kind of work a Job performs, with kind-specific parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -18,10 +41,17 @@ pub enum JobKind {
     /// Execute a plan manifest end-to-end.
     Plan { manifest_path: PathBuf },
     /// Finalize a pull request (rebase, checks, merge gating).
+    ///
+    /// `merge_mode` carries the user's `--merge` / `--merge-admin` intent
+    /// from the CLI surface through `JobStore::create` so it persists in
+    /// `job.json` and survives a daemon restart. `MergeMode::None` (the
+    /// default) means "monitor only, no merge".
     PrFinalize {
         owner: String,
         repo: String,
         pr: u32,
+        #[serde(default)]
+        merge_mode: MergeMode,
     },
     /// Run a code review job for a branch against a base.
     Review { branch: String, base: String },
@@ -175,10 +205,42 @@ mod tests {
             owner: "octo".to_string(),
             repo: "demo".to_string(),
             pr: 42,
+            merge_mode: MergeMode::None,
         };
         let json = serde_json::to_string(&value).expect("serialize");
         let back: JobKind = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, value);
+    }
+
+    #[test]
+    fn job_kind_pr_finalize_merge_mode_roundtrip_for_each_variant() {
+        for mode in [MergeMode::None, MergeMode::Merge, MergeMode::MergeAdmin] {
+            let value = JobKind::PrFinalize {
+                owner: "octo".to_string(),
+                repo: "demo".to_string(),
+                pr: 42,
+                merge_mode: mode,
+            };
+            let json = serde_json::to_string(&value).expect("serialize");
+            let back: JobKind = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, value);
+        }
+    }
+
+    #[test]
+    fn job_kind_pr_finalize_defaults_merge_mode_when_field_missing() {
+        // Older `job.json` files written before C1.2 won't have a
+        // `merge_mode` key. `#[serde(default)]` must fall back to
+        // `MergeMode::None` so existing manifests still deserialize.
+        let json = r#"{"kind":"pr_finalize","owner":"octo","repo":"demo","pr":42}"#;
+        let parsed: JobKind = serde_json::from_str(json).expect("deserialize");
+        let expected = JobKind::PrFinalize {
+            owner: "octo".to_string(),
+            repo: "demo".to_string(),
+            pr: 42,
+            merge_mode: MergeMode::None,
+        };
+        assert_eq!(parsed, expected);
     }
 
     #[test]
