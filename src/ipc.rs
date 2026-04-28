@@ -23,8 +23,6 @@ pub enum TuiRequest {
     ResumeJob { job_id: String },
     /// Request full state snapshot
     GetState,
-    /// Retry the handoff for a job whose sub-agents were never dispatched
-    RetryHandoff { job_id: String },
     /// Track a remote execution PR for status monitoring
     TrackRemote { plan_path: String, remote_repo: String, pr_number: u64 },
 }
