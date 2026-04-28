@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.40.0] - 2026-04-28
+
+### Bug Fixes
+
+- Storage hardening — unique temp paths + 0700 perms (Codex #7, Sec F-7) ([11ba91d](https://github.com/andreas-pohl-parloa/plan-executor/commit/11ba91dc3492fdcd716725fc24d331e31b7a4c67))
+- Helper subprocess Read/Write/Edit jailed to ctx.workdir (Sec F-1) ([b869044](https://github.com/andreas-pohl-parloa/plan-executor/commit/b869044788de96f2945d746c6f5352a70eb7bc30))
+- PrFinalize subprocess hygiene (Codex #5) ([8bc8bc9](https://github.com/andreas-pohl-parloa/plan-executor/commit/8bc8bc9f822b5d1cf5c56c55bf735f143614ca02))
+- Fix-loop wall-clock budget + token-based transient matcher (Sec F-9, F-12) ([26fb24f](https://github.com/andreas-pohl-parloa/plan-executor/commit/26fb24f3307f92e3a8b85ee2e91b4d64be312589))
+- GHA workflow hardening + remote-execution SECURITY.md (Sec F-6, F-14, F-15) ([f897a19](https://github.com/andreas-pohl-parloa/plan-executor/commit/f897a19000c306f7bb84389b675c404bc911c84d))
+
+### Features
+
+- Retire legacy orchestrator skill, drive plan jobs via Rust scheduler (Phase D4) ([d1e65fc](https://github.com/andreas-pohl-parloa/plan-executor/commit/d1e65fc1da3be01abe2e3644c8873fe2acd69795))
 ## [0.39.0] - 2026-04-28
 
 ### Bug Fixes
