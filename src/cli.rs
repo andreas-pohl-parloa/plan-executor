@@ -1,10 +1,12 @@
-use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
-#[command(name = "plan-executor", about = "Monitor and execute Claude plan files")]
+#[command(
+    name = "plan-executor",
+    about = "Monitor and execute Claude plan files"
+)]
 pub struct Cli {
     /// Path to config file. Default: ~/.plan-executor/config.json
     #[arg(long, global = true, value_name = "FILE")]
@@ -38,8 +40,11 @@ pub enum Commands {
     Ensure,
     /// Show daemon status
     Status,
-    /// List job history
-    Jobs,
+    /// List, show, cancel, gc, or replay job records.
+    Jobs {
+        #[command(subcommand)]
+        command: Option<JobsCommand>,
+    },
     /// Kill a running job by job ID (prefix match)
     Kill { job_id: String },
     /// Pause a running job at the next handoff
@@ -77,6 +82,37 @@ pub enum Commands {
         /// Absolute path to the findings.json file (conforms to findings.schema.json).
         #[arg(long = "findings-json")]
         findings_json: PathBuf,
+    },
+}
+
+/// Subcommands for the `plan-executor jobs` group.
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum JobsCommand {
+    /// List all jobs (new and legacy layouts). Default when no subcommand.
+    List,
+    /// Show full step/attempt history for a job (id prefix match).
+    Show {
+        /// Full or prefix-matched job id.
+        id: String,
+    },
+    /// Mark a job as cancelled (new layout only; running daemon jobs use `kill`).
+    Cancel {
+        /// Full or prefix-matched job id.
+        id: String,
+    },
+    /// Garbage-collect completed jobs older than the given duration.
+    Gc {
+        /// Duration like "7d", "24h", "30m". Default: "30d".
+        #[arg(long)]
+        older_than: Option<String>,
+    },
+    /// Replay a job from step N. Phase A: stub; full impl in Phase D.
+    Replay {
+        /// Full or prefix-matched job id.
+        id: String,
+        /// Step seq to start replay from (1-based).
+        #[arg(long)]
+        from_step: Option<u32>,
     },
 }
 
@@ -143,7 +179,9 @@ fn render_subagent_output(job_id: &str, dispatch: u32, index: usize) {
         .join("jobs")
         .join(job_id)
         .join("sub-agents");
-    let Ok(entries) = std::fs::read_dir(&base) else { return };
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return;
+    };
 
     let prefix = subagent_prefix(index);
     let prefix_stdout = format!("dispatch-{}-agent-{}-", dispatch, index);
@@ -159,15 +197,9 @@ fn render_subagent_output(job_id: &str, dispatch: u32, index: usize) {
             Err(_) => continue,
         };
         let header = if is_stderr {
-            format!(
-                "{}\x1b[2m─── sub-agent {} stderr ───\x1b[0m",
-                prefix, index,
-            )
+            format!("{}\x1b[2m─── sub-agent {} stderr ───\x1b[0m", prefix, index,)
         } else {
-            format!(
-                "{}\x1b[2m─── sub-agent {} output ───\x1b[0m",
-                prefix, index,
-            )
+            format!("{}\x1b[2m─── sub-agent {} output ───\x1b[0m", prefix, index,)
         };
         println!("{}", header);
         for raw_line in content.lines() {
@@ -196,7 +228,9 @@ fn terminal_width() -> usize {
     #[cfg(unix)]
     {
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-        if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 {
+        if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0
+            && ws.ws_col > 0
+        {
             return ws.ws_col as usize;
         }
     }
@@ -218,7 +252,9 @@ fn processes_in_pgid(pgid: u32) -> Vec<(u32, String)> {
     let output = std::process::Command::new("ps")
         .args(["-o", "pid=,command=", "-g", &pgid.to_string()])
         .output();
-    let Ok(output) = output else { return Vec::new() };
+    let Ok(output) = output else {
+        return Vec::new();
+    };
     if !output.status.success() {
         return Vec::new();
     }
@@ -318,9 +354,7 @@ pub(crate) fn resolve_manifest_path(arg: &str) -> Result<PathBuf> {
         cwd.join(&raw)
     };
     let resolved = std::fs::canonicalize(&absolute).unwrap_or(absolute);
-    if resolved.is_file()
-        && resolved.file_name().and_then(|n| n.to_str()) == Some("tasks.json")
-    {
+    if resolved.is_file() && resolved.file_name().and_then(|n| n.to_str()) == Some("tasks.json") {
         return Ok(resolved);
     }
     if resolved.is_dir() {
@@ -338,17 +372,15 @@ pub(crate) fn read_manifest_plan_block(manifest_path: &Path) -> Result<(PathBuf,
         .with_context(|| format!("read manifest {}", manifest_path.display()))?;
     let v: serde_json::Value = serde_json::from_str(&raw)
         .with_context(|| format!("parse manifest {}", manifest_path.display()))?;
-    let plan_path = v.pointer("/plan/path")
+    let plan_path = v
+        .pointer("/plan/path")
         .and_then(|x| x.as_str())
-        .ok_or_else(|| anyhow::anyhow!(
-            "manifest {} missing plan.path", manifest_path.display()
-        ))?
+        .ok_or_else(|| anyhow::anyhow!("manifest {} missing plan.path", manifest_path.display()))?
         .to_string();
-    let status = v.pointer("/plan/status")
+    let status = v
+        .pointer("/plan/status")
         .and_then(|x| x.as_str())
-        .ok_or_else(|| anyhow::anyhow!(
-            "manifest {} missing plan.status", manifest_path.display()
-        ))?
+        .ok_or_else(|| anyhow::anyhow!("manifest {} missing plan.status", manifest_path.display()))?
         .to_string();
     Ok((PathBuf::from(plan_path), status))
 }
@@ -369,8 +401,12 @@ fn run_validate(tasks_json: &std::path::Path) {
         }
     };
 
-    let schema_errors = crate::schema::validate_manifest(&manifest).err().unwrap_or_default();
-    let manifest_dir = tasks_json.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let schema_errors = crate::schema::validate_manifest(&manifest)
+        .err()
+        .unwrap_or_default();
+    let manifest_dir = tasks_json
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
     let semantic_errors = crate::validate::semantic_check(&manifest, manifest_dir)
         .err()
         .unwrap_or_default();
@@ -472,15 +508,50 @@ pub fn run() {
 
     // Synchronous commands — handle before creating the async runtime.
     match &cli.command {
-        Commands::Stop   => { stop_daemon(); return; }
-        Commands::Jobs   => { list_jobs(); return; }
-        Commands::Ensure => { ensure_daemon(); return; }
-        Commands::RemoteSetup => { remote_setup(); return; }
-        Commands::Kill   { job_id } => { daemon_job_request("kill",    job_id); return; }
-        Commands::Pause  { job_id } => { daemon_job_request("pause",   job_id); return; }
-        Commands::Unpause{ job_id } => { daemon_job_request("unpause", job_id); return; }
-        Commands::Validate { tasks_json } => { run_validate(tasks_json); return; }
-        Commands::CompileFixWaves { plan, execution_root, findings_json } => {
+        Commands::Stop => {
+            stop_daemon();
+            return;
+        }
+        Commands::Jobs { command } => {
+            let cmd = command.clone().unwrap_or(JobsCommand::List);
+            match crate::job::cli::dispatch(cmd) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("Error: {:#}", e);
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        Commands::Ensure => {
+            ensure_daemon();
+            return;
+        }
+        Commands::RemoteSetup => {
+            remote_setup();
+            return;
+        }
+        Commands::Kill { job_id } => {
+            daemon_job_request("kill", job_id);
+            return;
+        }
+        Commands::Pause { job_id } => {
+            daemon_job_request("pause", job_id);
+            return;
+        }
+        Commands::Unpause { job_id } => {
+            daemon_job_request("unpause", job_id);
+            return;
+        }
+        Commands::Validate { tasks_json } => {
+            run_validate(tasks_json);
+            return;
+        }
+        Commands::CompileFixWaves {
+            plan,
+            execution_root,
+            findings_json,
+        } => {
             run_compile_fix_waves(plan, execution_root, findings_json);
             return;
         }
@@ -505,17 +576,22 @@ pub fn run() {
     // Default to info-level logging when RUST_LOG is not set.
     // After daemonize(), stderr points to ~/.plan-executor/daemon.log.
     if std::env::var("RUST_LOG").is_err() {
-        unsafe { std::env::set_var("RUST_LOG", "plan_executor=info"); }
+        unsafe {
+            std::env::set_var("RUST_LOG", "plan_executor=info");
+        }
     }
     tracing_subscriber::fmt::init();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
 
-    let config = crate::config::Config::load(config_path.as_deref())
-        .expect("failed to load config");
+    let config =
+        crate::config::Config::load(config_path.as_deref()).expect("failed to load config");
 
     let result: Result<()> = match cli.command {
         Commands::Daemon { .. } => rt.block_on(crate::daemon::run_daemon(config)),
-        Commands::Execute { manifest, foreground } => {
+        Commands::Execute {
+            manifest,
+            foreground,
+        } => {
             if foreground {
                 rt.block_on(execute_foreground(manifest, config))
             } else {
@@ -525,8 +601,13 @@ pub fn run() {
         Commands::Status => rt.block_on(show_status()),
         Commands::Output { job_id, follow } => rt.block_on(output_job(job_id, follow)),
         Commands::Retry { job_id } => rt.block_on(retry_job(job_id)),
-        Commands::Stop | Commands::Jobs | Commands::Ensure | Commands::RemoteSetup
-        | Commands::Kill { .. } | Commands::Pause { .. } | Commands::Unpause { .. }
+        Commands::Stop
+        | Commands::Jobs { .. }
+        | Commands::Ensure
+        | Commands::RemoteSetup
+        | Commands::Kill { .. }
+        | Commands::Pause { .. }
+        | Commands::Unpause { .. }
         | Commands::Validate { .. }
         | Commands::CompileFixWaves { .. } => unreachable!(),
     };
@@ -556,10 +637,15 @@ async fn output_job(job_id_prefix: String, follow: bool) -> Result<()> {
     write_half.write_all(format!("{}\n", gs).as_bytes()).await?;
 
     let state_line = reader.next_line().await?.unwrap_or_default();
-    let (job_id, is_running) = if let Ok(DaemonEvent::State { running_jobs, history, .. }) =
-        serde_json::from_str::<DaemonEvent>(&state_line)
+    let (job_id, is_running) = if let Ok(DaemonEvent::State {
+        running_jobs,
+        history,
+        ..
+    }) = serde_json::from_str::<DaemonEvent>(&state_line)
     {
-        let running_match = running_jobs.iter().find(|j| j.id.starts_with(&job_id_prefix));
+        let running_match = running_jobs
+            .iter()
+            .find(|j| j.id.starts_with(&job_id_prefix));
         let history_match = history.iter().find(|j| j.id.starts_with(&job_id_prefix));
         match (running_match, history_match) {
             (Some(j), _) => (j.id.clone(), true),
@@ -576,14 +662,15 @@ async fn output_job(job_id_prefix: String, follow: bool) -> Result<()> {
     // before each `sub-agent <N> done` / `sub-agent <N> failed` line we
     // render the matching persisted JSONL file with a dim indented prefix
     // so the context is clear.
-    let display_path = Config::base_dir().join("jobs").join(&job_id).join("display.log");
+    let display_path = Config::base_dir()
+        .join("jobs")
+        .join(&job_id)
+        .join("display.log");
     if display_path.exists() {
         let content = std::fs::read_to_string(&display_path)?;
         let mut dispatch_counter: u32 = 0;
         for line in content.lines() {
-            if line.contains("⏺ [plan-executor] dispatching")
-                && line.contains("sub-agent(s)")
-            {
+            if line.contains("⏺ [plan-executor] dispatching") && line.contains("sub-agent(s)") {
                 dispatch_counter += 1;
             }
             if let Some(idx) = parse_subagent_done_index(line) {
@@ -604,43 +691,51 @@ async fn output_job(job_id_prefix: String, follow: bool) -> Result<()> {
     // sub-agent finished before follow began, we still batch-render its
     // file at the done marker; otherwise we skip the batch to avoid
     // double-rendering what we already streamed.
-    eprintln!("[following {} — Ctrl+C to stop]", &job_id[..job_id.len().min(8)]);
+    eprintln!(
+        "[following {} — Ctrl+C to stop]",
+        &job_id[..job_id.len().min(8)]
+    );
     let mut dispatch_counter: u32 = 0;
     let mut live_streamed: std::collections::HashSet<(u32, usize)> =
         std::collections::HashSet::new();
     while let Some(line) = reader.next_line().await? {
-                if let Ok(DaemonEvent::JobDisplayLine { job_id: jid, line: text }) =
-                    serde_json::from_str::<DaemonEvent>(&line)
+        if let Ok(DaemonEvent::JobDisplayLine {
+            job_id: jid,
+            line: text,
+        }) = serde_json::from_str::<DaemonEvent>(&line)
+        {
+            if jid == job_id {
+                if text.contains("⏺ [plan-executor] dispatching") && text.contains("sub-agent(s)")
                 {
-                    if jid == job_id {
-                        if text.contains("⏺ [plan-executor] dispatching")
-                            && text.contains("sub-agent(s)")
-                        {
-                            dispatch_counter += 1;
-                        }
-                        if let Some(idx) = parse_subagent_done_index(&text) {
-                            if !live_streamed.contains(&(dispatch_counter, idx)) {
-                                render_subagent_output(&job_id, dispatch_counter, idx);
-                            }
-                        }
-                        print_display_line(&text);
-                    }
-                } else if let Ok(DaemonEvent::SubAgentLine {
-                    job_id: jid, index, is_stderr, line: sa_line, ..
-                }) = serde_json::from_str::<DaemonEvent>(&line)
-                {
-                    if jid == job_id {
-                        live_streamed.insert((dispatch_counter, index));
-                        render_subagent_live(index, is_stderr, &sa_line);
-                    }
-                } else if let Ok(DaemonEvent::JobUpdated { job }) =
-                    serde_json::from_str::<DaemonEvent>(&line)
-                {
-                    if job.id == job_id && job.status != crate::jobs::JobStatus::Running {
-                        eprintln!("[job finished: {:?}]", job.status);
-                        break;
+                    dispatch_counter += 1;
+                }
+                if let Some(idx) = parse_subagent_done_index(&text) {
+                    if !live_streamed.contains(&(dispatch_counter, idx)) {
+                        render_subagent_output(&job_id, dispatch_counter, idx);
                     }
                 }
+                print_display_line(&text);
+            }
+        } else if let Ok(DaemonEvent::SubAgentLine {
+            job_id: jid,
+            index,
+            is_stderr,
+            line: sa_line,
+            ..
+        }) = serde_json::from_str::<DaemonEvent>(&line)
+        {
+            if jid == job_id {
+                live_streamed.insert((dispatch_counter, index));
+                render_subagent_live(index, is_stderr, &sa_line);
+            }
+        } else if let Ok(DaemonEvent::JobUpdated { job }) =
+            serde_json::from_str::<DaemonEvent>(&line)
+        {
+            if job.id == job_id && job.status != crate::jobs::JobStatus::Running {
+                eprintln!("[job finished: {:?}]", job.status);
+                break;
+            }
+        }
     }
     Ok(())
 }
@@ -675,10 +770,7 @@ fn parse_subagent_done_index(line: &str) -> Option<usize> {
     let after = line.strip_prefix("⏺ [plan-executor] sub-agent ")?;
     let (num, rest) = after.split_once(' ')?;
     let idx: usize = num.parse().ok()?;
-    if rest.starts_with("done")
-        || rest.starts_with("failed")
-        || rest.starts_with("skipped")
-    {
+    if rest.starts_with("done") || rest.starts_with("failed") || rest.starts_with("skipped") {
         Some(idx)
     } else {
         None
@@ -699,15 +791,25 @@ async fn retry_job(job_id_prefix: String) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("No job matching '{}'", job_id_prefix))?;
     let job_id = job.id.clone();
 
-    println!("Retrying handoff for job {} ({})", &job_id[..job_id.len().min(8)],
-        job.plan_path.file_name().and_then(|n| n.to_str()).unwrap_or("?"));
+    println!(
+        "Retrying handoff for job {} ({})",
+        &job_id[..job_id.len().min(8)],
+        job.plan_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?")
+    );
 
     let stream = UnixStream::connect(crate::ipc::socket_path()).await?;
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half).lines();
 
-    let req = serde_json::to_string(&TuiRequest::RetryHandoff { job_id: job_id.clone() })?;
-    write_half.write_all(format!("{}\n", req).as_bytes()).await?;
+    let req = serde_json::to_string(&TuiRequest::RetryHandoff {
+        job_id: job_id.clone(),
+    })?;
+    write_half
+        .write_all(format!("{}\n", req).as_bytes())
+        .await?;
 
     // Wait briefly for confirmation that the job moved to Running, then detach.
     let short_id = &job_id[..job_id.len().min(8)];
@@ -755,7 +857,10 @@ async fn execute_plan(manifest_arg: String, config: crate::config::Config) -> Re
     }
 
     if !plan_path.exists() {
-        anyhow::bail!("Plan file referenced by manifest not found: {}", plan_path.display());
+        anyhow::bail!(
+            "Plan file referenced by manifest not found: {}",
+            plan_path.display()
+        );
     }
 
     if !crate::ipc::socket_path().exists() {
@@ -770,12 +875,14 @@ async fn trigger_remote(
     manifest_path: PathBuf,
     config: crate::config::Config,
 ) -> Result<()> {
-    let remote_repo = config.remote_repo.as_deref()
-        .ok_or_else(|| anyhow::anyhow!(
+    let remote_repo = config.remote_repo.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
             "remote execution requires 'remote_repo' in config — run 'plan-executor remote-setup'"
-        ))?;
+        )
+    })?;
 
-    let plan_filename = plan.file_name()
+    let plan_filename = plan
+        .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("plan.md")
         .to_string();
@@ -796,7 +903,8 @@ async fn trigger_remote(
     // Push Codex OAuth token (idempotent, skips if no auth file)
     let _ = crate::remote::push_codex_auth(remote_repo);
 
-    let pr_url = crate::remote::trigger_remote_execution(remote_repo, &plan, &manifest_path, &meta)?;
+    let pr_url =
+        crate::remote::trigger_remote_execution(remote_repo, &plan, &manifest_path, &meta)?;
     let pr_num = crate::remote::pr_number_from_url(&pr_url);
 
     // Store PR number for daemon-side polling.
@@ -806,9 +914,7 @@ async fn trigger_remote(
 
     // Create a job entry and persist it
     if let Some(n) = pr_num {
-        let job = crate::jobs::JobMetadata::new_remote(
-            plan.clone(), remote_repo.to_string(), n,
-        );
+        let job = crate::jobs::JobMetadata::new_remote(plan.clone(), remote_repo.to_string(), n);
         let short_id = job.id[..job.id.len().min(8)].to_string();
         let _ = job.save();
 
@@ -842,7 +948,10 @@ async fn execute_foreground(manifest_arg: String, config: crate::config::Config)
         anyhow::bail!("Manifest plan.status is {}, expected READY", status);
     }
     if !resolved_path.exists() {
-        anyhow::bail!("Plan file referenced by manifest not found: {}", resolved_path.display());
+        anyhow::bail!(
+            "Plan file referenced by manifest not found: {}",
+            resolved_path.display()
+        );
     }
 
     if crate::plan::parse_execution_mode(&resolved_path) == crate::plan::ExecutionMode::Remote
@@ -851,14 +960,21 @@ async fn execute_foreground(manifest_arg: String, config: crate::config::Config)
         return trigger_remote(resolved_path, manifest_path, config).await;
     }
 
-    let execution_root = find_repo_root(&resolved_path)
-        .unwrap_or_else(|| resolved_path.parent().unwrap_or(&resolved_path).to_path_buf());
+    let execution_root = find_repo_root(&resolved_path).unwrap_or_else(|| {
+        resolved_path
+            .parent()
+            .unwrap_or(&resolved_path)
+            .to_path_buf()
+    });
 
     let job = JobMetadata::new(resolved_path.clone());
     let job_id = job.id.clone();
 
     let (mut child, _pgid, mut exec_rx) = spawn_execution(
-        job, execution_root.clone(), manifest_path.clone(), &config.agents.main,
+        job,
+        execution_root.clone(),
+        manifest_path.clone(),
+        &config.agents.main,
     )?;
 
     let mut last_display_blank = false;
@@ -877,7 +993,10 @@ async fn execute_foreground(manifest_arg: String, config: crate::config::Config)
                     last_display_blank = is_blank;
                     print_display_line(&line);
                 }
-                ExecEvent::HandoffRequired { session_id, state_file } => {
+                ExecEvent::HandoffRequired {
+                    session_id,
+                    state_file,
+                } => {
                     let state_data = handoff::load_state(&state_file)?;
 
                     println!("\x1b[33m\u{23fa} [plan-executor]\x1b[0m dispatching {} sub-agent(s) (phase: {})",
@@ -902,9 +1021,8 @@ async fn execute_foreground(manifest_arg: String, config: crate::config::Config)
                     // channel — but its contents are already covered by
                     // `subagent_tx` above, so drain it silently.
                     let (live_tx, mut live_rx) = tokio::sync::mpsc::channel::<(usize, String)>(256);
-                    let drain_task = tokio::spawn(async move {
-                        while live_rx.recv().await.is_some() {}
-                    });
+                    let drain_task =
+                        tokio::spawn(async move { while live_rx.recv().await.is_some() {} });
 
                     let (results, _pgids) = handoff::dispatch_all(
                         state_data.handoffs,
@@ -915,7 +1033,8 @@ async fn execute_foreground(manifest_arg: String, config: crate::config::Config)
                         Some(live_tx),
                         None, // no pgid tracking in foreground path
                         Some(subagent_tx),
-                    ).await;
+                    )
+                    .await;
                     let _ = drain_task.await;
                     let _ = render_task.await;
 
@@ -927,8 +1046,11 @@ async fn execute_foreground(manifest_arg: String, config: crate::config::Config)
                             println!("\x1b[33m\u{23fa} [plan-executor]\x1b[0m sub-agent {} skipped (can-fail): {}",
                                 r.index, r.stderr.lines().next().unwrap_or("(no stderr)"));
                         } else {
-                            eprintln!("\x1b[31m\u{23fa} [plan-executor] sub-agent {} failed: {}\x1b[0m",
-                                r.index, r.stderr.lines().next().unwrap_or("(no stderr)"));
+                            eprintln!(
+                                "\x1b[31m\u{23fa} [plan-executor] sub-agent {} failed: {}\x1b[0m",
+                                r.index,
+                                r.stderr.lines().next().unwrap_or("(no stderr)")
+                            );
                         }
                     }
 
@@ -940,8 +1062,10 @@ async fn execute_foreground(manifest_arg: String, config: crate::config::Config)
 
                     crate::executor::consume_handoffs(&state_file);
 
-                    println!("\x1b[33m\u{23fa} [plan-executor]\x1b[0m resuming session {}",
-                        &session_id[..session_id.len().min(16)]);
+                    println!(
+                        "\x1b[33m\u{23fa} [plan-executor]\x1b[0m resuming session {}",
+                        &session_id[..session_id.len().min(16)]
+                    );
 
                     let continuation = handoff::build_continuation(&results);
                     match handoff::resume_execution(
@@ -951,7 +1075,9 @@ async fn execute_foreground(manifest_arg: String, config: crate::config::Config)
                         Some(job_id.clone()),
                         Some(resolved_path.clone()),
                         &config.agents.main,
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok((new_child, _new_pgid, new_rx)) => {
                             child = new_child;
                             exec_rx = new_rx;
@@ -994,7 +1120,9 @@ async fn execute_foreground(manifest_arg: String, config: crate::config::Config)
                                 Some(job_id.clone()),
                                 Some(resolved_path.clone()),
                                 &config.agents.main,
-                            ).await {
+                            )
+                            .await
+                            {
                                 Ok((new_child, _new_pgid, new_rx)) => {
                                     child = new_child;
                                     exec_rx = new_rx;
@@ -1057,7 +1185,8 @@ async fn execute_via_daemon(
 
     let is_remote = crate::plan::parse_execution_mode(&plan) == crate::plan::ExecutionMode::Remote;
 
-    let stream = UnixStream::connect(crate::ipc::socket_path()).await
+    let stream = UnixStream::connect(crate::ipc::socket_path())
+        .await
         .context("Daemon not reachable")?;
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half).lines();
@@ -1068,15 +1197,28 @@ async fn execute_via_daemon(
 
     let mut existing_ids = std::collections::HashSet::<String>::new();
     if let Ok(Some(line)) = reader.next_line().await {
-        if let Ok(DaemonEvent::State { running_jobs, history, .. }) = serde_json::from_str(&line) {
-            existing_ids = running_jobs.iter().chain(history.iter()).map(|j| j.id.clone()).collect();
+        if let Ok(DaemonEvent::State {
+            running_jobs,
+            history,
+            ..
+        }) = serde_json::from_str(&line)
+        {
+            existing_ids = running_jobs
+                .iter()
+                .chain(history.iter())
+                .map(|j| j.id.clone())
+                .collect();
         }
     }
 
     // Trigger execution.
     let manifest_str = manifest_path.to_string_lossy().to_string();
-    let req = serde_json::to_string(&TuiRequest::Execute { manifest_path: manifest_str })?;
-    write_half.write_all(format!("{}\n", req).as_bytes()).await?;
+    let req = serde_json::to_string(&TuiRequest::Execute {
+        manifest_path: manifest_str,
+    })?;
+    write_half
+        .write_all(format!("{}\n", req).as_bytes())
+        .await?;
 
     let filename = plan.file_name().and_then(|n| n.to_str()).unwrap_or("?");
 
@@ -1136,8 +1278,8 @@ async fn execute_via_daemon(
 /// corresponding daemon request, and prints the result.
 fn daemon_job_request(action: &str, job_id_prefix: &str) {
     use crate::ipc::{DaemonEvent, TuiRequest};
-    use std::os::unix::net::UnixStream;
     use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
 
     let sock = crate::ipc::socket_path();
     if !sock.exists() {
@@ -1147,7 +1289,10 @@ fn daemon_job_request(action: &str, job_id_prefix: &str) {
 
     let mut stream = match UnixStream::connect(&sock) {
         Ok(s) => s,
-        Err(e) => { eprintln!("Cannot connect to daemon: {}", e); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("Cannot connect to daemon: {}", e);
+            std::process::exit(1);
+        }
     };
 
     // Get state to resolve job ID prefix.
@@ -1158,7 +1303,8 @@ fn daemon_job_request(action: &str, job_id_prefix: &str) {
     let _ = reader.read_line(&mut line);
 
     let full_id = if let Ok(DaemonEvent::State { running_jobs, .. }) = serde_json::from_str(&line) {
-        running_jobs.into_iter()
+        running_jobs
+            .into_iter()
             .find(|j| j.id.starts_with(job_id_prefix))
             .map(|j| j.id)
     } else {
@@ -1171,9 +1317,15 @@ fn daemon_job_request(action: &str, job_id_prefix: &str) {
     };
 
     let req = match action {
-        "kill"    => TuiRequest::KillJob   { job_id: job_id.clone() },
-        "pause"   => TuiRequest::PauseJob  { job_id: job_id.clone() },
-        "unpause" => TuiRequest::ResumeJob { job_id: job_id.clone() },
+        "kill" => TuiRequest::KillJob {
+            job_id: job_id.clone(),
+        },
+        "pause" => TuiRequest::PauseJob {
+            job_id: job_id.clone(),
+        },
+        "unpause" => TuiRequest::ResumeJob {
+            job_id: job_id.clone(),
+        },
         _ => unreachable!(),
     };
 
@@ -1194,7 +1346,10 @@ fn list_jobs() {
 
     let mut s = match UnixStream::connect(crate::ipc::socket_path()) {
         Ok(s) => s,
-        Err(e) => { eprintln!("Cannot connect to daemon: {}", e); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("Cannot connect to daemon: {}", e);
+            std::process::exit(1);
+        }
     };
     let gs = serde_json::to_string(&TuiRequest::GetState).unwrap_or_default();
     let _ = s.write_all(format!("{}\n", gs).as_bytes());
@@ -1202,20 +1357,26 @@ fn list_jobs() {
     let mut line = String::new();
     let _ = reader.read_line(&mut line);
 
-    let (jobs, job_processes): (Vec<JobMetadata>, std::collections::HashMap<String, crate::ipc::JobProcesses>) =
-        if let Ok(DaemonEvent::State { running_jobs, history, running_processes, .. }) =
-            serde_json::from_str::<DaemonEvent>(&line)
-        {
-            let jobs: Vec<JobMetadata> = running_jobs.into_iter().chain(history).collect();
-            let map: std::collections::HashMap<_, _> = running_processes
-                .into_iter()
-                .map(|p| (p.job_id.clone(), p))
-                .collect();
-            (jobs, map)
-        } else {
-            eprintln!("Unexpected response from daemon.");
-            std::process::exit(1);
-        };
+    let (jobs, job_processes): (
+        Vec<JobMetadata>,
+        std::collections::HashMap<String, crate::ipc::JobProcesses>,
+    ) = if let Ok(DaemonEvent::State {
+        running_jobs,
+        history,
+        running_processes,
+        ..
+    }) = serde_json::from_str::<DaemonEvent>(&line)
+    {
+        let jobs: Vec<JobMetadata> = running_jobs.into_iter().chain(history).collect();
+        let map: std::collections::HashMap<_, _> = running_processes
+            .into_iter()
+            .map(|p| (p.job_id.clone(), p))
+            .collect();
+        (jobs, map)
+    } else {
+        eprintln!("Unexpected response from daemon.");
+        std::process::exit(1);
+    };
 
     if jobs.is_empty() {
         println!("No jobs found.");
@@ -1242,16 +1403,21 @@ fn list_jobs() {
 
     for job in &jobs {
         let id = &job.id[..job.id.len().min(8)];
-        let plan = job.plan_path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        let plan = job
+            .plan_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?");
         let plan_display = truncate_str(plan, plan_w);
         let status = match job.status {
-            JobStatus::Success       => "success",
-            JobStatus::Failed        => "failed",
-            JobStatus::Killed        => "killed",
-            JobStatus::Running       => "running",
+            JobStatus::Success => "success",
+            JobStatus::Failed => "failed",
+            JobStatus::Killed => "killed",
+            JobStatus::Running => "running",
             JobStatus::RemoteRunning => "remote",
         };
-        let duration = job.duration_ms
+        let duration = job
+            .duration_ms
             .map(|ms| format_duration(ms / 1000))
             .unwrap_or_else(|| "-".to_string());
         let last = if matches!(job.status, JobStatus::Running) {
@@ -1293,12 +1459,18 @@ fn list_jobs() {
                 // can be wider ("succeeded" is 9 chars), and a hard-coded
                 // 8 here silently pushes the target past term_w and wraps
                 // the last character.
-                let r_status_w = remote_jobs.iter()
+                let r_status_w = remote_jobs
+                    .iter()
                     .map(|rj| rj.status.len())
-                    .max().unwrap_or(8).max(8);
-                let r_target_w = remote_jobs.iter()
+                    .max()
+                    .unwrap_or(8)
+                    .max(8);
+                let r_target_w = remote_jobs
+                    .iter()
                     .map(|rj| rj.target.len())
-                    .max().unwrap_or(6).max(6);
+                    .max()
+                    .unwrap_or(6)
+                    .max(6);
                 let r_dur_w = 10;
                 let r_gaps = 8; // 4 gaps × 2 spaces
                 let r_plan_w = term_w
@@ -1380,7 +1552,10 @@ fn stop_daemon() {
         let _ = std::fs::remove_file(&pid_path);
         println!("Daemon stopped (pid={}).", pid);
     } else {
-        eprintln!("Failed to stop daemon (pid={}). It may have already exited.", pid);
+        eprintln!(
+            "Failed to stop daemon (pid={}). It may have already exited.",
+            pid
+        );
         std::process::exit(1);
     }
 }
@@ -1406,7 +1581,9 @@ fn daemonize() {
             .lines()
             .filter(|p| p.trim() != our_pid)
             .filter_map(|p| p.trim().parse::<libc::pid_t>().ok())
-            .inspect(|&pid| { unsafe { libc::kill(pid, libc::SIGTERM); } })
+            .inspect(|&pid| unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            })
             .count();
         if killed > 0 {
             std::thread::sleep(std::time::Duration::from_millis(300));
@@ -1424,7 +1601,9 @@ fn daemonize() {
         .append(true)
         .open(&log_path)
         .expect("failed to open daemon log file");
-    let log_stderr = log_file.try_clone().expect("failed to clone log file handle");
+    let log_stderr = log_file
+        .try_clone()
+        .expect("failed to clone log file handle");
 
     // No .pid_file() — we write the PID ourselves in run_daemon() after fork.
     // Using pid_file() here creates a lock that conflicts when restarting.
@@ -1460,7 +1639,11 @@ fn remote_setup() {
     let mut stdout = io::stdout();
 
     // Check gh CLI
-    if std::process::Command::new("gh").arg("--version").output().is_err() {
+    if std::process::Command::new("gh")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
         eprintln!("Error: gh CLI not found. Install: https://cli.github.com");
         std::process::exit(1);
     }
@@ -1475,9 +1658,15 @@ fn remote_setup() {
             .args(["api", "user", "--jq", ".login"])
             .output()
             .ok()
-            .and_then(|o| if o.status.success() {
-                String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
-            } else { None });
+            .and_then(|o| {
+                if o.status.success() {
+                    String::from_utf8(o.stdout)
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                } else {
+                    None
+                }
+            });
         match gh_user {
             Some(user) if !user.is_empty() => format!("{}/plan-executions", user),
             _ => "owner/plan-executions".to_string(),
@@ -1495,7 +1684,10 @@ fn remote_setup() {
     };
 
     if !crate::remote::validate_repo_slug(&remote_repo) {
-        eprintln!("Error: invalid repo slug '{}'. Expected format: owner/repo", remote_repo);
+        eprintln!(
+            "Error: invalid repo slug '{}'. Expected format: owner/repo",
+            remote_repo
+        );
         std::process::exit(1);
     }
 
@@ -1587,7 +1779,10 @@ fn remote_setup() {
                     Err(e) => eprintln!("  Error reading {}: {}", auth_path.display(), e),
                 }
             } else {
-                eprintln!("  {} not found. Run codex login first.", auth_path.display());
+                eprintln!(
+                    "  {} not found. Run codex login first.",
+                    auth_path.display()
+                );
             }
         }
         "a" | "api" => {
@@ -1665,13 +1860,19 @@ fn configure_commit_signing(
 
     let mut rotating = false;
     if already_set {
-        print!("  GPG_SIGNING_KEY already set on {}. (r)otate / (s)kip [default: skip]: ", remote_repo);
+        print!(
+            "  GPG_SIGNING_KEY already set on {}. (r)otate / (s)kip [default: skip]: ",
+            remote_repo
+        );
         let _ = stdout.flush();
         let mut choice = String::new();
         let _ = stdin.lock().read_line(&mut choice);
         match choice.trim() {
             "r" | "rotate" => rotating = true,
-            _ => { println!("  Skipped."); return; }
+            _ => {
+                println!("  Skipped.");
+                return;
+            }
         }
     }
 
@@ -1680,7 +1881,10 @@ fn configure_commit_signing(
     let fingerprint = if rotating {
         match generate_new_ci_key(stdin, stdout) {
             Some(fp) => fp,
-            None => { println!("  Skipped."); return; }
+            None => {
+                println!("  Skipped.");
+                return;
+            }
         }
     } else if let Some(existing) = crate::remote::find_ci_signing_key() {
         let short = short_fingerprint(&existing.fingerprint);
@@ -1697,14 +1901,23 @@ fn configure_commit_signing(
             "" | "u" | "use" => existing.fingerprint,
             "g" | "generate" => match generate_new_ci_key(stdin, stdout) {
                 Some(fp) => fp,
-                None => { println!("  Skipped."); return; }
+                None => {
+                    println!("  Skipped.");
+                    return;
+                }
             },
-            _ => { println!("  Skipped."); return; }
+            _ => {
+                println!("  Skipped.");
+                return;
+            }
         }
     } else {
         match generate_new_ci_key(stdin, stdout) {
             Some(fp) => fp,
-            None => { println!("  Skipped."); return; }
+            None => {
+                println!("  Skipped.");
+                return;
+            }
         }
     };
 
@@ -1726,7 +1939,8 @@ fn configure_commit_signing(
             },
             Err(e) => eprintln!("  Warning: could not export public key: {e}"),
         },
-        Ok(GithubGpgKeyCheck::MissingScope) => match crate::remote::gpg_export_public(&fingerprint) {
+        Ok(GithubGpgKeyCheck::MissingScope) => match crate::remote::gpg_export_public(&fingerprint)
+        {
             Ok(pub_armored) => print_gpg_upload_fallback(&pub_armored),
             Err(e) => eprintln!("  Warning: could not export public key: {e}"),
         },
@@ -1735,23 +1949,27 @@ fn configure_commit_signing(
 
     // Private key secret.
     match crate::remote::gpg_export_secret(&fingerprint) {
-        Ok(secret) => match crate::remote::gh_secret_set_stdin("GPG_SIGNING_KEY", remote_repo, &secret) {
-            Ok(()) => println!("  Stored GPG_SIGNING_KEY."),
-            Err(e) => eprintln!("  Error storing GPG_SIGNING_KEY: {e}"),
-        },
+        Ok(secret) => {
+            match crate::remote::gh_secret_set_stdin("GPG_SIGNING_KEY", remote_repo, &secret) {
+                Ok(()) => println!("  Stored GPG_SIGNING_KEY."),
+                Err(e) => eprintln!("  Error storing GPG_SIGNING_KEY: {e}"),
+            }
+        }
         Err(e) => eprintln!("  Error exporting secret key: {e}"),
     }
-    if let Err(e) = crate::remote::gh_secret_set_stdin("GPG_SIGNING_KEY_ID", remote_repo, &fingerprint) {
+    if let Err(e) =
+        crate::remote::gh_secret_set_stdin("GPG_SIGNING_KEY_ID", remote_repo, &fingerprint)
+    {
         eprintln!("  Error storing GPG_SIGNING_KEY_ID: {e}");
     } else {
-        println!("  Stored GPG_SIGNING_KEY_ID ({}).", short_fingerprint(&fingerprint));
+        println!(
+            "  Stored GPG_SIGNING_KEY_ID ({}).",
+            short_fingerprint(&fingerprint)
+        );
     }
 }
 
-fn generate_new_ci_key(
-    stdin: &std::io::Stdin,
-    stdout: &mut std::io::Stdout,
-) -> Option<String> {
+fn generate_new_ci_key(stdin: &std::io::Stdin, stdout: &mut std::io::Stdout) -> Option<String> {
     use std::io::{BufRead, Write};
 
     let default_name = default_commit_name();
@@ -1782,7 +2000,12 @@ fn generate_new_ci_key(
     println!("  Generating ed25519 signing key (no passphrase)...");
     match crate::remote::gpg_generate_ci_key(&name, &email) {
         Ok(fp) => {
-            println!("  Generated {} ({} <{}>).", short_fingerprint(&fp), name, email);
+            println!(
+                "  Generated {} ({} <{}>).",
+                short_fingerprint(&fp),
+                name,
+                email
+            );
             Some(fp)
         }
         Err(e) => {
@@ -1845,7 +2068,11 @@ fn gh_user_field(field: &str) -> Option<String> {
         return None;
     }
     let v = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if v.is_empty() || v == "null" { None } else { Some(v) }
+    if v.is_empty() || v == "null" {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 fn short_fingerprint(fp: &str) -> String {
@@ -1878,12 +2105,18 @@ fn print_gpg_upload_fallback(armored_public: &str) {
     println!("  (Setup continues — the private key secret is already stored.)");
 }
 
-fn notify_daemon_track_remote(plan_path: String, remote_repo: String, pr_number: u64) -> Result<()> {
+fn notify_daemon_track_remote(
+    plan_path: String,
+    remote_repo: String,
+    pr_number: u64,
+) -> Result<()> {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     let mut s = UnixStream::connect(crate::ipc::socket_path())?;
     let req = serde_json::to_string(&crate::ipc::TuiRequest::TrackRemote {
-        plan_path, remote_repo, pr_number,
+        plan_path,
+        remote_repo,
+        pr_number,
     })?;
     s.write_all(format!("{}\n", req).as_bytes())?;
     Ok(())
@@ -1910,8 +2143,11 @@ mod tests {
             *self.captured_args.borrow_mut() = args.iter().map(|p| p.to_path_buf()).collect();
             let output_dir = args[2];
             let target = output_dir.join("tasks.json");
-            fs::write(target, serde_json::to_vec_pretty(&self.post_manifest).unwrap())
-                .map_err(|e| format!("fake write: {e}"))?;
+            fs::write(
+                target,
+                serde_json::to_vec_pretty(&self.post_manifest).unwrap(),
+            )
+            .map_err(|e| format!("fake write: {e}"))?;
             // Materialize every referenced prompt_file so the post-append
             // semantic_check (added per F4) accepts the synthetic manifest.
             if let Some(tasks) = self.post_manifest.get("tasks").and_then(|v| v.as_object()) {
@@ -1956,7 +2192,11 @@ mod tests {
         let exec_root = tmp.path().to_path_buf();
         // Pre-write tasks.json
         let pre = pre_manifest();
-        fs::write(exec_root.join("tasks.json"), serde_json::to_vec_pretty(&pre).unwrap()).unwrap();
+        fs::write(
+            exec_root.join("tasks.json"),
+            serde_json::to_vec_pretty(&pre).unwrap(),
+        )
+        .unwrap();
 
         // Pre-write findings.json
         let findings_path = exec_root.join("findings-input.json");
@@ -1968,9 +2208,12 @@ mod tests {
 
         // Build the post-append manifest the fake will write.
         let mut post = pre.clone();
-        post["waves"].as_array_mut().unwrap().push(serde_json::json!({
-            "id": 100, "task_ids": ["fix-100-1"], "depends_on": [1], "kind": "fix"
-        }));
+        post["waves"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": 100, "task_ids": ["fix-100-1"], "depends_on": [1], "kind": "fix"
+            }));
         post["tasks"]["fix-100-1"] = serde_json::json!({
             "prompt_file": "tasks/task-fix-100-1.md", "agent_type": "claude"
         });
@@ -2013,8 +2256,13 @@ mod tests {
         }
 
         let plan_path = std::path::PathBuf::from("/tmp/plan.md");
-        let err = run_compile_fix_waves_with_invoker(&NeverInvoker, &plan_path, &exec_root, &findings_path)
-            .expect_err("missing manifest must error");
+        let err = run_compile_fix_waves_with_invoker(
+            &NeverInvoker,
+            &plan_path,
+            &exec_root,
+            &findings_path,
+        )
+        .expect_err("missing manifest must error");
         let msg = format!("{err}");
         assert!(msg.contains("manifest not found"), "msg was: {msg}");
     }
@@ -2041,8 +2289,13 @@ mod tests {
         }
 
         let plan_path = std::path::PathBuf::from("/tmp/plan.md");
-        let err = run_compile_fix_waves_with_invoker(&NeverInvoker, &plan_path, &exec_root, &findings_path)
-            .expect_err("malformed findings must error");
+        let err = run_compile_fix_waves_with_invoker(
+            &NeverInvoker,
+            &plan_path,
+            &exec_root,
+            &findings_path,
+        )
+        .expect_err("malformed findings must error");
         let _ = err;
     }
 
