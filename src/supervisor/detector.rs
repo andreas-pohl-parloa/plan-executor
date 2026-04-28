@@ -35,12 +35,32 @@ use serde_json::Value;
 
 use crate::supervisor::violation::ProtocolViolation;
 
-/// Pure detector: classify a single parsed stream-json turn.
+/// Pure detector: given a single parsed stream-json turn, returns the list
+/// of violations observed in that turn. Empty Vec means the turn looks
+/// clean to the supervisor.
 ///
-/// The input is expected to be the JSON object emitted on a single
-/// `event: assistant` line of the stream — i.e., what the daemon's
-/// stream-json parser already deserializes. Returns an empty Vec if the
-/// turn shows no violations the detector knows about.
+/// **Detection order** (the order matters because `observe_turn` recovers
+/// using the FIRST returned violation, even when several are detected in
+/// the same turn):
+///
+/// 1. `ForbiddenTool` — most actionable correction; the orchestrator must
+///    redo the work via the legal tool surface.
+/// 2. `ScheduleWakeupInNonInteractive` — easy to detect, surface early so
+///    the orchestrator stops scheduling a no-op.
+/// 3. `PostHandoffToolUse` — turn-shape violation; the daemon will SIGKILL
+///    the session if it repeats.
+/// 4. `DanglingNarration` — same shape class but text-only.
+/// 5. `UnboundedPollEmitted` — heuristic; lowest priority because false
+///    positives are non-zero (see `detect_unbounded_poll` doc-comment).
+///
+/// Phase B1.1 is conservative: detect only the patterns documented below.
+/// Phase F mines production logs to expand coverage.
+///
+/// `HandoffsArrayEmpty`, `HandoffsArrayMissing`, `StateFileMalformed`, and
+/// `SkillBoundaryCrossed` require knowledge the detector doesn't have from
+/// a single turn (state-file contents, phase context). These are produced
+/// by a separate state-file inspector (Phase B2.1+ daemon-side wiring), not
+/// by this function.
 #[must_use]
 pub fn detect(turn: &Value) -> Vec<ProtocolViolation> {
     let mut out = Vec::new();
@@ -135,6 +155,29 @@ fn detect_dangling_narration(turn: &Value, out: &mut Vec<ProtocolViolation>) {
     }
 }
 
+/// Heuristic detector for unbounded poll loops in Bash tool calls.
+///
+/// Flags Bash commands that contain `while`/`until` AND `sleep` AND no
+/// obvious break condition (`break`, `exit`, `&&`).
+///
+/// **Known false positives** (will be calibrated in Phase F log mining):
+///   * `while read line; do ...; sleep 0.1; done < input.txt` — bounded
+///     by EOF on stdin; no break/exit/`&&` substring.
+///   * `while sleep 1; do cmd_that_eventually_returns_nonzero; done` —
+///     bounded by command exit code in the loop condition.
+///   * `until pgrep foo > /dev/null 2>&1; do sleep 1; done` — strictly
+///     unbounded but a frequent legit "wait until process appears" idiom.
+///
+/// **Known false negatives:**
+///   * Loops that include the literal substring `&&` *anywhere* are not
+///     flagged, even if the `&&` is unrelated to break logic
+///     (e.g., `until [ -f done ]; do sleep 1 && echo waiting; done`).
+///   * Loops with break logic in named functions (e.g.,
+///     `break_after_10_iterations`) are flagged because the substring
+///     `break` is matched but not the actual semantic break.
+///
+/// Phase F log mining will tighten these heuristics against real
+/// production transcripts.
 fn detect_unbounded_poll(turn: &Value, out: &mut Vec<ProtocolViolation>) {
     for tu in tool_uses(turn) {
         if tu.get("name").and_then(Value::as_str) != Some("Bash") {
@@ -396,6 +439,33 @@ mod tests {
             )
         });
         assert_eq!(any_state, false);
+    }
+
+    #[test]
+    fn unbounded_poll_flags_known_false_positive_while_read() {
+        // Locks the current FP behavior so a future Phase F change has to
+        // explicitly update this test.
+        let turn = serde_json::json!({
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Bash",
+                        "input": {
+                            "command": "while read line; do echo $line; sleep 0.1; done < input.txt"
+                        }
+                    }
+                ]
+            }
+        });
+        let v = detect(&turn);
+        // Currently a false positive: the heuristic flags this as unbounded.
+        assert_eq!(
+            v.len(),
+            1,
+            "FP class: while-read-EOF-bounded loops are currently flagged. \
+             If Phase F tightens the detector, update this test."
+        );
     }
 
     #[test]

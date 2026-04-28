@@ -36,6 +36,10 @@ pub enum ProtocolViolation {
     StateFileMalformed { path: String, error: String },
     /// Free-form narration (non-empty `text` block) appears AFTER a
     /// `call sub-agent` line in the same turn.
+    ///
+    /// `byte_offset` is the byte offset within the *text block* that contains
+    /// the trailing narration (NOT a turn-global offset). Phase D consumers
+    /// should treat it as a hint for log rendering, not as an absolute pointer.
     DanglingNarration { sample: String, byte_offset: usize },
     /// `ScheduleWakeup` was invoked in a non-interactive run, where it is
     /// unsupported.

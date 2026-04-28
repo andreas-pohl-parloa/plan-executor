@@ -82,6 +82,15 @@ fn cmd_show(id_prefix: &str) -> Result<()> {
     Err(anyhow!("no job matching prefix {id_prefix:?}"))
 }
 
+/// Cancel a new-layout job by id prefix.
+///
+/// Refuses to cancel jobs already in a terminal state (`Succeeded` or
+/// `Failed`); cancelling a terminal job would only rewrite the failure
+/// reason and is treated as user error.
+///
+/// Note: this is a metadata-only mutation. Killing a still-running daemon
+/// process is a Phase D feature; for now use `plan-executor kill <id>` to
+/// stop a running job at the OS level.
 fn cmd_cancel(id_prefix: &str) -> Result<()> {
     let store = JobStore::new()?;
     let found_id = find_new_id_by_prefix(&store, id_prefix)?.ok_or_else(|| {
@@ -89,6 +98,7 @@ fn cmd_cancel(id_prefix: &str) -> Result<()> {
     })?;
     let dir = store.open(&found_id)?;
     let mut job: Job = dir.read_job()?;
+    assert_cancellable(&job)?;
     job.state = JobState::Failed {
         reason: "cancelled by user".to_string(),
         recoverable: false,
@@ -98,14 +108,51 @@ fn cmd_cancel(id_prefix: &str) -> Result<()> {
     Ok(())
 }
 
+/// Errors when `job` is already in a terminal state and cannot be cancelled.
+fn assert_cancellable(job: &Job) -> Result<()> {
+    if matches!(job.state, JobState::Succeeded | JobState::Failed { .. }) {
+        return Err(anyhow!(
+            "job {} is already terminal (state: {}); cancel is a no-op",
+            job.id.0,
+            state_label(&job.state),
+        ));
+    }
+    Ok(())
+}
+
 fn cmd_gc(older_than: Option<&str>) -> Result<()> {
     let threshold = parse_duration(older_than.unwrap_or("30d"))?;
+    let store = JobStore::new()?;
+    let (deleted, failures) = gc_with_store(&store, threshold)?;
+    println!(
+        "Garbage-collected {deleted} job director{}.",
+        if deleted == 1 { "y" } else { "ies" }
+    );
+    for (path, err) in &failures {
+        eprintln!("  Failed: {} — {}", path.display(), err);
+    }
+    Ok(())
+}
+
+/// Garbage-collect terminal job directories older than `threshold`.
+///
+/// Returns the count of removed directories and a list of `(path, error)`
+/// pairs for entries that could not be processed (failed metadata read,
+/// missing creation/modification time, or `remove_dir_all` failure). Entries
+/// that are simply not yet old enough are silently skipped (not failures).
+///
+/// # Errors
+///
+/// Returns the underlying `JobStore::list_all` error or, in the unlikely
+/// event that `now - threshold` underflows the system time, an `anyhow`
+/// error describing the overflow.
+fn gc_with_store(store: &JobStore, threshold: Duration) -> Result<(usize, Vec<(PathBuf, String)>)> {
     let cutoff = SystemTime::now()
         .checked_sub(threshold)
         .ok_or_else(|| anyhow!("threshold too large"))?;
-    let store = JobStore::new()?;
     let entries = store.list_all()?;
-    let mut deleted = 0_u32;
+    let mut deleted: usize = 0;
+    let mut failures: Vec<(PathBuf, String)> = Vec::new();
     for entry in entries {
         let (path, completed) = match &entry {
             JobStoreEntry::New { summary, path } => {
@@ -117,21 +164,29 @@ fn cmd_gc(older_than: Option<&str>) -> Result<()> {
         if !completed {
             continue;
         }
-        let Ok(metadata) = fs::metadata(&path) else {
-            continue;
-        };
-        let created = metadata.created().or_else(|_| metadata.modified()).ok();
-        if let Some(t) = created {
-            if t < cutoff && fs::remove_dir_all(&path).is_ok() {
-                deleted += 1;
+        let metadata = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                failures.push((path.clone(), format!("metadata: {e}")));
+                continue;
             }
+        };
+        let created = match metadata.created().or_else(|_| metadata.modified()) {
+            Ok(t) => t,
+            Err(e) => {
+                failures.push((path.clone(), format!("no created/modified time: {e}")));
+                continue;
+            }
+        };
+        if created >= cutoff {
+            continue;
+        }
+        match fs::remove_dir_all(&path) {
+            Ok(()) => deleted += 1,
+            Err(e) => failures.push((path.clone(), format!("remove_dir_all: {e}"))),
         }
     }
-    println!(
-        "Garbage-collected {deleted} job director{}.",
-        if deleted == 1 { "y" } else { "ies" }
-    );
-    Ok(())
+    Ok((deleted, failures))
 }
 
 fn cmd_replay(id: &str, from_step: Option<u32>) -> Result<()> {
@@ -141,14 +196,30 @@ fn cmd_replay(id: &str, from_step: Option<u32>) -> Result<()> {
 }
 
 fn find_new_id_by_prefix(store: &JobStore, prefix: &str) -> Result<Option<JobId>> {
-    for entry in store.list_all()? {
-        if let JobStoreEntry::New { summary, .. } = entry {
-            if summary.id.0.starts_with(prefix) {
-                return Ok(Some(summary.id));
+    let matches: Vec<JobId> = store
+        .list_all()?
+        .into_iter()
+        .filter_map(|entry| match entry {
+            JobStoreEntry::New { summary, .. } if summary.id.0.starts_with(prefix) => {
+                Some(summary.id)
             }
+            _ => None,
+        })
+        .collect();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.into_iter().next()),
+        n => {
+            let ids = matches
+                .iter()
+                .map(|id| id.0.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(anyhow!(
+                "ambiguous prefix {prefix:?}: matches {n} jobs ({ids})"
+            ))
         }
     }
-    Ok(None)
 }
 
 fn state_label(s: &JobState) -> String {
@@ -450,5 +521,88 @@ mod tests {
             "remote_running".to_string(),
         );
         assert_eq!(labels, expected);
+    }
+
+    use crate::job::types::{Job, JobKind};
+    use tempfile::TempDir;
+
+    fn make_job(id: &str, state: JobState) -> Job {
+        Job {
+            id: JobId(id.to_string()),
+            kind: JobKind::Plan {
+                manifest_path: PathBuf::from("/tmp/manifest.json"),
+            },
+            state,
+            created_at: "2026-04-28T10:00:00Z".to_string(),
+            steps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn assert_cancellable_rejects_succeeded_job() {
+        let job = make_job("job-succ", JobState::Succeeded);
+        let err = assert_cancellable(&job).expect_err("should be Err");
+        let msg = err.to_string();
+        assert_eq!(msg.contains("already terminal"), true);
+    }
+
+    #[test]
+    fn assert_cancellable_rejects_failed_job() {
+        let job = make_job(
+            "job-fail",
+            JobState::Failed {
+                reason: "boom".to_string(),
+                recoverable: false,
+            },
+        );
+        let err = assert_cancellable(&job).expect_err("should be Err");
+        let msg = err.to_string();
+        assert_eq!(msg.contains("already terminal"), true);
+    }
+
+    #[test]
+    fn assert_cancellable_allows_running_job() {
+        let job = make_job("job-run", JobState::Running);
+        let result = assert_cancellable(&job).is_ok();
+        assert_eq!(result, true);
+    }
+
+    #[test]
+    fn find_new_id_by_prefix_errors_on_ambiguous_prefix() {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = JobStore::with_base(tmp.path().to_path_buf()).expect("store");
+        store
+            .create(&make_job("job-shared-a", JobState::Pending))
+            .expect("create a");
+        store
+            .create(&make_job("job-shared-b", JobState::Pending))
+            .expect("create b");
+
+        let err = find_new_id_by_prefix(&store, "job-shared").expect_err("should be Err");
+        let msg = err.to_string();
+        assert_eq!(msg.contains("ambiguous prefix"), true);
+    }
+
+    #[test]
+    fn gc_with_store_reports_failure_for_missing_path() {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = JobStore::with_base(tmp.path().to_path_buf()).expect("store");
+        let job_dir = tmp.path().join("orphan-job");
+        fs::create_dir_all(&job_dir).expect("orphan dir");
+        fs::write(job_dir.join("metadata.json"), b"{}").expect("metadata");
+        let _ = store
+            .create(&make_job("job-pending", JobState::Pending))
+            .expect("pending");
+
+        let (deleted, failures) = gc_with_store(&store, Duration::from_secs(0)).expect("gc");
+
+        let pending_terminal = matches!(
+            make_job("job-pending", JobState::Pending).state,
+            JobState::Succeeded | JobState::Failed { .. }
+        );
+        assert_eq!(
+            (deleted, failures.is_empty(), pending_terminal),
+            (0, true, false)
+        );
     }
 }

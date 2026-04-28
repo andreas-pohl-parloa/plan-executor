@@ -17,6 +17,12 @@ pub enum RecoveryPolicy {
         to: CheckpointTarget,
         then: Box<RecoveryPolicy>,
     },
+    /// Sequence-of-policies composition.
+    ///
+    /// **Wire-format note:** the `policies` field name is part of the serialized
+    /// representation (`{"kind":"compose","policies":[...]}`). Do NOT rename
+    /// without a migration — Phase D and later phases persist this enum to
+    /// `~/.plan-executor/jobs/<id>/job.json`.
     Compose {
         policies: Vec<RecoveryPolicy>,
     },
