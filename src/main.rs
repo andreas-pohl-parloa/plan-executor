@@ -6,11 +6,13 @@ mod executor;
 mod finding;
 mod handoff;
 mod ipc;
-mod remote;
+mod job;
 mod jobs;
 mod plan;
 mod proctree;
+mod remote;
 mod schema;
+mod supervisor;
 mod validate;
 
 pub use config::Config;

@@ -59,6 +59,9 @@ wait-timeout = "0.2"
 # Secure temp directory creation (used by compile::embedded_schema_path)
 tempfile = "3"
 
+# Async traits (used by Job framework Step trait)
+async-trait = "0.1"
+
 [dev-dependencies]
 tokio-test = "0.4"
 dirs = "6"
