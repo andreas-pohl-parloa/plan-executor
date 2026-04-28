@@ -235,7 +235,7 @@ impl CompileInvoker for ClaudeInvoker {
 
 /// Spawns a background thread that drains `reader` into a `Vec<u8>` of at
 /// most `cap` bytes. The thread joins cleanly once the pipe reaches EOF.
-fn spawn_drainer<R: Read + Send + 'static>(reader: R, cap: u64) -> JoinHandle<Vec<u8>> {
+pub(crate) fn spawn_drainer<R: Read + Send + 'static>(reader: R, cap: u64) -> JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut buf = Vec::with_capacity(8 * 1024);
         let mut limited = reader.take(cap);
@@ -245,7 +245,7 @@ fn spawn_drainer<R: Read + Send + 'static>(reader: R, cap: u64) -> JoinHandle<Ve
 }
 
 /// Joins a drainer thread, returning the captured bytes as a lossy UTF-8 string.
-fn join_drainer(handle: JoinHandle<Vec<u8>>) -> String {
+pub(crate) fn join_drainer(handle: JoinHandle<Vec<u8>>) -> String {
     match handle.join() {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(_) => String::new(),
@@ -525,7 +525,7 @@ fn is_disallowed_control_or_format(c: char) -> bool {
 
 /// Truncates `s` to at most `max_bytes` (cut on a char boundary) and appends
 /// a `... (truncated, N more bytes)` suffix when truncation occurred.
-fn truncate_for_error(s: &str, max_bytes: usize) -> String {
+pub(crate) fn truncate_for_error(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
@@ -721,7 +721,7 @@ const SCRUB_ENV_SUFFIXES: &[&str] = &[
 /// requires `ANTHROPIC_API_KEY` (or equivalent) to authenticate. Operators
 /// who run on a different auth mechanism may unset these explicitly before
 /// invoking `plan-executor`.
-fn scrubbed_env_command() -> Command {
+pub(crate) fn scrubbed_env_command() -> Command {
     let mut cmd = Command::new("claude");
     let names: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
     for k in vars_to_scrub(names.iter().map(String::as_str)) {

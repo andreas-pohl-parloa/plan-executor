@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parloa.dev/plan-executor/skills/pr-finalize/output.schema.json",
+  "title": "pr-finalize output (non-interactive)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "next_step", "notes", "state_updates"],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["success", "fix_required", "blocked", "abort"]
+    },
+    "next_step": {
+      "type": "string",
+      "enum": ["done", "address_findings", "wait_for_review", "terminate"]
+    },
+    "notes": {
+      "type": "string"
+    },
+    "state_updates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pr_state", "bugbot_comments_addressed"],
+      "properties": {
+        "pr_state": {
+          "type": "string",
+          "enum": ["OPEN", "MERGED", "CLOSED", "UNKNOWN"]
+        },
+        "merge_sha": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{40}$"
+        },
+        "bugbot_comments_addressed": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

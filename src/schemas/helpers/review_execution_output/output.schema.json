@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parloa.dev/plan-executor/skills/review-execution-output-non-interactive/output.schema.json",
+  "title": "review-execution-output-non-interactive output",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "next_step", "notes", "state_updates"],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["success", "fix_required", "blocked", "abort"]
+    },
+    "next_step": {
+      "type": "string",
+      "enum": ["proceed_to_validation", "dispatch_fix_wave", "escalate", "terminate"]
+    },
+    "notes": {
+      "type": "string"
+    },
+    "state_updates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["triaged_findings_path"],
+      "properties": {
+        "triaged_findings_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "wave_id_for_fix": {
+          "type": "integer",
+          "minimum": 100
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parloa.dev/plan-executor/skills/validate-execution-plan-non-interactive/output.schema.json",
+  "title": "validate-execution-plan-non-interactive output",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "next_step", "notes", "state_updates"],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["success", "fix_required", "blocked", "abort"]
+    },
+    "next_step": {
+      "type": "string",
+      "enum": ["proceed_to_pr", "dispatch_validation_fix", "escalate", "terminate"]
+    },
+    "notes": {
+      "type": "string"
+    },
+    "state_updates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["validation_report_path", "gaps"],
+      "properties": {
+        "validation_report_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "gaps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["goal", "missing_evidence"],
+            "properties": {
+              "goal":             { "type": "string", "minLength": 1 },
+              "missing_evidence": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    }
+  }
+}
