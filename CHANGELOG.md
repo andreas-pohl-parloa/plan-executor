@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.41.0] - 2026-04-28
+
+### Features
+
+- --remote flag for plan-executor run pr-finalize ([5055abc](https://github.com/andreas-pohl-parloa/plan-executor/commit/5055abcbc9466fb85980749abe0d3c9150990ea2))
 ## [0.40.1] - 2026-04-28
 
 ### Documentation
