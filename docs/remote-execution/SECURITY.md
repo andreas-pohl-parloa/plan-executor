@@ -5,7 +5,7 @@ execution flow (`execute-plan.yml` + `plan-executor remote-setup`). It
 exists separately from the workflow file so operators have somewhere to
 read before granting an execution repo access to their target repos.
 
-## GPG signing key reuse (Sec F-15)
+## GPG signing key reuse
 
 `plan-executor remote-setup` provisions a passphraseless ed25519 GPG
 signing key per user via the `find_ci_signing_key` flow:
@@ -30,8 +30,8 @@ signing key per user via the `find_ci_signing_key` flow:
 - The key never appears in workflow logs — `Configure commit signing`
   imports it via stdin and GitHub redacts the secret automatically.
   Untrusted plans cannot exfiltrate it through the install step
-  (Sec F-6 allow-list) or through `gh release download` (Sec F-14
-  checksum verification), but any code path that gets to run inside
+  (the marketplace/plugin allow-list) or through `gh release download`
+  (the checksum verification gate), but any code path that gets to run inside
   the runner has access to the same `gpg --export-secret-keys` that
   the trusted code uses. Reviewing every plan before merging the
   execution PR is the primary control.

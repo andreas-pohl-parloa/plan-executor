@@ -577,7 +577,7 @@ impl JobDir {
 ///
 /// Uses [`tempfile::NamedTempFile`] so each writer gets its own randomized
 /// temp filename — concurrent writers no longer race on a shared `<path>.tmp`
-/// (Codex #7 / F2 hardening). On error, the temp file is dropped (and its
+/// path. On error, the temp file is dropped (and its
 /// inode unlinked) automatically; on success, `persist` performs the rename
 /// atomically on the same filesystem.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {

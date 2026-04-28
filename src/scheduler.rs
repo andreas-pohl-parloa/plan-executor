@@ -437,7 +437,7 @@ fn build_handoffs(
             // confirm the joined path stays under `manifest_dir`. The
             // path-shape check already rejects `..` and absolute prompts,
             // but canonicalize gives us a real-filesystem guard against
-            // symlink-based escapes when both paths exist on disk (Sec F-3).
+            // symlink-based escapes when both paths exist on disk.
             validate_prompt_file_shape(tid, &task.prompt_file)?;
             if Path::new(&task.prompt_file).is_absolute() {
                 return Err(SchedulerError::Invariant(format!(
