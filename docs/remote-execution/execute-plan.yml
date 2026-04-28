@@ -19,8 +19,37 @@ jobs:
       - name: Checkout execution repo
         uses: actions/checkout@v4
 
+      - name: Detect job kind
+        id: kind
+        run: |
+          # Dispatch on job-spec.json `kind`. Missing file → fall back to
+          # `plan` for backward compatibility (pre-job-framework PRs) and
+          # emit a deprecation warning. Unknown kind → fail loudly.
+          if [ ! -f job-spec.json ]; then
+            echo "::warning::job-spec.json not found at PR branch root; falling back to plan execution. This fallback is deprecated — regenerate the execution PR with the current plan-executor handover skill."
+            echo "kind=plan" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          KIND=$(jq -r '.kind // empty' job-spec.json)
+          if [ -z "$KIND" ]; then
+            echo "::error::job-spec.json missing required 'kind' field"
+            exit 1
+          fi
+
+          case "$KIND" in
+            plan|pr-finalize)
+              echo "kind=${KIND}" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::Unknown job-spec.json kind: ${KIND} (expected: plan, pr-finalize)"
+              exit 1
+              ;;
+          esac
+
       - name: Parse and validate execution metadata
         id: meta
+        if: steps.kind.outputs.kind == 'plan'
         run: |
           TARGET_REPO=$(jq -r '.target_repo' execution.json)
           TARGET_REF=$(jq -r '.target_ref' execution.json)
@@ -53,7 +82,51 @@ jobs:
           echo "target_branch=${TARGET_BRANCH}" >> "$GITHUB_OUTPUT"
           echo "plan_filename=${PLAN_FILENAME}" >> "$GITHUB_OUTPUT"
 
+      - name: Parse and validate pr-finalize metadata
+        id: meta_pr_finalize
+        if: steps.kind.outputs.kind == 'pr-finalize'
+        run: |
+          # job-spec.json fields for pr-finalize:
+          #   pr           (required, integer PR number)
+          #   merge        (optional, bool — fast-forward merge after fixes)
+          #   merge_admin  (optional, bool — admin merge after fixes)
+          #   owner        (optional, string — defaults to current repo owner)
+          #   repo         (optional, string — defaults to current repo name)
+          PR=$(jq -r '.pr // empty' job-spec.json)
+          MERGE=$(jq -r '.merge // false' job-spec.json)
+          MERGE_ADMIN=$(jq -r '.merge_admin // false' job-spec.json)
+          OWNER=$(jq -r '.owner // empty' job-spec.json)
+          REPO=$(jq -r '.repo // empty' job-spec.json)
+
+          if [ -z "$PR" ] || ! echo "$PR" | grep -qP '^[0-9]+$'; then
+            echo "::error::pr-finalize job-spec.json: 'pr' must be a positive integer (got: '${PR}')"
+            exit 1
+          fi
+          if [ "$MERGE" = "true" ] && [ "$MERGE_ADMIN" = "true" ]; then
+            echo "::error::pr-finalize job-spec.json: 'merge' and 'merge_admin' are mutually exclusive"
+            exit 1
+          fi
+          if [ -n "$OWNER" ] && ! echo "$OWNER" | grep -qP '^[a-zA-Z0-9._-]+$'; then
+            echo "::error::Invalid owner: $OWNER"
+            exit 1
+          fi
+          if [ -n "$REPO" ] && ! echo "$REPO" | grep -qP '^[a-zA-Z0-9._-]+$'; then
+            echo "::error::Invalid repo: $REPO"
+            exit 1
+          fi
+          if { [ -n "$OWNER" ] && [ -z "$REPO" ]; } || { [ -z "$OWNER" ] && [ -n "$REPO" ]; }; then
+            echo "::error::pr-finalize job-spec.json: 'owner' and 'repo' must be set together"
+            exit 1
+          fi
+
+          echo "pr=${PR}" >> "$GITHUB_OUTPUT"
+          echo "merge=${MERGE}" >> "$GITHUB_OUTPUT"
+          echo "merge_admin=${MERGE_ADMIN}" >> "$GITHUB_OUTPUT"
+          echo "owner=${OWNER}" >> "$GITHUB_OUTPUT"
+          echo "repo=${REPO}" >> "$GITHUB_OUTPUT"
+
       - name: Clone target repo
+        if: steps.kind.outputs.kind == 'plan'
         env:
           TARGET_REPO: ${{ steps.meta.outputs.target_repo }}
           TARGET_REF: ${{ steps.meta.outputs.target_ref }}
@@ -136,17 +209,27 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
           PLAN_FILENAME: ${{ steps.meta.outputs.plan_filename }}
+          JOB_KIND: ${{ steps.kind.outputs.kind }}
         run: |
           git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
           git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "git@github.com:"
 
-          PLAN_FILE="plan.md"
-
-          # Always install the base marketplace and plugin
+          # Always install the base marketplace and plugin (needed by both
+          # `kind: plan` execution and `kind: pr-finalize` — the pr-finalize
+          # skill ships in plan-executor@plan-executor).
           echo "Adding marketplace: andreas-pohl-parloa/plan-executor-plugin"
           claude plugin marketplace add andreas-pohl-parloa/plan-executor-plugin || true
           echo "Installing plugin: plan-executor@plan-executor"
           claude plugin install plan-executor@plan-executor || true
+
+          # Plan-driven extra marketplaces/plugins are only relevant for
+          # `kind: plan`; pr-finalize jobs ship no plan.md.
+          if [ "$JOB_KIND" != "plan" ]; then
+            echo "Skipping plan-driven marketplace/plugin extensions (kind=${JOB_KIND})."
+            exit 0
+          fi
+
+          PLAN_FILE="plan.md"
 
           # Install additional marketplaces from **add-marketplaces:** header
           MARKETPLACES=$(grep -i '^\*\*add-marketplaces:\*\*' "$PLAN_FILE" | sed 's/.*\*\*[[:space:]]*//' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -177,6 +260,7 @@ jobs:
           CODEX_AUTH: ${{ secrets.CODEX_AUTH }}
 
       - name: Copy plan into target repo
+        if: steps.kind.outputs.kind == 'plan'
         env:
           PLAN_FILENAME: ${{ steps.meta.outputs.plan_filename }}
         run: |
@@ -198,6 +282,7 @@ jobs:
 
       - name: Execute plan
         id: execute
+        if: steps.kind.outputs.kind == 'plan'
         env:
           PLAN_FILENAME: ${{ steps.meta.outputs.plan_filename }}
           PLAN_EXECUTOR_LOCAL: "1"
@@ -209,24 +294,64 @@ jobs:
           cd workspace
           plan-executor execute -f .tmp-plan-compiled/tasks.json
 
+      - name: Run pr-finalize
+        id: pr_finalize
+        if: steps.kind.outputs.kind == 'pr-finalize'
+        env:
+          PLAN_EXECUTOR_LOCAL: "1"
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GH_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
+          PR: ${{ steps.meta_pr_finalize.outputs.pr }}
+          MERGE: ${{ steps.meta_pr_finalize.outputs.merge }}
+          MERGE_ADMIN: ${{ steps.meta_pr_finalize.outputs.merge_admin }}
+          OWNER: ${{ steps.meta_pr_finalize.outputs.owner }}
+          REPO: ${{ steps.meta_pr_finalize.outputs.repo }}
+        run: |
+          # Build argv as an array so optional flags are passed correctly.
+          ARGS=(run pr-finalize --pr "$PR")
+          if [ "$MERGE" = "true" ]; then
+            ARGS+=(--merge)
+          fi
+          if [ "$MERGE_ADMIN" = "true" ]; then
+            ARGS+=(--merge-admin)
+          fi
+          if [ -n "$OWNER" ] && [ -n "$REPO" ]; then
+            ARGS+=(--owner "$OWNER" --repo "$REPO")
+          fi
+          echo "Invoking: plan-executor ${ARGS[*]}"
+          plan-executor "${ARGS[@]}"
+
       - name: Post result comment
         if: always()
         env:
+          JOB_KIND: ${{ steps.kind.outputs.kind }}
           EXECUTE_OUTCOME: ${{ steps.execute.outcome }}
+          PR_FINALIZE_OUTCOME: ${{ steps.pr_finalize.outcome }}
           TARGET_REPO: ${{ steps.meta.outputs.target_repo }}
           TARGET_REF: ${{ steps.meta.outputs.target_ref }}
           TARGET_BRANCH: ${{ steps.meta.outputs.target_branch }}
           PLAN_FILENAME: ${{ steps.meta.outputs.plan_filename }}
+          PR_FINALIZE_PR: ${{ steps.meta_pr_finalize.outputs.pr }}
+          PR_FINALIZE_OWNER: ${{ steps.meta_pr_finalize.outputs.owner }}
+          PR_FINALIZE_REPO: ${{ steps.meta_pr_finalize.outputs.repo }}
+          PR_FINALIZE_MERGE: ${{ steps.meta_pr_finalize.outputs.merge }}
+          PR_FINALIZE_MERGE_ADMIN: ${{ steps.meta_pr_finalize.outputs.merge_admin }}
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GH_REPO: ${{ github.repository }}
         run: |
-          if [ "$EXECUTE_OUTCOME" = "success" ]; then
+          if [ "$JOB_KIND" = "pr-finalize" ]; then
+            OUTCOME="$PR_FINALIZE_OUTCOME"
+          else
+            OUTCOME="$EXECUTE_OUTCOME"
+          fi
+          if [ "$OUTCOME" = "success" ]; then
             STATUS="succeeded"
           else
             STATUS="failed"
           fi
-          REF_SHORT="${TARGET_REF:0:12}"
 
           # Read execution summary written by the skill (may be in a worktree
           # created as a sibling of workspace/, not inside it)
@@ -236,12 +361,28 @@ jobs:
             SUMMARY=$(head -c 60000 "$SUMMARY_FILE")
           fi
 
-          BODY="## Execution Complete
+          if [ "$JOB_KIND" = "pr-finalize" ]; then
+            TARGET_DESC="${PR_FINALIZE_OWNER:-$GH_REPO%/*}/${PR_FINALIZE_REPO:-${GH_REPO#*/}}#${PR_FINALIZE_PR}"
+            MERGE_DESC="no"
+            if [ "$PR_FINALIZE_MERGE" = "true" ]; then
+              MERGE_DESC="merge"
+            elif [ "$PR_FINALIZE_MERGE_ADMIN" = "true" ]; then
+              MERGE_DESC="merge-admin"
+            fi
+            BODY="## PR Finalize Complete
+
+          **Status:** ${STATUS}
+          **Target PR:** ${TARGET_DESC}
+          **Merge:** ${MERGE_DESC}"
+          else
+            REF_SHORT="${TARGET_REF:0:12}"
+            BODY="## Execution Complete
 
           **Status:** ${STATUS}
           **Target:** ${TARGET_REPO}@${REF_SHORT}
           **Branch:** ${TARGET_BRANCH}
           **Plan:** ${PLAN_FILENAME}"
+          fi
 
           if [ -n "$SUMMARY" ]; then
             BODY="${BODY}
