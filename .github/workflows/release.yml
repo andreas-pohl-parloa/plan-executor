@@ -124,13 +124,17 @@ jobs:
         run: cargo build --release --locked --bin plan-executor
 
       - name: Package
-        run: zip -j plan-executor-macos-arm64.zip target/release/plan-executor
+        run: |
+          zip -j plan-executor-macos-arm64.zip target/release/plan-executor
+          shasum -a 256 plan-executor-macos-arm64.zip | awk '{print $1"  "$2}' > plan-executor-macos-arm64.zip.sha256
 
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.release.outputs.tag }}
-          files: plan-executor-macos-arm64.zip
+          files: |
+            plan-executor-macos-arm64.zip
+            plan-executor-macos-arm64.zip.sha256
 
   build-linux:
     name: Build Linux x86_64
@@ -157,10 +161,14 @@ jobs:
         run: cargo build --release
 
       - name: Package
-        run: zip -j plan-executor-linux-x86_64.zip target/release/plan-executor
+        run: |
+          zip -j plan-executor-linux-x86_64.zip target/release/plan-executor
+          sha256sum plan-executor-linux-x86_64.zip | awk '{print $1"  "$2}' > plan-executor-linux-x86_64.zip.sha256
 
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.release.outputs.tag }}
-          files: plan-executor-linux-x86_64.zip
+          files: |
+            plan-executor-linux-x86_64.zip
+            plan-executor-linux-x86_64.zip.sha256
