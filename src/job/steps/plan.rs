@@ -420,7 +420,11 @@ async fn run_helper_fix_loop(
 
         let helper_output = match helper_result {
             Ok(out) => out,
-            Err(HelperError::SemanticFailure { status, notes }) => match status {
+            Err(HelperError::SemanticFailure {
+                status,
+                notes,
+                state_updates,
+            }) => match status {
                 HelperStatus::FixRequired => {
                     if iteration > max_iterations {
                         tracing::warn!(
@@ -434,8 +438,18 @@ async fn run_helper_fix_loop(
                     }
                     // Build and dispatch the fix wave; on any sub-failure we
                     // surface that as the attempt outcome and let the
-                    // registry decide whether to retry or abort.
-                    let dispatch = dispatch_fix_wave(ctx, manifest_path, kind, iteration).await;
+                    // registry decide whether to retry or abort. The
+                    // `state_updates` payload from the helper's SemanticFailure
+                    // is forwarded so the validation branch can decode `gaps`
+                    // without re-invoking the helper.
+                    let dispatch = dispatch_fix_wave(
+                        ctx,
+                        manifest_path,
+                        kind,
+                        iteration,
+                        &state_updates,
+                    )
+                    .await;
                     match dispatch {
                         FixWaveOutcome::Continue => continue,
                         FixWaveOutcome::Outcome(outcome) => return outcome,
@@ -513,6 +527,7 @@ async fn dispatch_fix_wave(
     manifest_path: &Path,
     kind: HelperLoopKind,
     iteration: u32,
+    state_updates: &serde_json::Value,
 ) -> FixWaveOutcome {
     let manifest_before = match scheduler::load_manifest(manifest_path) {
         Ok(m) => m,
@@ -534,7 +549,8 @@ async fn dispatch_fix_wave(
     // Step 1 — produce the findings JSON file the CLI consumes. For the
     // code-review path this is a triage call into the review-execution-output
     // helper; for the validation path the validator's own gaps array is
-    // already structured findings.
+    // already structured findings (read directly from the SemanticFailure
+    // `state_updates`, no helper re-invocation).
     let findings_path = match build_findings_for_fix_wave(
         ctx,
         manifest_path,
@@ -542,6 +558,7 @@ async fn dispatch_fix_wave(
         &plan_path,
         kind,
         iteration,
+        state_updates,
     ) {
         Ok(p) => p,
         Err(outcome) => return FixWaveOutcome::Outcome(outcome),
@@ -549,9 +566,39 @@ async fn dispatch_fix_wave(
 
     // Step 2 — invoke the existing `compile-fix-waves` CLI. Reuses the
     // production binary so we do not duplicate compile-plan logic; the CLI
-    // mutates `tasks.json` in place via APPEND mode.
+    // mutates `tasks.json` in place via APPEND mode. Canonicalize the
+    // findings path and confirm it stays within the workdir before passing
+    // it into the child process — defends against helper-supplied paths
+    // that escape the workdir via traversal or symlinks (Sec F-2).
+    let canonical_findings = match std::fs::canonicalize(&findings_path) {
+        Ok(p) => p,
+        Err(e) => {
+            return FixWaveOutcome::Outcome(AttemptOutcome::ProtocolViolation {
+                category: "findings_path_canonicalize".into(),
+                detail: format!("{}: {e}", findings_path.display()),
+            });
+        }
+    };
+    let canonical_workdir = match std::fs::canonicalize(&ctx.workdir) {
+        Ok(p) => p,
+        Err(e) => {
+            return FixWaveOutcome::Outcome(AttemptOutcome::HardInfra {
+                error: format!("workdir canonicalize: {e}"),
+            });
+        }
+    };
+    if !canonical_findings.starts_with(&canonical_workdir) {
+        return FixWaveOutcome::Outcome(AttemptOutcome::ProtocolViolation {
+            category: "findings_path_escape".into(),
+            detail: format!(
+                "{} not under {}",
+                canonical_findings.display(),
+                canonical_workdir.display()
+            ),
+        });
+    }
     let appended_path =
-        match invoke_compile_fix_waves_cli(&plan_path, &execution_root, &findings_path) {
+        match invoke_compile_fix_waves_cli(&plan_path, &execution_root, &canonical_findings) {
             Ok(path) => path,
             Err(outcome) => return FixWaveOutcome::Outcome(outcome),
         };
@@ -714,10 +761,14 @@ fn detect_language(workdir: &Path) -> String {
 ///   to obtain `wave_id_for_fix` plus the consolidated findings file path,
 ///   then re-uses the helper-produced file directly when it is already in
 ///   the findings.json shape; otherwise wraps the helper-supplied
-///   `findings_path` in a synthetic findings document.
-/// - For [`HelperLoopKind::Validation`], converts the validator's `gaps`
-///   array into [`Finding`]s with `category="validation_gap"`, severity
-///   `major`, and writes them under `<workdir>/.plan-executor/fix-loop/`.
+///   `findings_path` in a synthetic findings document. The triage-supplied
+///   path is canonicalized and confirmed to live under `ctx.workdir` before
+///   it is returned (Sec F-2).
+/// - For [`HelperLoopKind::Validation`], reads the validator's `gaps` array
+///   from the helper's `state_updates` payload (no re-invocation — the
+///   outer loop already paid the cost), converts each gap into a
+///   [`Finding`] with `category="validation_gap"` and severity `major`, and
+///   writes them under `<workdir>/.plan-executor/fix-loop/`.
 ///
 /// On any failure returns the [`AttemptOutcome`] the caller should surface.
 fn build_findings_for_fix_wave(
@@ -727,6 +778,7 @@ fn build_findings_for_fix_wave(
     plan_path: &Path,
     kind: HelperLoopKind,
     iteration: u32,
+    state_updates: &serde_json::Value,
 ) -> Result<PathBuf, AttemptOutcome> {
     match kind {
         HelperLoopKind::CodeReview => {
@@ -754,7 +806,10 @@ fn build_findings_for_fix_wave(
             // Triage state_updates carries `triaged_findings_path` and
             // optionally `wave_id_for_fix`. The triage helper guarantees the
             // findings file is in `findings.json` shape (the file the CLI
-            // consumes directly).
+            // consumes directly). The reviewer-team `findings_path` (when
+            // present) and the validator `validation_report_path` are also
+            // helper-supplied paths; we canonicalize each one and require
+            // it to remain under `ctx.workdir` before trusting it (Sec F-2).
             let triaged_findings_path = raw
                 .state_updates
                 .get("triaged_findings_path")
@@ -763,56 +818,65 @@ fn build_findings_for_fix_wave(
                     category: "triage_missing_path".to_string(),
                     detail: "triage state_updates missing triaged_findings_path".to_string(),
                 })?;
-            Ok(PathBuf::from(triaged_findings_path))
+            let triaged_buf = PathBuf::from(triaged_findings_path);
+            let canonical = ensure_path_under_workdir(
+                &triaged_buf,
+                &ctx.workdir,
+                "triaged_findings_path",
+            )?;
+            // If the reviewer team also reported its raw `findings_path`,
+            // confirm it is contained too. We do not consume that path here
+            // (the triaged file is what the CLI ingests), but a missing
+            // containment check would still let an attacker influence
+            // downstream consumers via the same payload.
+            if let Some(findings_path_str) = raw
+                .state_updates
+                .get("findings_path")
+                .and_then(|v| v.as_str())
+            {
+                ensure_path_under_workdir(
+                    Path::new(findings_path_str),
+                    &ctx.workdir,
+                    "findings_path",
+                )?;
+            }
+            Ok(canonical)
         }
         HelperLoopKind::Validation => {
-            // The validator's typed output has the `gaps` array we need, but
-            // we only see it on `Success`. On `fix_required` we still need
-            // `state_updates.gaps` so the fix-wave can be computed; re-invoke
-            // the validator via `invoke_helper` here would be redundant — the
-            // outer loop already paid the cost. Instead, the outer loop hands
-            // us the helper's raw envelope via the side-channel below: we
-            // re-run the validator helper to fetch `state_updates` even on a
-            // `fix_required` status, since the typed wrapper would have
-            // discarded it.
-            //
-            // This is the same trick used in `invoke_loop_helper`: bypass the
-            // typed wrapper to retain `state_updates` independent of status.
-            let input = build_validator_input(ctx, _manifest_path, iteration)
-                .map_err(helper_error_to_outcome)?;
-            let envelope =
-                serde_json::to_value(&input).map_err(|e| AttemptOutcome::ProtocolViolation {
-                    category: "input_serialize".to_string(),
-                    detail: format!("serialize ValidatorInput failed: {e}"),
-                })?;
-            let raw = invoke_helper(HelperSkill::ValidateExecutionPlan, envelope, ctx)
-                .map_err(helper_error_to_outcome)?;
-            let gaps = raw
-                .state_updates
+            // The validator's `state_updates` payload was forwarded from
+            // `HelperError::SemanticFailure` so we do not re-invoke the
+            // helper. Decode `gaps` into `Vec<ValidationGap>` directly.
+            // Optionally containment-check `validation_report_path` when the
+            // helper supplied one (Sec F-2).
+            if let Some(report_path_str) = state_updates
+                .get("validation_report_path")
+                .and_then(|v| v.as_str())
+            {
+                ensure_path_under_workdir(
+                    Path::new(report_path_str),
+                    &ctx.workdir,
+                    "validation_report_path",
+                )?;
+            }
+            let gaps_value = state_updates
                 .get("gaps")
-                .and_then(|v| v.as_array())
                 .cloned()
-                .unwrap_or_default();
+                .unwrap_or(serde_json::Value::Array(Vec::new()));
+            let gaps: Vec<crate::helper::ValidationGap> = serde_json::from_value(gaps_value)
+                .map_err(|e| AttemptOutcome::ProtocolViolation {
+                    category: "validation_gaps_shape".into(),
+                    detail: format!("decode validator gaps from state_updates failed: {e}"),
+                })?;
             let findings: Vec<Finding> = gaps
                 .iter()
                 .enumerate()
-                .map(|(idx, gap)| {
-                    let goal = gap
-                        .get("goal")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("(unspecified goal)");
-                    let evidence = gap
-                        .get("missing_evidence")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("(unspecified evidence)");
-                    Finding {
-                        id: format!("V{:03}", idx + 1),
-                        severity: Severity::Major,
-                        category: "validation_gap".to_string(),
-                        description: format!("{goal}: {evidence}"),
-                        files: Vec::new(),
-                        suggested_fix: None,
-                    }
+                .map(|(idx, gap)| Finding {
+                    id: format!("V{:03}", idx + 1),
+                    severity: Severity::Major,
+                    category: "validation_gap".to_string(),
+                    description: format!("{}: {}", gap.goal, gap.missing_evidence),
+                    files: Vec::new(),
+                    suggested_fix: None,
                 })
                 .collect();
             if findings.is_empty() {
@@ -826,6 +890,38 @@ fn build_findings_for_fix_wave(
     }
 }
 
+/// Canonicalizes `path` and confirms it is a descendant of `workdir`
+/// (also canonicalized). Returns [`AttemptOutcome::ProtocolViolation`] with a
+/// `<field>_canonicalize` or `<field>_escape` category when the path cannot
+/// be canonicalized or escapes the workdir. Defends helper-supplied paths
+/// against directory-traversal and symlink escapes (Sec F-2).
+fn ensure_path_under_workdir(
+    path: &Path,
+    workdir: &Path,
+    field: &str,
+) -> Result<PathBuf, AttemptOutcome> {
+    let canonical_path =
+        std::fs::canonicalize(path).map_err(|e| AttemptOutcome::ProtocolViolation {
+            category: format!("{field}_canonicalize"),
+            detail: format!("{}: {e}", path.display()),
+        })?;
+    let canonical_workdir =
+        std::fs::canonicalize(workdir).map_err(|e| AttemptOutcome::HardInfra {
+            error: format!("workdir canonicalize: {e}"),
+        })?;
+    if !canonical_path.starts_with(&canonical_workdir) {
+        return Err(AttemptOutcome::ProtocolViolation {
+            category: format!("{field}_escape"),
+            detail: format!(
+                "{} not under {}",
+                canonical_path.display(),
+                canonical_workdir.display()
+            ),
+        });
+    }
+    Ok(canonical_path)
+}
+
 /// Converts a [`HelperError`] into the matching [`AttemptOutcome`] variant.
 fn helper_error_to_outcome(err: HelperError) -> AttemptOutcome {
     match err {
@@ -834,7 +930,11 @@ fn helper_error_to_outcome(err: HelperError) -> AttemptOutcome {
         HelperError::ProtocolViolation { category, detail } => {
             AttemptOutcome::ProtocolViolation { category, detail }
         }
-        HelperError::SemanticFailure { status, notes } => match status {
+        HelperError::SemanticFailure {
+            status,
+            notes,
+            state_updates: _,
+        } => match status {
             HelperStatus::FixRequired => AttemptOutcome::SemanticMistake { fix_loop_round: 0 },
             HelperStatus::Blocked | HelperStatus::Abort => AttemptOutcome::SpecDrift { gap: notes },
             HelperStatus::Success => AttemptOutcome::Success,
@@ -1552,18 +1652,18 @@ fn delegate_to_pr_finalize(ctx: &StepContext, url: &str) -> AttemptOutcome {
 }
 
 /// Parses `https://github.com/<owner>/<repo>/pull/<n>` into its three
-/// segments. Returns `None` for any URL that doesn't match.
+/// segments. Returns `None` for any URL that doesn't match. The host is
+/// pinned to `github.com` over `https`; non-`https` schemes, alternative
+/// hosts, the misspelled `pulls` segment, and missing/non-numeric PR ids
+/// all fail (Sec F-8).
 fn parse_pr_url(url: &str) -> Option<(String, String, u32)> {
-    let stripped = url
-        .trim()
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_start_matches("github.com/");
-    let mut parts = stripped.split('/');
+    const PREFIX: &str = "https://github.com/";
+    let trimmed = url.trim();
+    let rest = trimmed.strip_prefix(PREFIX)?;
+    let mut parts = rest.split('/');
     let owner = parts.next()?.to_string();
     let repo = parts.next()?.to_string();
-    let segment = parts.next()?;
-    if segment != "pull" && segment != "pulls" {
+    if parts.next()? != "pull" {
         return None;
     }
     let pr: u32 = parts.next()?.parse().ok()?;

@@ -491,18 +491,23 @@ fn happy_path_tiny_plan_succeeds_through_all_real_steps() {
     );
 
     let log = h.read_spawn_log();
-    assert!(
-        !log.contains("execute-plan-non-interactive"),
-        "spawn log unexpectedly contains execute-plan-non-interactive:\n{log}"
-    );
-    assert!(
-        log.contains("/plan-executor:run-reviewer-team-non-interactive"),
-        "spawn log missing reviewer team helper:\n{log}"
-    );
-    assert!(
-        log.contains("/plan-executor:validate-execution-plan-non-interactive"),
-        "spawn log missing validator helper:\n{log}"
-    );
+    #[derive(Debug, PartialEq, Eq)]
+    struct LogContents {
+        has_orchestrator: bool,
+        has_reviewer_team: bool,
+        has_validator: bool,
+    }
+    let actual = LogContents {
+        has_orchestrator: log.contains("execute-plan-non-interactive"),
+        has_reviewer_team: log.contains("/plan-executor:run-reviewer-team-non-interactive"),
+        has_validator: log.contains("/plan-executor:validate-execution-plan-non-interactive"),
+    };
+    let expected = LogContents {
+        has_orchestrator: false,
+        has_reviewer_team: true,
+        has_validator: true,
+    };
+    assert_eq!(actual, expected, "spawn log mismatch:\n{log}");
 }
 
 // =====================================================================
@@ -599,9 +604,8 @@ fn code_review_step_helper_input_includes_manifest_context() {
     let exec_outputs = parsed["execution_outputs"]
         .as_str()
         .expect("execution_outputs string");
-    assert_eq!(
+    assert!(
         exec_outputs.contains(&manifest_str),
-        true,
         "execution_outputs did not embed manifest path: {exec_outputs}",
     );
 }
@@ -708,9 +712,8 @@ fn code_review_step_returns_protocol_violation_on_malformed_helper_output() {
         cr.run(&mut c).await
     });
 
-    assert_eq!(
+    assert!(
         matches!(outcome, AttemptOutcome::ProtocolViolation { .. }),
-        true,
         "expected ProtocolViolation, got {outcome:?}"
     );
 }

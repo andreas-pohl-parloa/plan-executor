@@ -353,16 +353,22 @@ jobs:
             STATUS="failed"
           fi
 
-          # Read execution summary written by the skill (may be in a worktree
-          # created as a sibling of workspace/, not inside it)
+          # Read execution summary written by the skill. Scope find to the
+          # canonical execution directory (workspace/) to avoid picking up
+          # attacker-placed files elsewhere in the runner home.
           SUMMARY=""
-          SUMMARY_FILE=$(find . -maxdepth 4 -name .tmp-execution-summary.md -not -path './.git/*' -print -quit 2>/dev/null)
+          SUMMARY_FILE=$(find workspace -maxdepth 3 -name .tmp-execution-summary.md -not -path '*/.git/*' -print -quit 2>/dev/null)
           if [ -n "$SUMMARY_FILE" ]; then
             SUMMARY=$(head -c 60000 "$SUMMARY_FILE")
           fi
 
           if [ "$JOB_KIND" = "pr-finalize" ]; then
-            TARGET_DESC="${PR_FINALIZE_OWNER:-$GH_REPO%/*}/${PR_FINALIZE_REPO:-${GH_REPO#*/}}#${PR_FINALIZE_PR}"
+            # Resolve owner/repo into intermediate vars first — nested
+            # ${VAR:-${GH_REPO%/*}} does not recursively evaluate suffix
+            # removal inside the default expansion in all bash versions.
+            OWNER_RES="${PR_FINALIZE_OWNER:-${GH_REPO%/*}}"
+            REPO_RES="${PR_FINALIZE_REPO:-${GH_REPO#*/}}"
+            TARGET_DESC="${OWNER_RES}/${REPO_RES}#${PR_FINALIZE_PR}"
             MERGE_DESC="no"
             if [ "$PR_FINALIZE_MERGE" = "true" ]; then
               MERGE_DESC="merge"

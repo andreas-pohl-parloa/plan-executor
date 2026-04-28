@@ -131,10 +131,19 @@ pub fn load_manifest(path: &Path) -> Result<Manifest, SchedulerError> {
     Ok(manifest)
 }
 
-/// Confirms cross-references the scheduler relies on. Schema-level validation
-/// happens upstream in [`crate::schema::validate_manifest`]; this is a safety
-/// net so the scheduler never panics on missing keys.
+/// Confirms cross-references and schema invariants the scheduler relies on.
+/// Schema-level validation also happens upstream in
+/// [`crate::schema::validate_manifest`]; the duplication here is a defense in
+/// depth so the scheduler never accepts a manifest that violates the
+/// `src/schemas/tasks.schema.json` contract (`version == 1`, restricted
+/// `prompt_file` shape).
 fn validate_invariants(m: &Manifest) -> Result<(), SchedulerError> {
+    if m.version != 1 {
+        return Err(SchedulerError::Invariant(format!(
+            "manifest version must be 1; got {}",
+            m.version
+        )));
+    }
     let wave_ids: HashSet<u32> = m.waves.iter().map(|w| w.id).collect();
     if wave_ids.len() != m.waves.len() {
         return Err(SchedulerError::Invariant(
@@ -157,6 +166,66 @@ fn validate_invariants(m: &Manifest) -> Result<(), SchedulerError> {
                     wave.id, dep
                 )));
             }
+        }
+    }
+    for (tid, task) in &m.tasks {
+        validate_prompt_file_shape(tid, &task.prompt_file)?;
+    }
+    Ok(())
+}
+
+/// Enforces the `tasks.schema.json` `prompt_file` regex
+/// (`^tasks/[A-Za-z0-9._/-]+\.(md|sh)$`) without pulling in a regex dep.
+///
+/// Equivalent semantics: starts with `tasks/`, ends in `.md` or `.sh`, only
+/// the documented character class is allowed, and no `..` segments slip
+/// through. Also rejects absolute paths and back-slash separators that could
+/// be misread as Windows drive specifiers.
+fn validate_prompt_file_shape(task_id: &str, prompt_file: &str) -> Result<(), SchedulerError> {
+    let invariant = |msg: String| SchedulerError::Invariant(msg);
+    if prompt_file.is_empty() {
+        return Err(invariant(format!("task `{task_id}` has empty prompt_file")));
+    }
+    if Path::new(prompt_file).is_absolute() {
+        return Err(invariant(format!(
+            "task `{task_id}` prompt_file `{prompt_file}` must be a relative path"
+        )));
+    }
+    if !prompt_file.starts_with("tasks/") {
+        return Err(invariant(format!(
+            "task `{task_id}` prompt_file `{prompt_file}` must start with `tasks/`"
+        )));
+    }
+    if !(prompt_file.ends_with(".md") || prompt_file.ends_with(".sh")) {
+        return Err(invariant(format!(
+            "task `{task_id}` prompt_file `{prompt_file}` must end with .md or .sh"
+        )));
+    }
+    if prompt_file.contains('\\') {
+        return Err(invariant(format!(
+            "task `{task_id}` prompt_file `{prompt_file}` may not contain backslashes"
+        )));
+    }
+    // Guard against `..` segments and characters outside [A-Za-z0-9._/-].
+    for segment in prompt_file.split('/') {
+        if segment == ".." {
+            return Err(invariant(format!(
+                "task `{task_id}` prompt_file `{prompt_file}` may not contain `..` segments"
+            )));
+        }
+        if segment.is_empty() {
+            return Err(invariant(format!(
+                "task `{task_id}` prompt_file `{prompt_file}` may not contain empty path segments"
+            )));
+        }
+    }
+    for ch in prompt_file.chars() {
+        let allowed =
+            ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '/' | '-');
+        if !allowed {
+            return Err(invariant(format!(
+                "task `{task_id}` prompt_file `{prompt_file}` contains disallowed character `{ch}`"
+            )));
         }
     }
     Ok(())
@@ -364,7 +433,30 @@ fn build_handoffs(
                     tid, task.agent_type
                 ))
             })?;
+            // Defense in depth: re-validate the prompt_file shape and
+            // confirm the joined path stays under `manifest_dir`. The
+            // path-shape check already rejects `..` and absolute prompts,
+            // but canonicalize gives us a real-filesystem guard against
+            // symlink-based escapes when both paths exist on disk (Sec F-3).
+            validate_prompt_file_shape(tid, &task.prompt_file)?;
+            if Path::new(&task.prompt_file).is_absolute() {
+                return Err(SchedulerError::Invariant(format!(
+                    "task `{tid}` prompt_file `{}` must be a relative path",
+                    task.prompt_file
+                )));
+            }
             let prompt_file = manifest_dir.join(&task.prompt_file);
+            if let (Ok(canon_prompt), Ok(canon_dir)) =
+                (std::fs::canonicalize(&prompt_file), std::fs::canonicalize(manifest_dir))
+            {
+                if !canon_prompt.starts_with(&canon_dir) {
+                    return Err(SchedulerError::Invariant(format!(
+                        "task `{tid}` prompt_file `{}` resolves outside manifest_dir `{}`",
+                        canon_prompt.display(),
+                        canon_dir.display()
+                    )));
+                }
+            }
             Ok(Handoff {
                 index: idx + 1,
                 agent_type,

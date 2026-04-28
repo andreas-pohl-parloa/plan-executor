@@ -460,13 +460,24 @@ fn fix_required_status_maps_to_semantic_failure() {
     .expect_err("expected SemanticFailure");
 
     match err {
-        HelperError::SemanticFailure { status, notes } => {
+        HelperError::SemanticFailure {
+            status,
+            notes,
+            state_updates,
+        } => {
             assert_eq!(
                 (status, notes),
                 (
                     HelperStatus::FixRequired,
                     "two findings need a fix wave".to_string()
                 )
+            );
+            // Structural assertion: state_updates is preserved verbatim.
+            assert_eq!(
+                state_updates
+                    .get("findings_path")
+                    .and_then(serde_json::Value::as_str),
+                Some("/tmp/findings.md"),
             );
         }
         other => panic!("expected SemanticFailure, got {other:?}"),

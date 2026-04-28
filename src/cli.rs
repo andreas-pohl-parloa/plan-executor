@@ -612,6 +612,17 @@ fn run_pr_finalize(
         }
     };
 
+    // Defense-in-depth (Sec F-4): validate owner/repo charset against the same
+    // shape the GHA workflow enforces (`^[A-Za-z0-9._-]+$`). Reuses
+    // `crate::remote::validate_repo_slug`, which checks both halves of the
+    // slug and rejects `..`, slashes, or other injection-prone characters.
+    let combined_slug = format!("{resolved_owner}/{resolved_repo}");
+    if !crate::remote::validate_repo_slug(&combined_slug) {
+        anyhow::bail!(
+            "invalid owner/repo: '{combined_slug}' — must match ^[A-Za-z0-9._-]+$ for both owner and repo"
+        );
+    }
+
     // Clap's `conflicts_with` already rejects `--merge` + `--merge-admin`,
     // but a defensive check here makes the precondition explicit and
     // shields the registry against future plumbing changes.

@@ -217,6 +217,11 @@ pub enum HelperError {
         status: HelperStatus,
         /// Helper-supplied notes; passed through verbatim for caller display.
         notes: String,
+        /// Helper-supplied `state_updates` payload, preserved verbatim so that
+        /// callers handling `fix_required` can inspect helper-specific
+        /// fields (e.g. validator `gaps`). Set to [`serde_json::Value::Null`]
+        /// when the helper did not emit a `state_updates` block.
+        state_updates: serde_json::Value,
     },
 }
 
@@ -473,6 +478,7 @@ fn parse_and_validate_output(
             Err(HelperError::SemanticFailure {
                 status,
                 notes: parsed.notes,
+                state_updates: parsed.state_updates,
             })
         }
     }

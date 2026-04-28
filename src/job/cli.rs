@@ -413,7 +413,7 @@ fn cmd_metrics(args: &MetricsArgs) -> Result<()> {
 
     let mut report = MetricsReport::empty(args);
     for entry in entries {
-        let JobStoreEntry::New { summary, path } = entry else {
+        let JobStoreEntry::New { summary, .. } = entry else {
             continue;
         };
         if let Some(kind) = job_kind_filter {
@@ -439,7 +439,6 @@ fn cmd_metrics(args: &MetricsArgs) -> Result<()> {
             Ok(j) => j,
             Err(_) => continue,
         };
-        let _ = path;
         report.absorb(&metrics, &job);
     }
 
@@ -819,20 +818,17 @@ mod tests {
 
     #[test]
     fn parse_duration_rejects_missing_unit() {
-        let result = parse_duration("7").is_err();
-        assert_eq!(result, true);
+        assert!(parse_duration("7").is_err());
     }
 
     #[test]
     fn parse_duration_rejects_unknown_unit() {
-        let result = parse_duration("5x").is_err();
-        assert_eq!(result, true);
+        assert!(parse_duration("5x").is_err());
     }
 
     #[test]
     fn parse_duration_rejects_empty_input() {
-        let result = parse_duration("").is_err();
-        assert_eq!(result, true);
+        assert!(parse_duration("").is_err());
     }
 
     #[test]
