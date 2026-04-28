@@ -4,4 +4,5 @@
 //! `types` submodule contains pure data structures (no behavior). Subsequent
 //! waves will introduce execution, recovery, and storage submodules.
 
+pub mod recovery;
 pub mod types;
