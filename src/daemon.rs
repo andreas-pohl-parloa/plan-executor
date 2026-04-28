@@ -9,8 +9,6 @@ use tokio::time::Duration;
 use anyhow::Result;
 
 use crate::config::{watchdog_verdict, Config, WatchdogVerdict};
-use crate::executor::{spawn_execution, ExecEvent};
-use crate::handoff;
 use crate::ipc::{socket_path, DaemonEvent, TuiRequest};
 use crate::jobs::{JobMetadata, JobStatus};
 
@@ -722,30 +720,101 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, manifest_path: &
     let execution_root = find_repo_root(&plan)
         .unwrap_or_else(|| plan.parent().unwrap_or(&plan).to_path_buf());
 
-    let job = JobMetadata::new(plan.clone());
-    let job_id = job.id.clone();
+    tracing::info!(plan = %plan_path, "dispatching plan job");
 
-    let main_cmd = {
-        let st = state.lock().await;
-        st.agents.main.clone()
-    };
+    spawn_rust_scheduler_job(state, plan.clone(), manifest.clone(), execution_root).await;
+}
 
-    let Ok((child, pgid, exec_rx)) = spawn_execution(
-        job.clone(), execution_root.clone(), manifest.clone(), &main_cmd,
-    ) else {
-        tracing::error!("failed to spawn execution for plan: {}", plan_path);
-        return;
+/// Phase D4 default: dispatch the plan through the new Rust scheduler.
+///
+/// Builds a [`crate::job::types::Job`] for [`crate::job::types::JobKind::Plan`],
+/// persists it via [`crate::job::storage::JobStore`], registers a matching
+/// `JobMetadata` row in the daemon's running-jobs table (so existing TUI /
+/// notification / watchdog plumbing keeps working unchanged), and spawns a
+/// background task that walks every step from
+/// [`crate::job::registry::steps_for`] in order. A non-success
+/// [`crate::job::types::AttemptOutcome`] aborts the pipeline and finalizes
+/// the job as `Failed`. Sub-agent dispatch inside each step still flows
+/// through [`crate::handoff::dispatch_all`] — only the orchestrator
+/// subprocess is removed.
+async fn spawn_rust_scheduler_job(
+    state: &Arc<Mutex<DaemonState>>,
+    plan: PathBuf,
+    manifest_path: PathBuf,
+    execution_root: PathBuf,
+) {
+    use crate::job::registry;
+    use crate::job::storage::JobStore;
+    use crate::job::types::{Job, JobId, JobKind, JobState, StepInstance, StepStatus};
+
+    let kind = JobKind::Plan {
+        manifest_path: manifest_path.clone(),
     };
+    let runtime_steps = registry::steps_for(&kind);
+    let step_instances: Vec<StepInstance> = runtime_steps
+        .iter()
+        .enumerate()
+        .map(|(idx, step)| {
+            let seq = u32::try_from(idx + 1).unwrap_or(u32::MAX);
+            StepInstance {
+                seq,
+                name: step.name().to_string(),
+                status: StepStatus::Pending,
+                attempts: Vec::new(),
+                idempotent: step.idempotent(),
+            }
+        })
+        .collect();
+
+    let job_struct = Job {
+        id: JobId(uuid::Uuid::new_v4().to_string()),
+        kind,
+        state: JobState::Running,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        steps: step_instances,
+    };
+    let job_id = job_struct.id.0.clone();
+
+    let store = match JobStore::new() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "rust scheduler: opening job store failed");
+            let st = state.lock().await;
+            let _ = st
+                .event_tx
+                .send(DaemonEvent::Error { message: format!("job store: {e}") });
+            return;
+        }
+    };
+    let job_dir = match store.create(&job_struct) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(error = %e, "rust scheduler: persisting job.json failed");
+            let st = state.lock().await;
+            let _ = st
+                .event_tx
+                .send(DaemonEvent::Error { message: format!("persist job.json: {e}") });
+            return;
+        }
+    };
+    let job_dir_path = job_dir.path().to_path_buf();
+
+    // Mirror the legacy pathway's bookkeeping: a `JobMetadata` row in
+    // `running_jobs` keeps the watchdog, notification, and `output` CLI
+    // working without modification. We override the auto-generated id so
+    // the persisted Job (job.json) and the in-memory metadata share the
+    // same id — this is what `plan-executor output -f <prefix>` resolves.
+    let mut metadata = JobMetadata::new(plan.clone());
+    metadata.id = job_id.clone();
 
     notify_plan("Execution started", &plan, "");
 
     {
         let mut st = state.lock().await;
-        st.running_jobs.insert(job_id.clone(), job.clone());
+        st.running_jobs.insert(job_id.clone(), metadata.clone());
         st.job_output.insert(job_id.clone(), VecDeque::new());
-        st.job_display_output.insert(job_id.clone(), VecDeque::new());
-        st.running_children.insert(job_id.clone(), child);
-        st.process_group_ids.insert(job_id.clone(), pgid);
+        st.job_display_output
+            .insert(job_id.clone(), VecDeque::new());
         let now = Instant::now();
         st.job_last_activity.insert(job_id.clone(), now);
         st.job_started_at_monotonic.insert(job_id.clone(), now);
@@ -754,691 +823,186 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, manifest_path: &
     }
 
     let state_clone = Arc::clone(state);
-    let plan_path_owned = plan_path.to_string();
-    tokio::spawn(run_exec_event_loop(
-        state_clone, job_id, plan, plan_path_owned, execution_root, manifest.clone(), exec_rx,
-    ));
-}
-
-/// Retry a job whose handoff was never dispatched: re-register the job as
-/// running, dispatch the sub-agents from the existing state file, resume the
-/// session, and process all subsequent events exactly like a normal execution.
-pub async fn retry_handoff_from_state(
-    state: &Arc<Mutex<DaemonState>>,
-    job_id: String,
-) {
-    let job = match crate::jobs::JobMetadata::load_by_id_prefix(&job_id) {
-        Some(j) => j,
-        None => {
-            let msg = format!("retry: job not found: {}", job_id);
-            tracing::error!("{}", msg);
-            let st = state.lock().await;
-            let _ = st.event_tx.send(crate::ipc::DaemonEvent::Error { message: msg });
-            return;
-        }
-    };
-    let session_id = match job.session_id.clone() {
-        Some(s) => s,
-        None => {
-            let msg = format!("retry: job {} has no session_id — cannot resume", job_id);
-            tracing::error!("{}", msg);
-            let st = state.lock().await;
-            let _ = st.event_tx.send(crate::ipc::DaemonEvent::Error { message: msg });
-            return;
-        }
-    };
-    let plan = job.plan_path.clone();
-    let execution_root = find_repo_root(&plan)
-        .unwrap_or_else(|| plan.parent().unwrap_or(&plan).to_path_buf());
-    let state_file = match crate::executor::find_state_file(&execution_root) {
-        Some(f) => f,
-        None => {
-            let msg = format!(
-                "retry: no state file found under {} — nothing to retry",
-                execution_root.display()
-            );
-            tracing::error!("{}", msg);
-            let st = state.lock().await;
-            let _ = st.event_tx.send(crate::ipc::DaemonEvent::Error { message: msg });
-            return;
-        }
-    };
-
-    // Re-register the job as running (remove from history if present).
-    {
-        let mut st = state.lock().await;
-        st.history.retain(|j| j.id != job.id);
-        let mut running_job = job.clone();
-        running_job.status = JobStatus::Running;
-        running_job.finished_at = None;
-        // Persist Running status to disk so a daemon kill marks this job Failed
-        // on next startup rather than leaving it with the old Success status.
-        let _ = running_job.save();
-        st.running_jobs.insert(job.id.clone(), running_job);
-        st.job_output.insert(job.id.clone(), VecDeque::new());
-        st.job_display_output.insert(job.id.clone(), VecDeque::new());
-        let now = Instant::now();
-        st.job_last_activity.insert(job.id.clone(), now);
-        // Retry uses current time as the monotonic start — we have no
-        // record of when the original job started on the monotonic clock,
-        // and the hard-cap applies from resume anyway.
-        st.job_started_at_monotonic.insert(job.id.clone(), now);
-        let event = st.snapshot_state();
-        let _ = st.event_tx.send(event);
-    }
-
-    let state_clone = Arc::clone(state);
-    let plan_path_owned = plan.to_string_lossy().to_string();
-    let job_id_full = job.id.clone();
-
     tokio::spawn(async move {
-        let agents = { state_clone.lock().await.agents.clone() };
+        let success = run_rust_scheduler_steps(
+            runtime_steps,
+            job_dir_path,
+            execution_root,
+            &state_clone,
+            &job_id,
+        )
+        .await;
 
-        // Load the persisted handoff state.
-        let state_data = match handoff::load_state(&state_file) {
-            Ok(s) => s,
-            Err(e) => {
-                let line = format!("⏺ [plan-executor] failed to read state file: {}", e);
-                append_display(&job_id_full, &line);
-                fail_job_cleanup(&state_clone, &job_id_full).await;
-                return;
-            }
-        };
-
-        // Announce dispatch.
-        {
-            let line = format!(
-                "⏺ [plan-executor] dispatching {} sub-agent(s) (phase: {})",
-                state_data.handoffs.len(), state_data.phase
-            );
-            append_display(&job_id_full, &line);
-            let mut st = state_clone.lock().await;
-            st.job_display_output.entry(job_id_full.clone()).or_default().push_back(line.clone());
-            let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: job_id_full.clone(), line: line.clone() });
-            let _ = st.event_tx.send(DaemonEvent::JobOutput { job_id: job_id_full.clone(), line });
-        }
-
-        // Channel for bash agents to stream live output (retry path).
-        let (live_tx, mut live_rx) = tokio::sync::mpsc::channel::<(usize, String)>(256);
-        let live_state = Arc::clone(&state_clone);
-        let live_jid = job_id_full.clone();
-        let live_task = tokio::spawn(async move {
-            while let Some((_idx, line)) = live_rx.recv().await {
-                append_display(&live_jid, &line);
-                let mut st = live_state.lock().await;
-                st.job_last_activity.insert(live_jid.clone(), Instant::now());
-                st.job_display_output.entry(live_jid.clone()).or_default().push_back(line.clone());
-                let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: live_jid.clone(), line });
-            }
-        });
-
-        // Reset sub_agent_pgids for this batch and start a registration
-        // task so each sub-agent's pgid lands in DaemonState the instant
-        // it spawns. A KillJob arriving mid-dispatch can then SIGKILL
-        // every sub-agent's process group, not just the ones that had
-        // already finished.
-        {
-            let mut st = state_clone.lock().await;
-            st.sub_agent_pgids.insert(job_id_full.clone(), Vec::new());
-        }
-        let (pgid_tx, pgid_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
-        let reg_task = spawn_pgid_registrar(
-            Arc::clone(&state_clone),
-            job_id_full.clone(),
-            pgid_rx,
-        );
-
-        // Sub-agent writer task: receives each streamed line, stamps
-        // job_last_activity (watchdog liveness), and persists to
-        // per-sub-agent files for later rendering by `output`.
-        let dispatch_num = {
-            let mut st = state_clone.lock().await;
-            let entry = st
-                .sub_agent_dispatch_counter
-                .entry(job_id_full.clone())
-                .or_insert(0);
-            *entry += 1;
-            *entry
-        };
-        let (subagent_tx, subagent_rx) =
-            tokio::sync::mpsc::unbounded_channel::<crate::handoff::SubAgentLine>();
-        let sa_task = spawn_subagent_writer(
-            Arc::clone(&state_clone),
-            job_id_full.clone(),
-            dispatch_num,
-            { state_clone.lock().await.event_tx.clone() },
-            subagent_rx,
-        );
-
-        let (results, sub_pgids) = handoff::dispatch_all(
-            state_data.handoffs,
-            &agents.claude,
-            &agents.codex,
-            &agents.gemini,
-            &agents.bash,
-            Some(live_tx),
-            Some(pgid_tx),
-            Some(subagent_tx),
-        ).await;
-        let _ = live_task.await;
-        let _ = reg_task.await;
-        let _ = sa_task.await;
-
-        // If the job was killed while dispatch_all was suspended, bail
-        // out now instead of proceeding to resume_execution (which would
-        // spawn a new main agent for a job that no longer exists).
-        {
-            let st = state_clone.lock().await;
-            if !st.running_jobs.contains_key(&job_id_full) {
-                return;
-            }
-        }
-
-        {
-            let mut st = state_clone.lock().await;
-            // Trust whatever pgids the registrar collected; sub_pgids is
-            // the ordered list returned after dispatch and may be more
-            // complete if registrations were late. Merge for safety.
-            let entry = st.sub_agent_pgids.entry(job_id_full.clone()).or_default();
-            for pgid in sub_pgids {
-                if pgid > 0 && !entry.contains(&pgid) {
-                    entry.push(pgid);
-                }
-            }
-            st.job_last_activity.insert(job_id_full.clone(), Instant::now());
-        }
-
-        for r in &results {
-            let line = if r.success {
-                format!("⏺ [plan-executor] sub-agent {} done ({} chars)", r.index, r.stdout.len())
+        let mut st = state_clone.lock().await;
+        if let Some(mut job) = st.running_jobs.remove(&job_id) {
+            job.status = if success {
+                JobStatus::Success
             } else {
-                format!("⏺ [plan-executor] sub-agent {} failed: {}", r.index,
-                    r.stderr.lines().next().unwrap_or("(no stderr)"))
+                JobStatus::Failed
             };
-            append_display(&job_id_full, &line);
-            let mut st = state_clone.lock().await;
-            st.job_display_output.entry(job_id_full.clone()).or_default().push_back(line.clone());
-            let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: job_id_full.clone(), line: line.clone() });
-            let _ = st.event_tx.send(DaemonEvent::JobOutput { job_id: job_id_full.clone(), line });
+            job.finished_at = Some(chrono::Utc::now());
+            job.duration_ms = Some(
+                (chrono::Utc::now() - job.started_at)
+                    .num_milliseconds()
+                    .max(0) as u64,
+            );
+            let _ = job.save();
+            st.history.insert(0, job.clone());
+            st.job_output.remove(&job_id);
+            st.job_display_output.remove(&job_id);
+            st.job_last_activity.remove(&job_id);
+            st.job_started_at_monotonic.remove(&job_id);
+            st.sub_agent_dispatch_counter.remove(&job_id);
+            let status_str = if success { "succeeded" } else { "failed" };
+            notify_plan(&format!("Execution {}", status_str), &job.plan_path, "");
+            let _ = st.event_tx.send(DaemonEvent::JobUpdated { job });
         }
-
-        if results.iter().any(|r| !r.success && !r.can_fail) {
-            crate::executor::consume_handoffs(&state_file);
-            fail_job_cleanup(&state_clone, &job_id_full).await;
-            return;
-        }
-
-        crate::executor::consume_handoffs(&state_file);
-
-        {
-            let line = format!("⏺ [plan-executor] resuming session {}", &session_id[..session_id.len().min(16)]);
-            append_display(&job_id_full, &line);
-            let mut st = state_clone.lock().await;
-            st.job_display_output.entry(job_id_full.clone()).or_default().push_back(line.clone());
-            let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: job_id_full.clone(), line: line.clone() });
-            let _ = st.event_tx.send(DaemonEvent::JobOutput { job_id: job_id_full.clone(), line });
-        }
-
-        let continuation = handoff::build_continuation(&results);
-        let exec_rx = match handoff::resume_execution(
-            &session_id,
-            &continuation,
-            execution_root.clone(),
-            Some(job_id_full.clone()),
-            Some(plan.clone()),
-            &agents.main,
-        ).await {
-            Ok((new_child, new_pgid, rx)) => {
-                let mut st = state_clone.lock().await;
-                st.running_children.insert(job_id_full.clone(), new_child);
-                st.process_group_ids.insert(job_id_full.clone(), new_pgid);
-                // Resume fresh-starts the liveness baseline, mirroring
-                // the main-loop handoff-resume path.
-                st.job_last_activity.insert(job_id_full.clone(), Instant::now());
-                rx
-            }
-            Err(e) => {
-                let line = format!("⏺ [plan-executor] failed to resume session: {}", e);
-                append_display(&job_id_full, &line);
-                let st = state_clone.lock().await;
-                let _ = st.event_tx.send(DaemonEvent::JobOutput { job_id: job_id_full.clone(), line });
-                drop(st);
-                fail_job_cleanup(&state_clone, &job_id_full).await;
-                return;
-            }
-        };
-
-        run_exec_event_loop(
-            state_clone, job_id_full, plan, plan_path_owned, execution_root, PathBuf::new(), exec_rx,
-        ).await;
     });
 }
 
-/// Marks a job as Failed and moves it to history. Used when retry dispatch or
-/// resume fails before the normal event loop can handle cleanup.
-async fn fail_job_cleanup(state: &Arc<Mutex<DaemonState>>, job_id: &str) {
-    let mut st = state.lock().await;
-    if let Some(mut job) = st.running_jobs.remove(job_id) {
-        job.status = JobStatus::Failed;
-        job.finished_at = Some(chrono::Utc::now());
-        let _ = job.save();
-        st.history.insert(0, job.clone());
-        st.running_children.remove(job_id);
-        st.process_group_ids.remove(job_id);
-        st.sub_agent_pgids.remove(job_id);
-        st.job_output.remove(job_id);
-        st.job_display_output.remove(job_id);
-        st.job_last_activity.remove(job_id);
-        st.job_started_at_monotonic.remove(job_id);
-            st.sub_agent_dispatch_counter.remove(job_id);
-        let _ = st.event_tx.send(DaemonEvent::JobUpdated { job });
-    }
-}
+/// Walks every step in `steps` for the given Rust-scheduler job, stamping
+/// per-line liveness on `job_last_activity` (so the watchdog still sees a
+/// live job) and broadcasting display-line events for each step transition.
+/// Returns `true` only when every step reached
+/// [`crate::job::types::AttemptOutcome::Success`] (or `Pending` for the
+/// placeholder shells); any other outcome aborts the pipeline and yields
+/// `false`.
+async fn run_rust_scheduler_steps(
+    steps: Vec<Box<dyn crate::job::step::Step>>,
+    job_dir: PathBuf,
+    workdir: PathBuf,
+    state: &Arc<Mutex<DaemonState>>,
+    job_id: &str,
+) -> bool {
+    use crate::job::metrics::JobMetrics;
+    use crate::job::step::StepContext;
+    use crate::job::storage::JobStore;
+    use crate::job::types::{AttemptOutcome, JobId};
 
-/// Core event loop shared by trigger_execution and retry_handoff_from_state.
-/// Processes OutputLine, DisplayLine, HandoffRequired, and Finished events,
-/// including recursive handoff dispatch and session resume.
-async fn run_exec_event_loop(
-    state: Arc<Mutex<DaemonState>>,
-    job_id: String,
-    plan: PathBuf,
-    _plan_path_owned: String,
-    execution_root: PathBuf,
-    manifest_path: PathBuf,
-    mut exec_rx: tokio::sync::mpsc::Receiver<crate::executor::ExecEvent>,
-) {
-    let mut last_display_blank = false;
-    let mut completion_retried = false;
-    'outer: loop {
-        while let Some(event) = exec_rx.recv().await {
-            match event {
-                ExecEvent::OutputLine(line) => {
-                    let mut st = state.lock().await;
-                    st.job_last_activity.insert(job_id.clone(), Instant::now());
-                    let buf = st.job_output.entry(job_id.clone()).or_default();
-                    buf.push_back(line.clone());
-                    if buf.len() > 10000 { buf.pop_front(); }
-                    let _ = st.event_tx.send(DaemonEvent::JobOutput {
-                        job_id: job_id.clone(),
-                        line,
-                    });
-                }
-                ExecEvent::DisplayLine(line) => {
-                    let is_blank = crate::executor::is_visually_blank(&line);
-                    if is_blank && last_display_blank {
-                        // drop consecutive blank line before it reaches the TUI or display buffer
-                    } else {
-                        last_display_blank = is_blank;
-                        let mut st = state.lock().await;
-                        st.job_last_activity.insert(job_id.clone(), Instant::now());
-                        let buf = st.job_display_output.entry(job_id.clone()).or_default();
-                        buf.push_back(line.clone());
-                        if buf.len() > 10000 { buf.pop_front(); }
-                        let _ = st.event_tx.send(DaemonEvent::JobDisplayLine {
-                            job_id: job_id.clone(),
-                            line,
-                        });
-                    }
-                }
-                ExecEvent::HandoffRequired { session_id, state_file } => {
-                    // Handoff is a strong liveness signal — reset watchdog
-                    // before the (potentially long) sub-agent dispatch.
-                    {
-                        let mut st = state.lock().await;
-                        st.job_last_activity.insert(job_id.clone(), Instant::now());
-                    }
-                    // Store session_id on the running job and persist to disk
-                    // before the (potentially long) sub-agent dispatch. A daemon
-                    // kill during dispatch will then show this job as Failed on
-                    // next startup and `retry` can resume with the session_id.
-                    {
-                        let mut st = state.lock().await;
-                        if let Some(job) = st.running_jobs.get_mut(&job_id) {
-                            job.session_id = Some(session_id.clone());
-                            let _ = job.save();
-                        }
-                    }
+    let job_id_owned = JobId(job_id.to_string());
+    let mut metrics = JobMetrics::new(job_id_owned.clone());
+    let mut pipeline_ok = true;
 
-                    let state_data = match handoff::load_state(&state_file) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            let st = state.lock().await;
-                            let _ = st.event_tx.send(DaemonEvent::JobOutput {
-                                job_id: job_id.clone(),
-                                line: format!("⏺ [plan-executor] failed to read state file: {}", e),
-                            });
-                            break 'outer;
-                        }
-                    };
+    for (idx, step) in steps.iter().enumerate() {
+        let seq = u32::try_from(idx + 1).unwrap_or(u32::MAX);
 
-                    loop {
-                        let is_paused = { state.lock().await.paused_jobs.contains(&job_id) };
-                        if !is_paused { break; }
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                    }
-
-                    {
-                        let line = format!(
-                            "⏺ [plan-executor] dispatching {} sub-agent(s) (phase: {})",
-                            state_data.handoffs.len(), state_data.phase
-                        );
-                        append_display(&job_id, &line);
-                        let mut st = state.lock().await;
-                        st.job_display_output.entry(job_id.clone()).or_default().push_back(line.clone());
-                        let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: job_id.clone(), line: line.clone() });
-                        let _ = st.event_tx.send(DaemonEvent::JobOutput { job_id: job_id.clone(), line });
-                    }
-
-                    let agents = { state.lock().await.agents.clone() };
-
-                    // Channel for bash agents to stream live output.
-                    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel::<(usize, String)>(256);
-                    let live_state = Arc::clone(&state);
-                    let live_job_id = job_id.clone();
-                    let live_task = tokio::spawn(async move {
-                        while let Some((_idx, line)) = live_rx.recv().await {
-                            append_display(&live_job_id, &line);
-                            let mut st = live_state.lock().await;
-                            st.job_last_activity.insert(live_job_id.clone(), Instant::now());
-                            st.job_display_output.entry(live_job_id.clone()).or_default().push_back(line.clone());
-                            let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: live_job_id.clone(), line });
-                        }
-                    });
-
-                    // Reset sub_agent_pgids for this batch and start a
-                    // registration task so a KillJob arriving mid-dispatch
-                    // can SIGKILL every sub-agent pgroup.
-                    {
-                        let mut st = state.lock().await;
-                        st.sub_agent_pgids.insert(job_id.clone(), Vec::new());
-                    }
-                    let (pgid_tx, pgid_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
-                    let reg_task = spawn_pgid_registrar(
-                        Arc::clone(&state),
-                        job_id.clone(),
-                        pgid_rx,
-                    );
-
-                    // Sub-agent writer task: receives each streamed
-                    // line, stamps job_last_activity (watchdog
-                    // liveness), and persists to per-sub-agent files
-                    // for later rendering by `output`.
-                    let dispatch_num = {
-                        let mut st = state.lock().await;
-                        let entry = st
-                            .sub_agent_dispatch_counter
-                            .entry(job_id.clone())
-                            .or_insert(0);
-                        *entry += 1;
-                        *entry
-                    };
-                    let (subagent_tx, subagent_rx) =
-                        tokio::sync::mpsc::unbounded_channel::<crate::handoff::SubAgentLine>();
-                    let sa_task = spawn_subagent_writer(
-                        Arc::clone(&state),
-                        job_id.clone(),
-                        dispatch_num,
-                        { state.lock().await.event_tx.clone() },
-                        subagent_rx,
-                    );
-
-                    let (results, sub_pgids) = handoff::dispatch_all(
-                        state_data.handoffs,
-                        &agents.claude,
-                        &agents.codex,
-                        &agents.gemini,
-                        &agents.bash,
-                        Some(live_tx),
-                        Some(pgid_tx),
-                        Some(subagent_tx),
-                    ).await;
-                    let _ = live_task.await;
-                    let _ = reg_task.await;
-                    let _ = sa_task.await;
-
-                    // If the job was killed during dispatch, bail out.
-                    {
-                        let st = state.lock().await;
-                        if !st.running_jobs.contains_key(&job_id) {
-                            break 'outer;
-                        }
-                    }
-
-                    {
-                        let mut st = state.lock().await;
-                        let entry = st.sub_agent_pgids.entry(job_id.clone()).or_default();
-                        for pgid in sub_pgids {
-                            if pgid > 0 && !entry.contains(&pgid) {
-                                entry.push(pgid);
-                            }
-                        }
-                        st.job_last_activity.insert(job_id.clone(), Instant::now());
-                    }
-
-                    for r in &results {
-                        let line = if r.success {
-                            format!("⏺ [plan-executor] sub-agent {} done ({} chars)", r.index, r.stdout.len())
-                        } else {
-                            let stderr_preview: String = r.stderr.lines()
-                                .filter(|l| !l.trim().is_empty())
-                                .take(3)
-                                .collect::<Vec<_>>()
-                                .join(" | ");
-                            let stderr_str = if stderr_preview.is_empty() {
-                                "(no stderr)".to_string()
-                            } else {
-                                stderr_preview
-                            };
-                            if r.can_fail {
-                                format!("⏺ [plan-executor] sub-agent {} skipped (can-fail): {}", r.index, stderr_str)
-                            } else {
-                                format!("⏺ [plan-executor] sub-agent {} failed: {}", r.index, stderr_str)
-                            }
-                        };
-                        append_display(&job_id, &line);
-                        let mut st = state.lock().await;
-                        st.job_display_output.entry(job_id.clone()).or_default().push_back(line.clone());
-                        let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: job_id.clone(), line: line.clone() });
-                        let _ = st.event_tx.send(DaemonEvent::JobOutput { job_id: job_id.clone(), line });
-                    }
-
-                    if results.iter().any(|r| !r.success && !r.can_fail) {
-                        crate::executor::consume_handoffs(&state_file);
-                        break 'outer;
-                    }
-
-                    crate::executor::consume_handoffs(&state_file);
-
-                    {
-                        let line = format!("⏺ [plan-executor] resuming session {}", &session_id[..session_id.len().min(16)]);
-                        append_display(&job_id, &line);
-                        let mut st = state.lock().await;
-                        st.job_display_output.entry(job_id.clone()).or_default().push_back(line.clone());
-                        let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: job_id.clone(), line: line.clone() });
-                        let _ = st.event_tx.send(DaemonEvent::JobOutput { job_id: job_id.clone(), line });
-                    }
-
-                    let continuation = handoff::build_continuation(&results);
-                    match handoff::resume_execution(
-                        &session_id,
-                        &continuation,
-                        execution_root.clone(),
-                        Some(job_id.clone()),
-                        Some(plan.clone()),
-                        &agents.main,
-                    ).await {
-                        Ok((new_child, new_pgid, new_rx)) => {
-                            {
-                                let mut st = state.lock().await;
-                                st.running_children.insert(job_id.clone(), new_child);
-                                st.process_group_ids.insert(job_id.clone(), new_pgid);
-                                // Handoff resume — bump liveness in case
-                                // the resumed session takes a while to
-                                // emit its first line.
-                                st.job_last_activity.insert(job_id.clone(), Instant::now());
-                            }
-                            exec_rx = new_rx;
-                            continue 'outer;
-                        }
-                        Err(e) => {
-                            let st = state.lock().await;
-                            let _ = st.event_tx.send(DaemonEvent::JobOutput {
-                                job_id: job_id.clone(),
-                                line: format!("⏺ [plan-executor] failed to resume session: {}", e),
-                            });
-                            break 'outer;
-                        }
-                    }
-                }
-                ExecEvent::Finished(finished_job) => {
-                    // If the agent returned success but the plan is still
-                    // EXECUTING, the skill bailed out mid-execution (e.g.
-                    // after a handoff resume it completed the triage but
-                    // didn't continue to the remaining phases). Resume the
-                    // session once with an explicit instruction to finish.
-                    let plan_still_executing = finished_job.status == JobStatus::Success
-                        && crate::cli::read_manifest_plan_block(&manifest_path)
-                            .map(|(_, status)| status == "EXECUTING")
-                            .unwrap_or(false);
-
-                    if plan_still_executing && !completion_retried {
-                        completion_retried = true;
-                        let session_id = {
-                            let st = state.lock().await;
-                            st.running_jobs.get(&job_id)
-                                .and_then(|j| j.session_id.clone())
-                                .or_else(|| finished_job.session_id.clone())
-                        };
-
-                        if let Some(sid) = session_id {
-                            let line = "⏺ [plan-executor] plan still EXECUTING after agent returned success — resuming to complete remaining phases";
-                            append_display(&job_id, line);
-                            {
-                                let mut st = state.lock().await;
-                                st.job_display_output.entry(job_id.clone()).or_default().push_back(line.to_string());
-                                let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: job_id.clone(), line: line.to_string() });
-                                let _ = st.event_tx.send(DaemonEvent::JobOutput { job_id: job_id.clone(), line: line.to_string() });
-                            }
-
-                            let agents = { state.lock().await.agents.clone() };
-                            let continuation = "The plan execution is incomplete — the plan status is still EXECUTING. \
-                                You returned from a handoff resume but did not complete the remaining execution phases. \
-                                Continue from where you left off. Complete all remaining phases (plan validation, \
-                                cleanup/PR, execution summary) until the plan status is set to COMPLETED.";
-
-                            match handoff::resume_execution(
-                                &sid,
-                                continuation,
-                                execution_root.clone(),
-                                Some(job_id.clone()),
-                                Some(plan.clone()),
-                                &agents.main,
-                            ).await {
-                                Ok((new_child, new_pgid, new_rx)) => {
-                                    let mut st = state.lock().await;
-                                    st.running_children.insert(job_id.clone(), new_child);
-                                    st.process_group_ids.insert(job_id.clone(), new_pgid);
-                                    // Resume fresh-starts the liveness
-                                    // baseline: the Finished event may have
-                                    // been the last stamp minutes ago.
-                                    st.job_last_activity.insert(job_id.clone(), Instant::now());
-                                    exec_rx = new_rx;
-                                    continue 'outer;
-                                }
-                                Err(e) => {
-                                    let line = format!("⏺ [plan-executor] completion retry failed to resume: {}", e);
-                                    append_display(&job_id, &line);
-                                    let mut st = state.lock().await;
-                                    st.job_display_output.entry(job_id.clone()).or_default().push_back(line.clone());
-                                    let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: job_id.clone(), line: line.clone() });
-                                    // Fall through to finish as failed
-                                }
-                            }
-                        }
-                    }
-
-                    // After the retry (or if no retry was needed), finalize the job.
-                    // If plan is still EXECUTING after a retry, force fail.
-                    let force_fail = plan_still_executing;
-
-                    let mut st = state.lock().await;
-                    // Merge result fields from the resume placeholder into
-                    // the original running job (which has the correct
-                    // started_at from initial trigger_execution).
-                    let mut job = if let Some(running) = st.running_jobs.remove(&job_id) {
-                        running
-                    } else {
-                        finished_job.clone()
-                    };
-                    job.status = if force_fail { JobStatus::Failed } else { finished_job.status };
-                    job.model = job.model.or(finished_job.model);
-                    job.session_id = job.session_id.or(finished_job.session_id);
-                    job.input_tokens = finished_job.input_tokens.or(job.input_tokens);
-                    job.output_tokens = finished_job.output_tokens.or(job.output_tokens);
-                    job.cache_creation_tokens = finished_job.cache_creation_tokens.or(job.cache_creation_tokens);
-                    job.cache_read_tokens = finished_job.cache_read_tokens.or(job.cache_read_tokens);
-                    job.finished_at = Some(chrono::Utc::now());
-                    // Wall-clock duration from actual start to now, not
-                    // the per-turn duration_ms from the result event.
-                    job.duration_ms = Some(
-                        (chrono::Utc::now() - job.started_at)
-                            .num_milliseconds()
-                            .max(0) as u64,
-                    );
-                    if force_fail {
-                        let line = "⏺ [plan-executor] plan still EXECUTING after completion retry — marking job FAILED";
-                        append_display(&job_id, line);
-                        st.job_display_output.entry(job_id.clone()).or_default().push_back(line.to_string());
-                        let _ = st.event_tx.send(DaemonEvent::JobDisplayLine { job_id: job_id.clone(), line: line.to_string() });
-                    }
-                    let _ = job.save();
-                    st.running_children.remove(&job_id);
-                    st.process_group_ids.remove(&job_id);
-                    st.sub_agent_pgids.remove(&job_id);
-                    st.job_output.remove(&job_id);
-                    st.job_display_output.remove(&job_id);
-                    st.job_last_activity.remove(&job_id);
-                    st.job_started_at_monotonic.remove(&job_id);
-            st.sub_agent_dispatch_counter.remove(&job_id);
-                    st.history.insert(0, job.clone());
-                    let status_str = match job.status {
-                        JobStatus::Success => "succeeded",
-                        JobStatus::Failed => "failed",
-                        JobStatus::Killed => "killed",
-                        _ => "finished",
-                    };
-                    notify_plan(&format!("Execution {}", status_str), &job.plan_path, "");
-                    let _ = st.event_tx.send(DaemonEvent::JobUpdated { job });
-                    break 'outer;
-                }
+        // Bail out cleanly if a KillJob / watchdog kill removed the job
+        // from `running_jobs` while a previous step was running.
+        {
+            let st = state.lock().await;
+            if !st.running_jobs.contains_key(job_id) {
+                tracing::info!(job = %job_id, "rust scheduler: job no longer running, aborting pipeline");
+                pipeline_ok = false;
+                break;
             }
         }
-        break; // exec_rx closed without Finished
-    } // end 'outer loop
 
-    // Clean up job if it never finished (resume failure or channel closed)
-    {
-        let mut st = state.lock().await;
-        if let Some(mut job) = st.running_jobs.remove(&job_id) {
-            if job.status == JobStatus::Running {
-                job.status = JobStatus::Failed;
-                job.finished_at = Some(chrono::Utc::now());
-                let _ = job.save();
-                notify_plan("Execution failed", &job.plan_path, "");
-                st.history.insert(0, job.clone());
-                st.running_children.remove(&job_id);
-                st.process_group_ids.remove(&job_id);
-                st.sub_agent_pgids.remove(&job_id);
-                st.job_output.remove(&job_id);
-                st.job_display_output.remove(&job_id);
-                st.job_last_activity.remove(&job_id);
-                st.job_started_at_monotonic.remove(&job_id);
-            st.sub_agent_dispatch_counter.remove(&job_id);
-                let _ = st.event_tx.send(DaemonEvent::JobUpdated { job });
+        let mut ctx = StepContext {
+            job_dir: job_dir.clone(),
+            step_seq: seq,
+            attempt_n: 1,
+            workdir: workdir.clone(),
+        };
+
+        let line = format!("⏺ [plan-executor] step {} ({}) starting", seq, step.name());
+        append_display(job_id, &line);
+        {
+            let mut st = state.lock().await;
+            st.job_last_activity.insert(job_id.to_string(), Instant::now());
+            st.job_display_output
+                .entry(job_id.to_string())
+                .or_default()
+                .push_back(line.clone());
+            let _ = st.event_tx.send(DaemonEvent::JobDisplayLine {
+                job_id: job_id.to_string(),
+                line,
+            });
+        }
+
+        // Step boundary — count once per step before running attempts.
+        metrics.record_step();
+
+        tracing::info!(step = step.name(), seq, "running step");
+        let outcome = step.run(&mut ctx).await;
+
+        let policy = step.recovery_policy();
+        metrics.record_attempt(&outcome, Some(&policy));
+
+        let (ok, summary) = match &outcome {
+            AttemptOutcome::Success => (true, "success".to_string()),
+            // Placeholder shells (`PreflightStep`, `PrFinalizeStep`) emit
+            // `Pending` today; treat as a pass so the pipeline reaches
+            // the real step bodies that follow.
+            AttemptOutcome::Pending => (true, "pending (placeholder)".to_string()),
+            AttemptOutcome::TransientInfra { error } => (false, format!("transient_infra: {error}")),
+            AttemptOutcome::HardInfra { error } => (false, format!("hard_infra: {error}")),
+            AttemptOutcome::ProtocolViolation { category, detail } => {
+                (false, format!("protocol_violation [{category}]: {detail}"))
             }
+            AttemptOutcome::SemanticMistake { fix_loop_round } => {
+                (false, format!("semantic_mistake (round {fix_loop_round})"))
+            }
+            AttemptOutcome::SpecDrift { gap } => (false, format!("spec_drift: {gap}")),
+        };
+
+        let line = format!(
+            "⏺ [plan-executor] step {} ({}) {}",
+            seq,
+            step.name(),
+            summary
+        );
+        append_display(job_id, &line);
+        {
+            let mut st = state.lock().await;
+            st.job_last_activity.insert(job_id.to_string(), Instant::now());
+            st.job_display_output
+                .entry(job_id.to_string())
+                .or_default()
+                .push_back(line.clone());
+            let _ = st.event_tx.send(DaemonEvent::JobDisplayLine {
+                job_id: job_id.to_string(),
+                line,
+            });
+        }
+
+        if !ok {
+            tracing::error!(
+                step = step.name(),
+                seq,
+                outcome = ?outcome,
+                "step failed; aborting pipeline",
+            );
+            pipeline_ok = false;
+            break;
         }
     }
+
+    // Finalize and persist metrics on every terminal state (success or
+    // failure). Errors here are logged but do not change the return value;
+    // the metrics file is best-effort observability data.
+    metrics.finalize();
+    match JobStore::new().and_then(|s| s.open(&job_id_owned)) {
+        Ok(dir) => match dir.write_metrics(&metrics) {
+            Ok(()) => {
+                tracing::debug!(
+                    job = %job_id,
+                    attempts = metrics.attempts_total,
+                    steps = metrics.step_count,
+                    "wrote job metrics.json",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(job = %job_id, error = %e, "failed to write metrics.json");
+            }
+        },
+        Err(e) => {
+            tracing::warn!(job = %job_id, error = %e, "failed to open job dir for metrics");
+        }
+    }
+
+    pipeline_ok
 }
+
 
 fn find_repo_root(path: &Path) -> Option<PathBuf> {
     let mut dir = if path.is_file() {
@@ -1541,9 +1105,6 @@ async fn handle_tui_request(
             if let Ok(json) = serde_json::to_string(&snapshot) {
                 let _ = write_half.write_all(format!("{}\n", json).as_bytes()).await;
             }
-        }
-        TuiRequest::RetryHandoff { job_id } => {
-            retry_handoff_from_state(state, job_id).await;
         }
         TuiRequest::TrackRemote { plan_path, remote_repo, pr_number } => {
             let mut st = state.lock().await;

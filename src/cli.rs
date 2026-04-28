@@ -59,11 +59,6 @@ pub enum Commands {
         #[arg(short = 'f', long)]
         follow: bool,
     },
-    /// Retry the handoff for a job whose sub-agents were never dispatched
-    Retry {
-        /// Job ID prefix (from `plan-executor jobs`)
-        job_id: String,
-    },
     /// Interactive wizard to configure remote execution secrets
     RemoteSetup,
     /// Validate a compiled tasks.json manifest against the schema and semantic rules.
@@ -179,33 +174,6 @@ fn print_display_line(line: &str) {
 /// visually distinguishable at a glance.
 fn subagent_prefix(index: usize) -> String {
     format!("\x1b[2m│{}│ \x1b[0m", index)
-}
-
-/// Prints one live sub-agent line (from `dispatch_all`'s subagent channel)
-/// with the standard `│N│ ` prefix. Bash stdout is raw text, bash stderr is
-/// dim text, and claude/codex/gemini stdout is rendered through sjv so the
-/// assistant blocks match the main-agent visual style.
-fn render_subagent_live_line(sl: &crate::handoff::SubAgentLine) {
-    let prefix = subagent_prefix(sl.index);
-    if sl.agent_type == "bash" || sl.is_stderr {
-        let body = if sl.is_stderr {
-            format!("\x1b[2m{}\x1b[0m", sl.line)
-        } else {
-            sl.line.clone()
-        };
-        println!("{}{}", prefix, body);
-        return;
-    }
-    // Non-bash stdout is JSONL — render the same way the main agent stream
-    // is rendered. sjv may emit multi-line blocks per input line; prefix
-    // each visible output line.
-    let rendered = sjv::render_runtime_line(&sl.line, false, true);
-    for visual in rendered.lines() {
-        if visual.is_empty() {
-            continue;
-        }
-        println!("{}{}", prefix, visual);
-    }
 }
 
 /// Renders one sub-agent's persisted JSONL output via sjv and prints
@@ -800,7 +768,6 @@ pub fn run() {
         }
         Commands::Status => rt.block_on(show_status()),
         Commands::Output { job_id, follow } => rt.block_on(output_job(job_id, follow)),
-        Commands::Retry { job_id } => rt.block_on(retry_job(job_id)),
         Commands::Stop
         | Commands::Jobs { .. }
         | Commands::Ensure
@@ -978,78 +945,10 @@ fn parse_subagent_done_index(line: &str) -> Option<usize> {
     }
 }
 
-async fn retry_job(job_id_prefix: String) -> Result<()> {
-    use crate::ipc::{DaemonEvent, TuiRequest};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
-
-    if !crate::ipc::socket_path().exists() {
-        anyhow::bail!("Daemon not running. Start with: plan-executor daemon");
-    }
-
-    // Resolve prefix → full job ID from history.
-    let job = crate::jobs::JobMetadata::load_by_id_prefix(&job_id_prefix)
-        .ok_or_else(|| anyhow::anyhow!("No job matching '{}'", job_id_prefix))?;
-    let job_id = job.id.clone();
-
-    println!(
-        "Retrying handoff for job {} ({})",
-        &job_id[..job_id.len().min(8)],
-        job.plan_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("?")
-    );
-
-    let stream = UnixStream::connect(crate::ipc::socket_path()).await?;
-    let (read_half, mut write_half) = tokio::io::split(stream);
-    let mut reader = BufReader::new(read_half).lines();
-
-    let req = serde_json::to_string(&TuiRequest::RetryHandoff {
-        job_id: job_id.clone(),
-    })?;
-    write_half
-        .write_all(format!("{}\n", req).as_bytes())
-        .await?;
-
-    // Wait briefly for confirmation that the job moved to Running, then detach.
-    let short_id = &job_id[..job_id.len().min(8)];
-    let timeout = tokio::time::sleep(std::time::Duration::from_secs(2));
-    tokio::pin!(timeout);
-
-    loop {
-        tokio::select! {
-            line = reader.next_line() => {
-                let Ok(Some(line)) = line else { break };
-                if let Ok(event) = serde_json::from_str::<DaemonEvent>(&line) {
-                    match event {
-                        DaemonEvent::State { running_jobs, .. } => {
-                            if running_jobs.iter().any(|j| j.id == job_id) {
-                                println!("Retrying (job {})", short_id);
-                                println!("Watch: plan-executor output -f {}", short_id);
-                                return Ok(());
-                            }
-                        }
-                        DaemonEvent::Error { message } => {
-                            eprintln!("Error: {}", message);
-                            return Ok(());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ = &mut timeout => {
-                // Timed out waiting for confirmation — assume it started.
-                println!("Retrying (job {})", short_id);
-                println!("Watch: plan-executor output -f {}", short_id);
-                return Ok(());
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn execute_plan(manifest_arg: String, config: crate::config::Config) -> Result<()> {
+async fn execute_plan(
+    manifest_arg: String,
+    config: crate::config::Config,
+) -> Result<()> {
     let manifest_path = resolve_manifest_path(&manifest_arg)?;
     let (plan_path, status) = read_manifest_plan_block(&manifest_path)?;
 
@@ -1137,10 +1036,19 @@ async fn trigger_remote(
     Ok(())
 }
 
-async fn execute_foreground(manifest_arg: String, config: crate::config::Config) -> Result<()> {
-    use crate::executor::{spawn_execution, ExecEvent};
-    use crate::handoff;
-    use crate::jobs::JobMetadata;
+/// Foreground-mode entry point: drives the Rust scheduler pipeline directly.
+///
+/// Builds a `Job { JobKind::Plan { manifest_path } }`, hydrates its steps via
+/// the registry, runs each step against a fresh `StepContext`, and exits with
+/// status 1 on the first non-success [`AttemptOutcome`]. Sub-agent dispatch
+/// flows through `handoff::dispatch_all` inside each step.
+async fn execute_foreground(
+    manifest_arg: String,
+    config: crate::config::Config,
+) -> Result<()> {
+    use crate::job::registry;
+    use crate::job::storage::JobStore;
+    use crate::job::types::{Job, JobId, JobKind, JobState, StepInstance, StepStatus};
 
     let manifest_path = resolve_manifest_path(&manifest_arg)?;
     let (resolved_path, status) = read_manifest_plan_block(&manifest_path)?;
@@ -1168,193 +1076,103 @@ async fn execute_foreground(manifest_arg: String, config: crate::config::Config)
             .to_path_buf()
     });
 
-    let job = JobMetadata::new(resolved_path.clone());
-    let job_id = job.id.clone();
+    tracing::info!("dispatching plan job (foreground)");
 
-    let (mut child, _pgid, mut exec_rx) = spawn_execution(
-        job,
-        execution_root.clone(),
-        manifest_path.clone(),
-        &config.agents.main,
-    )?;
-
-    let mut last_display_blank = false;
-    let mut final_status = None;
-    let mut completion_retried = false;
-
-    'outer: loop {
-        while let Some(event) = exec_rx.recv().await {
-            match event {
-                ExecEvent::OutputLine(_) => {}
-                ExecEvent::DisplayLine(line) => {
-                    let is_blank = crate::executor::is_visually_blank(&line);
-                    if is_blank && last_display_blank {
-                        continue;
-                    }
-                    last_display_blank = is_blank;
-                    print_display_line(&line);
-                }
-                ExecEvent::HandoffRequired {
-                    session_id,
-                    state_file,
-                } => {
-                    let state_data = handoff::load_state(&state_file)?;
-
-                    println!("\x1b[33m\u{23fa} [plan-executor]\x1b[0m dispatching {} sub-agent(s) (phase: {})",
-                        state_data.handoffs.len(), state_data.phase);
-
-                    // Stream every sub-agent's output live to stdout with a
-                    // per-index `│N│ ` prefix, rendering JSONL through sjv —
-                    // same visual format that `plan-executor output`
-                    // produces in daemon mode. This makes the sub-agent
-                    // turn visible in CI logs instead of a silent gap
-                    // between `dispatching` and `done`.
-                    let (subagent_tx, mut subagent_rx) =
-                        tokio::sync::mpsc::unbounded_channel::<handoff::SubAgentLine>();
-                    let render_task = tokio::spawn(async move {
-                        while let Some(sl) = subagent_rx.recv().await {
-                            render_subagent_live_line(&sl);
-                        }
-                    });
-
-                    // `dispatch_agent` takes the bash fast path only when
-                    // `live_tx.is_some()`, so we still need to pass a
-                    // channel — but its contents are already covered by
-                    // `subagent_tx` above, so drain it silently.
-                    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel::<(usize, String)>(256);
-                    let drain_task =
-                        tokio::spawn(async move { while live_rx.recv().await.is_some() {} });
-
-                    let (results, _pgids) = handoff::dispatch_all(
-                        state_data.handoffs,
-                        &config.agents.claude,
-                        &config.agents.codex,
-                        &config.agents.gemini,
-                        &config.agents.bash,
-                        Some(live_tx),
-                        None, // no pgid tracking in foreground path
-                        Some(subagent_tx),
-                    )
-                    .await;
-                    let _ = drain_task.await;
-                    let _ = render_task.await;
-
-                    for r in &results {
-                        if r.success {
-                            println!("\x1b[33m\u{23fa} [plan-executor]\x1b[0m sub-agent {} done ({} chars)",
-                                r.index, r.stdout.len());
-                        } else if r.can_fail {
-                            println!("\x1b[33m\u{23fa} [plan-executor]\x1b[0m sub-agent {} skipped (can-fail): {}",
-                                r.index, r.stderr.lines().next().unwrap_or("(no stderr)"));
-                        } else {
-                            eprintln!(
-                                "\x1b[31m\u{23fa} [plan-executor] sub-agent {} failed: {}\x1b[0m",
-                                r.index,
-                                r.stderr.lines().next().unwrap_or("(no stderr)")
-                            );
-                        }
-                    }
-
-                    if results.iter().any(|r| !r.success && !r.can_fail) {
-                        crate::executor::consume_handoffs(&state_file);
-                        final_status = Some(false);
-                        break 'outer;
-                    }
-
-                    crate::executor::consume_handoffs(&state_file);
-
-                    println!(
-                        "\x1b[33m\u{23fa} [plan-executor]\x1b[0m resuming session {}",
-                        &session_id[..session_id.len().min(16)]
-                    );
-
-                    let continuation = handoff::build_continuation(&results);
-                    match handoff::resume_execution(
-                        &session_id,
-                        &continuation,
-                        execution_root.clone(),
-                        Some(job_id.clone()),
-                        Some(resolved_path.clone()),
-                        &config.agents.main,
-                    )
-                    .await
-                    {
-                        Ok((new_child, _new_pgid, new_rx)) => {
-                            child = new_child;
-                            exec_rx = new_rx;
-                            continue 'outer;
-                        }
-                        Err(e) => {
-                            eprintln!("\x1b[31m\u{23fa} [plan-executor] failed to resume session: {}\x1b[0m", e);
-                            final_status = Some(false);
-                            break 'outer;
-                        }
-                    }
-                }
-                ExecEvent::Finished(finished_job) => {
-                    let is_success = finished_job.status == crate::jobs::JobStatus::Success;
-
-                    // If the agent returned success but the plan is still
-                    // EXECUTING, the skill bailed out mid-execution. Resume
-                    // the session once with an explicit instruction to finish.
-                    let plan_still_executing = is_success
-                        && read_manifest_plan_block(&manifest_path)
-                            .map(|(_, status)| status == "EXECUTING")
-                            .unwrap_or(false);
-
-                    if plan_still_executing && !completion_retried {
-                        completion_retried = true;
-                        let session_id = finished_job.session_id.clone();
-
-                        if let Some(sid) = session_id {
-                            println!("\x1b[33m\u{23fa} [plan-executor]\x1b[0m plan still EXECUTING after agent returned success — resuming to complete remaining phases");
-
-                            let continuation = "The plan execution is incomplete — the plan status is still EXECUTING. \
-                                You returned from a handoff resume but did not complete the remaining execution phases. \
-                                Continue from where you left off. Complete all remaining phases (plan validation, \
-                                cleanup/PR, execution summary) until the plan status is set to COMPLETED.";
-
-                            match handoff::resume_execution(
-                                &sid,
-                                continuation,
-                                execution_root.clone(),
-                                Some(job_id.clone()),
-                                Some(resolved_path.clone()),
-                                &config.agents.main,
-                            )
-                            .await
-                            {
-                                Ok((new_child, _new_pgid, new_rx)) => {
-                                    child = new_child;
-                                    exec_rx = new_rx;
-                                    continue 'outer;
-                                }
-                                Err(e) => {
-                                    eprintln!("\x1b[31m\u{23fa} [plan-executor] completion retry failed to resume: {}\x1b[0m", e);
-                                }
-                            }
-                        }
-                    }
-
-                    if plan_still_executing {
-                        eprintln!("\x1b[31m\u{23fa} [plan-executor] plan still EXECUTING after completion retry — marking FAILED\x1b[0m");
-                        final_status = Some(false);
-                    } else {
-                        final_status = Some(is_success);
-                    }
-                    break 'outer;
-                }
+    let kind = JobKind::Plan {
+        manifest_path: manifest_path.clone(),
+    };
+    let runtime_steps = registry::steps_for(&kind);
+    let step_instances: Vec<StepInstance> = runtime_steps
+        .iter()
+        .enumerate()
+        .map(|(idx, step)| {
+            let seq = u32::try_from(idx + 1).unwrap_or(u32::MAX);
+            StepInstance {
+                seq,
+                name: step.name().to_string(),
+                status: StepStatus::Pending,
+                attempts: Vec::new(),
+                idempotent: step.idempotent(),
             }
-        }
-        break;
-    }
+        })
+        .collect();
 
-    let _ = child;
-    let success = final_status.unwrap_or(false);
+    let job = Job {
+        id: JobId(uuid::Uuid::new_v4().to_string()),
+        kind,
+        state: JobState::Running,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        steps: step_instances,
+    };
+
+    let store = JobStore::new().context("opening job store")?;
+    let job_dir = store
+        .create(&job)
+        .context("persisting job.json for foreground rust scheduler run")?;
+
+    let _ = resolved_path; // kept in scope to mirror prior contract
+
+    let success = run_rust_scheduler_pipeline(
+        runtime_steps,
+        job_dir.path().to_path_buf(),
+        execution_root,
+    )
+    .await;
     if !success {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Sequentially runs every step in `steps` and reports whether all of them
+/// reached [`AttemptOutcome::Success`]. Each step gets a fresh
+/// [`StepContext`] anchored at `job_dir` and `workdir`. Recovery / retry
+/// per step is the registry's responsibility in later phases; D4-step-1 is
+/// a "happy-path wiring" change — any non-success outcome aborts the run.
+pub(crate) async fn run_rust_scheduler_pipeline(
+    steps: Vec<Box<dyn crate::job::step::Step>>,
+    job_dir: PathBuf,
+    workdir: PathBuf,
+) -> bool {
+    use crate::job::step::StepContext;
+    use crate::job::types::AttemptOutcome;
+
+    for (idx, step) in steps.iter().enumerate() {
+        let seq = u32::try_from(idx + 1).unwrap_or(u32::MAX);
+        let mut ctx = StepContext {
+            job_dir: job_dir.clone(),
+            step_seq: seq,
+            attempt_n: 1,
+            workdir: workdir.clone(),
+        };
+        tracing::info!(step = step.name(), seq, "running step");
+        let outcome = step.run(&mut ctx).await;
+        match outcome {
+            AttemptOutcome::Success => {
+                tracing::info!(step = step.name(), seq, "step succeeded");
+            }
+            AttemptOutcome::Pending => {
+                // `Pending` is currently emitted by the placeholder
+                // `PreflightStep` and `PrFinalizeStep` shells. Treat as
+                // a no-op pass so the rest of the pipeline can run.
+                tracing::info!(
+                    step = step.name(),
+                    seq,
+                    "step returned Pending (placeholder); continuing",
+                );
+            }
+            other => {
+                tracing::error!(
+                    step = step.name(),
+                    seq,
+                    outcome = ?other,
+                    "step failed; aborting pipeline",
+                );
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Walk up from a path to find the closest directory containing `.git`.

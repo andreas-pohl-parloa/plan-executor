@@ -9,6 +9,22 @@ permissions:
   pull-requests: write
   issues: write
 
+# Allow-lists for plan-driven Claude marketplace / plugin installation.
+#
+# The "Install Claude marketplaces and plugins" step parses
+# `**add-marketplaces:**` / `**add-plugins:**` header lines from the plan
+# and feeds them to `claude plugin marketplace add` / `claude plugin install`.
+# Without an allow-list a malicious plan could install arbitrary plugins
+# that then run with full repo secrets (Sec F-6).
+#
+# Operators add new marketplaces/plugins by editing this workflow file
+# (PR-reviewed) and appending the new slug to the corresponding env var
+# below. Any value not present here causes the install step to fail
+# closed before the plugin/marketplace is fetched.
+env:
+  ALLOWED_MARKETPLACES: "andreas-pohl-parloa/plan-executor-plugin andreas-pohl-parloa/plan-executor-marketplace andreas-pohl-parloa/security-marketplace andreas-pohl-parloa/my-coding-marketplace"
+  ALLOWED_PLUGINS: "plan-executor@plan-executor security@security-marketplace my-coding@my-coding-marketplace"
+
 jobs:
   execute:
     runs-on: ubuntu-latest
@@ -192,6 +208,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
         run: |
+          # Sec F-14: every release zip MUST be accompanied by a sibling
+          # `<asset>.sha256` release asset (produced by `gh release upload`
+          # alongside the zip). The workflow downloads both, recomputes the
+          # SHA256, and fails closed on mismatch or missing checksum file.
+          # Older releases without the sidecar must be re-uploaded with a
+          # `.sha256` companion or the operator must pin to a newer tag.
           for repo_asset in "plan-executor:plan-executor-linux-x86_64.zip" "stream-json-view:sjv-linux-x86_64.zip"; do
             REPO="andreas-pohl-parloa/${repo_asset%%:*}"
             ASSET="${repo_asset##*:}"
@@ -200,6 +222,23 @@ jobs:
               --jq "[.[] | select(.assets | map(.name) | any(contains(\"linux\")))][0].tag_name")
             echo "Downloading $BINARY $TAG from $REPO"
             gh release download "$TAG" --repo "$REPO" --pattern "$ASSET" --dir /tmp
+            # Fail closed if the .sha256 sidecar is missing — never skip
+            # verification silently.
+            if ! gh release download "$TAG" --repo "$REPO" --pattern "${ASSET}.sha256" --dir /tmp; then
+              echo "::error::missing checksum file ${ASSET}.sha256 in release $TAG of $REPO. Upload it with 'gh release upload $TAG ${ASSET}.sha256 --repo $REPO' or pin to a newer release that ships the checksum."
+              exit 1
+            fi
+            EXPECTED_SHA=$(awk '{print $1}' "/tmp/${ASSET}.sha256")
+            ACTUAL_SHA=$(sha256sum "/tmp/$ASSET" | awk '{print $1}')
+            if [ -z "$EXPECTED_SHA" ]; then
+              echo "::error::could not parse expected checksum from /tmp/${ASSET}.sha256"
+              exit 1
+            fi
+            if [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
+              echo "::error::checksum mismatch for ${ASSET}: expected $EXPECTED_SHA got $ACTUAL_SHA"
+              exit 1
+            fi
+            echo "Checksum OK for ${ASSET}: $ACTUAL_SHA"
             unzip -qo "/tmp/$ASSET" -d /tmp
           done
           chmod +x /tmp/plan-executor /tmp/sjv
@@ -231,20 +270,40 @@ jobs:
 
           PLAN_FILE="plan.md"
 
-          # Install additional marketplaces from **add-marketplaces:** header
+          # Install additional marketplaces from **add-marketplaces:** header.
+          # Each entry MUST appear in $ALLOWED_MARKETPLACES (workflow env at
+          # top of file) — see Sec F-6. Unknown values fail the build.
           MARKETPLACES=$(grep -i '^\*\*add-marketplaces:\*\*' "$PLAN_FILE" | sed 's/.*\*\*[[:space:]]*//' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
           for mp in $MARKETPLACES; do
             [ -z "$mp" ] && continue
             [[ "$mp" == "andreas-pohl-parloa/plan-executor-plugin" ]] && continue
+            case " $ALLOWED_MARKETPLACES " in
+              *" $mp "*)
+                ;;
+              *)
+                echo "::error::marketplace $mp not in allow-list (ALLOWED_MARKETPLACES). To permit it, edit docs/remote-execution/execute-plan.yml and add the slug to env.ALLOWED_MARKETPLACES."
+                exit 1
+                ;;
+            esac
             echo "Adding marketplace: $mp"
             claude plugin marketplace add "$mp" || true
           done
 
-          # Install additional plugins from **add-plugins:** header
+          # Install additional plugins from **add-plugins:** header.
+          # Each entry MUST appear in $ALLOWED_PLUGINS (workflow env at top
+          # of file) — see Sec F-6. Unknown values fail the build.
           PLUGINS=$(grep -i '^\*\*add-plugins:\*\*' "$PLAN_FILE" | sed 's/.*\*\*[[:space:]]*//' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
           for pl in $PLUGINS; do
             [ -z "$pl" ] && continue
             [[ "$pl" == "plan-executor@plan-executor" ]] && continue
+            case " $ALLOWED_PLUGINS " in
+              *" $pl "*)
+                ;;
+              *)
+                echo "::error::plugin $pl not in allow-list (ALLOWED_PLUGINS). To permit it, edit docs/remote-execution/execute-plan.yml and add the slug to env.ALLOWED_PLUGINS."
+                exit 1
+                ;;
+            esac
             echo "Installing plugin: $pl"
             claude plugin install "$pl" || true
           done
