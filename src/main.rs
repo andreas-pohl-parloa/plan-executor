@@ -1,7 +1,9 @@
 mod cli;
+mod compile;
 mod config;
 mod daemon;
 mod executor;
+mod finding;
 mod handoff;
 mod ipc;
 mod remote;

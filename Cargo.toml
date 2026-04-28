@@ -53,7 +53,12 @@ libc = "0.2"
 # JSON Schema validation for compiled-plan manifests
 jsonschema = "0.46"
 
-[dev-dependencies]
+# Subprocess wait with timeout (used by compile::ClaudeInvoker)
+wait-timeout = "0.2"
+
+# Secure temp directory creation (used by compile::embedded_schema_path)
 tempfile = "3"
+
+[dev-dependencies]
 tokio-test = "0.4"
 dirs = "6"
