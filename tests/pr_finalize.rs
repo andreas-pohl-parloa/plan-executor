@@ -210,7 +210,7 @@ esac
             owner: owner.clone(),
             repo: repo.clone(),
             pr,
-            script_path: monitor,
+            script_path: Some(monitor),
         }
         .run(&mut ctx)
         .await,
@@ -338,7 +338,7 @@ async fn monitor_step_returns_transient_when_script_exits_nonzero() {
         owner: "octo".to_string(),
         repo: "demo".to_string(),
         pr: 1,
-        script_path: monitor,
+        script_path: Some(monitor),
     };
 
     let outcome = step.run(&mut ctx).await;
@@ -354,7 +354,7 @@ async fn monitor_step_recovery_policy_is_retry_transient_max_one() {
         owner: "octo".to_string(),
         repo: "demo".to_string(),
         pr: 1,
-        script_path: PathBuf::from("/nonexistent/pr-monitor.sh"),
+        script_path: Some(PathBuf::from("/nonexistent/pr-monitor.sh")),
     };
 
     let policy = step.recovery_policy();

@@ -17,10 +17,12 @@
 //! responsible for threading the user's merge intent into the field.
 
 use async_trait::async_trait;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
+use wait_timeout::ChildExt;
 
+use crate::compile::{join_drainer, spawn_drainer};
 use crate::job::recovery::{Backoff, RecoveryPolicy};
 use crate::job::step::{Step, StepContext};
 use crate::job::types::AttemptOutcome;
@@ -40,6 +42,82 @@ fn default_backoff() -> Backoff {
 /// has its own internal retry/poll loop; this guard prevents a runaway
 /// child from blocking the whole job indefinitely.
 const MONITOR_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+
+/// Maximum wall-clock for a single `gh` invocation. The supervisor's
+/// retry policy handles per-call transients; this hard ceiling protects
+/// against `gh` hanging on a credential prompt or network stall.
+const GH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Maximum bytes captured from each subprocess stream after a timeout
+/// or exit. Mirrors `compile::SUBPROCESS_STREAM_CAP_BYTES` so error
+/// messages stay bounded even when a child writes pathological output.
+const SUBPROCESS_STREAM_CAP_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Operator override for the absolute path to `pr-monitor.sh`. Read by
+/// [`resolve_monitor_script`]; takes priority over every fallback.
+const MONITOR_SCRIPT_ENV: &str = "PLAN_EXECUTOR_PR_MONITOR_SCRIPT";
+
+/// Resolves the absolute path to `pr-monitor.sh` at runtime.
+///
+/// Lookup order:
+///
+/// 1. `PLAN_EXECUTOR_PR_MONITOR_SCRIPT` env var (operator override).
+/// 2. The directory containing the running `plan-executor` binary,
+///    plus a sibling `share/plan-executor/` lookup.
+/// 3. The plan-executor plugin install location under
+///    `~/.claude/plugins/cache/plan-executor/plan-executor/<sha>/skills/pr-finalize/pr-monitor.sh`.
+///
+/// Returns the first candidate that exists as a regular file. `None`
+/// when no candidate is present.
+fn resolve_monitor_script() -> Option<PathBuf> {
+    if let Ok(value) = std::env::var(MONITOR_SCRIPT_ENV) {
+        let candidate = PathBuf::from(value);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let sibling = parent.join("pr-monitor.sh");
+            if sibling.is_file() {
+                return Some(sibling);
+            }
+            let share = parent.join("share/plan-executor/pr-monitor.sh");
+            if share.is_file() {
+                return Some(share);
+            }
+            // Common cargo layout: `target/{debug,release}/plan-executor`;
+            // walk one level up so `share/plan-executor/...` next to the
+            // crate root is also discoverable.
+            if let Some(grand) = parent.parent() {
+                let share2 = grand.join("share/plan-executor/pr-monitor.sh");
+                if share2.is_file() {
+                    return Some(share2);
+                }
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let plugin_root =
+            Path::new(&home).join(".claude/plugins/cache/plan-executor/plan-executor");
+        if let Ok(entries) = std::fs::read_dir(&plugin_root) {
+            for entry in entries.flatten() {
+                let candidate = entry.path().join("skills/pr-finalize/pr-monitor.sh");
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+        // Marketplaces install path (no sha intermediate dir).
+        let marketplace = Path::new(&home).join(
+            ".claude/plugins/marketplaces/plan-executor/plugins/plan-executor/skills/pr-finalize/pr-monitor.sh",
+        );
+        if marketplace.is_file() {
+            return Some(marketplace);
+        }
+    }
+    None
+}
 
 /// Whether to attempt a merge after monitor completes.
 ///
@@ -168,8 +246,10 @@ pub struct MonitorStep {
     pub repo: String,
     /// PR number.
     pub pr: u32,
-    /// Absolute path to `pr-monitor.sh` (resolved by the CLI/registry).
-    pub script_path: PathBuf,
+    /// Optional absolute path to `pr-monitor.sh`. When `None`, the step
+    /// resolves the script at runtime via [`resolve_monitor_script`]
+    /// (env override → binary sibling → plugin install).
+    pub script_path: Option<PathBuf>,
 }
 
 #[async_trait]
@@ -190,14 +270,25 @@ impl Step for MonitorStep {
     }
 
     async fn run(&self, _ctx: &mut StepContext) -> AttemptOutcome {
-        if !self.script_path.is_file() {
-            return AttemptOutcome::HardInfra {
-                error: format!("pr-monitor.sh not found at {}", self.script_path.display()),
-            };
-        }
+        let resolved = self
+            .script_path
+            .as_ref()
+            .filter(|p| p.is_file())
+            .cloned()
+            .or_else(resolve_monitor_script);
+        let script_path = match resolved {
+            Some(p) => p,
+            None => {
+                return AttemptOutcome::HardInfra {
+                    error: format!(
+                        "pr-monitor.sh not found (set {MONITOR_SCRIPT_ENV} or install plan-executor plugin)"
+                    ),
+                };
+            }
+        };
         let pr_arg = self.pr.to_string();
         let repo_arg = format!("{}/{}", self.owner, self.repo);
-        let mut cmd = Command::new(self.script_path.as_os_str());
+        let mut cmd = Command::new(script_path.as_os_str());
         cmd.arg("--repo")
             .arg(repo_arg.as_str())
             .arg("--pr")
@@ -213,32 +304,41 @@ impl Step for MonitorStep {
                 };
             }
         };
-        let result = match wait_timeout::ChildExt::wait_timeout(&mut child, MONITOR_TIMEOUT) {
-            Ok(Some(status)) => status,
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return AttemptOutcome::TransientInfra {
-                    error: format!(
-                        "pr-monitor.sh exceeded {} s timeout",
-                        MONITOR_TIMEOUT.as_secs()
-                    ),
-                };
-            }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return AttemptOutcome::TransientInfra {
-                    error: format!("pr-monitor.sh wait failed: {e}"),
-                };
-            }
-        };
-        if result.success() {
-            AttemptOutcome::Success
-        } else {
-            AttemptOutcome::TransientInfra {
-                error: format!("pr-monitor.sh exited with code {:?}", result.code()),
-            }
+        // Drainers MUST run alongside `wait_timeout`. Without them the
+        // child blocks on `write()` once the pipe buffer fills, and the
+        // wait deadline cannot fire until the child exits on its own.
+        let stdout_handle = child
+            .stdout
+            .take()
+            .map(|s| spawn_drainer(s, SUBPROCESS_STREAM_CAP_BYTES));
+        let stderr_handle = child
+            .stderr
+            .take()
+            .map(|s| spawn_drainer(s, SUBPROCESS_STREAM_CAP_BYTES));
+
+        let wait_result = child.wait_timeout(MONITOR_TIMEOUT);
+        let needs_kill = matches!(wait_result, Ok(None) | Err(_));
+        if needs_kill {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _stdout = stdout_handle.map(join_drainer).unwrap_or_default();
+        let _stderr = stderr_handle.map(join_drainer).unwrap_or_default();
+
+        match wait_result {
+            Ok(Some(status)) if status.success() => AttemptOutcome::Success,
+            Ok(Some(status)) => AttemptOutcome::TransientInfra {
+                error: format!("pr-monitor.sh exited with code {:?}", status.code()),
+            },
+            Ok(None) => AttemptOutcome::TransientInfra {
+                error: format!(
+                    "pr-monitor.sh exceeded {} s timeout",
+                    MONITOR_TIMEOUT.as_secs()
+                ),
+            },
+            Err(e) => AttemptOutcome::TransientInfra {
+                error: format!("pr-monitor.sh wait failed: {e}"),
+            },
         }
     }
 }
@@ -360,18 +460,67 @@ struct GhError {
 
 /// Runs `gh <args>`, capturing stdout. Errors are categorized for the
 /// caller so each step can map them to the right `AttemptOutcome`.
+///
+/// Subprocess hygiene:
+///   - `stdin` is nulled so `gh` cannot block on a credential prompt.
+///   - stdout/stderr are drained in background threads to avoid pipe-
+///     buffer deadlocks on chatty subcommands.
+///   - The wait is bounded by [`GH_TIMEOUT`]; on expiry the child is
+///     killed and the call is reported as transient (the supervisor's
+///     retry policy decides whether to attempt again).
 fn run_gh_capture(args: &[&str]) -> Result<String, GhError> {
-    let output = Command::new("gh")
+    let mut child = Command::new("gh")
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| GhError {
             kind: GhFailureKind::SpawnFailed,
             error: format!("failed to spawn gh: {e}"),
         })?;
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+
+    let stdout_handle = child
+        .stdout
+        .take()
+        .map(|s| spawn_drainer(s, SUBPROCESS_STREAM_CAP_BYTES));
+    let stderr_handle = child
+        .stderr
+        .take()
+        .map(|s| spawn_drainer(s, SUBPROCESS_STREAM_CAP_BYTES));
+
+    let wait_result = child.wait_timeout(GH_TIMEOUT);
+    let needs_kill = matches!(wait_result, Ok(None) | Err(_));
+    if needs_kill {
+        let _ = child.kill();
+        let _ = child.wait();
     }
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stdout = stdout_handle.map(join_drainer).unwrap_or_default();
+    let stderr = stderr_handle.map(join_drainer).unwrap_or_default();
+
+    let status = match wait_result {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            return Err(GhError {
+                kind: GhFailureKind::Transient,
+                error: format!(
+                    "gh {} timed out after {}s",
+                    args.join(" "),
+                    GH_TIMEOUT.as_secs()
+                ),
+            });
+        }
+        Err(e) => {
+            return Err(GhError {
+                kind: GhFailureKind::Transient,
+                error: format!("gh {} wait failed: {e}", args.join(" ")),
+            });
+        }
+    };
+
+    if status.success() {
+        return Ok(stdout);
+    }
     let kind = if is_transient_gh_error(&stderr) {
         GhFailureKind::Transient
     } else {
@@ -382,7 +531,7 @@ fn run_gh_capture(args: &[&str]) -> Result<String, GhError> {
         error: format!(
             "gh {} failed (status {:?}): {}",
             args.join(" "),
-            output.status.code(),
+            status.code(),
             stderr.trim()
         ),
     })
@@ -390,16 +539,23 @@ fn run_gh_capture(args: &[&str]) -> Result<String, GhError> {
 
 /// Returns `true` when stderr indicates a transient gh API hiccup that the
 /// supervisor's `RetryTransient` policy is meant to absorb.
+///
+/// Sec F-12: HTTP status codes (`502`/`503`/`504`) and the `timeout` keyword
+/// are matched as whole tokens (split on non-alphanumerics) rather than
+/// substrings, so unrelated text containing those characters cannot
+/// misclassify a hard failure as transient.
 fn is_transient_gh_error(stderr: &str) -> bool {
     let lower = stderr.to_ascii_lowercase();
+    let has_token = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| matches!(tok, "502" | "503" | "504" | "timeout"));
+    if has_token {
+        return true;
+    }
     lower.contains("rate limit")
         || lower.contains("connection reset")
         || lower.contains("timed out")
-        || lower.contains("timeout")
         || lower.contains("temporary failure")
-        || lower.contains("503")
-        || lower.contains("502")
-        || lower.contains("504")
         || lower.contains("network is unreachable")
 }
 

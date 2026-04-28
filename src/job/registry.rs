@@ -4,8 +4,6 @@
 //! Other variants panic via `unimplemented!()` and will be populated in later
 //! phases.
 
-use std::path::PathBuf;
-
 use crate::job::step::Step;
 use crate::job::steps;
 use crate::job::steps::pr_finalize::MergeMode as RuntimeMergeMode;
@@ -80,7 +78,10 @@ pub fn steps_for(kind: &JobKind) -> Vec<Box<dyn Step>> {
                 owner: owner.clone(),
                 repo: repo.clone(),
                 pr: *pr,
-                script_path: PathBuf::from("pr-monitor.sh"),
+                // `None` defers resolution to runtime — the step looks at
+                // `PLAN_EXECUTOR_PR_MONITOR_SCRIPT`, the binary's sibling
+                // dir, then the plan-executor plugin install location.
+                script_path: None,
             }),
             Box::new(steps::pr_finalize::MergeStep {
                 owner: owner.clone(),
