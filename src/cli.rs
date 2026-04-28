@@ -560,8 +560,9 @@ fn detect_owner_repo_via_gh() -> Option<(String, String)> {
 ///
 /// Returns an error when `gh repo view` cannot resolve the repo (and the
 /// caller did not pass `--owner`/`--repo`), when the job store cannot be
-/// opened, or when persisting `job.json` fails.
-fn run_pr_finalize(
+/// opened, when persisting `job.json` fails, or when the synchronous
+/// pipeline reports a non-success outcome on any step.
+async fn run_pr_finalize(
     pr: u32,
     owner: Option<String>,
     repo: Option<String>,
@@ -636,7 +637,7 @@ fn run_pr_finalize(
     let job = Job {
         id: JobId(uuid::Uuid::new_v4().to_string()),
         kind,
-        state: JobState::Pending,
+        state: JobState::Running,
         created_at: chrono::Utc::now().to_rfc3339(),
         steps: step_instances,
     };
@@ -646,10 +647,23 @@ fn run_pr_finalize(
 
     let short_id = &job.id.0[..job.id.0.len().min(8)];
     println!(
-        "Queued pr-finalize job (id {}) at {}",
+        "Running pr-finalize job (id {}) at {}",
         short_id,
         dir.path().display()
     );
+
+    // Run the 5-step pipeline synchronously. The daemon's dispatcher only
+    // hydrates `JobKind::Plan` today, so deferring to the daemon would
+    // dead-letter the job. Workdir is the current dir — gh subprocesses
+    // resolve owner/repo via the args we already validated above, not via
+    // a git remote inside workdir.
+    let workdir = std::env::current_dir().context("resolving current working directory")?;
+    let success =
+        run_rust_scheduler_pipeline(runtime_steps, dir.path().to_path_buf(), workdir).await;
+    if !success {
+        anyhow::bail!("pr-finalize pipeline failed (see job dir for per-step logs)");
+    }
+    println!("pr-finalize job {short_id} succeeded");
     Ok(())
 }
 
@@ -830,7 +844,14 @@ fn run_subcommand(command: RunCommand, config_path: Option<&Path>) -> Result<()>
             if remote {
                 run_pr_finalize_remote(pr, owner, repo, merge, merge_admin, config_path)
             } else {
-                run_pr_finalize(pr, owner, repo, merge, merge_admin)
+                // The pipeline awaits sub-step async work (gh subprocesses,
+                // monitor wait). Spin up a single-threaded runtime locally
+                // so this stays a synchronous CLI entry point.
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .context("creating tokio runtime for pr-finalize pipeline")?;
+                rt.block_on(run_pr_finalize(pr, owner, repo, merge, merge_admin))
             }
         }
     }
