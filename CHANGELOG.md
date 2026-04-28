@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.41.6] - 2026-04-28
+
+### Bug Fixes
+
+- **pr_finalize:** MonitorStep passes the 8 args pr-monitor.sh requires ([adec65f](https://github.com/andreas-pohl-parloa/plan-executor/commit/adec65f0577601fd5e2f3cc0a809121a776394c9))
 ## [0.41.5] - 2026-04-28
 
 ### Bug Fixes
