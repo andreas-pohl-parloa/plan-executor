@@ -5,4 +5,7 @@
 //! waves will introduce execution, recovery, and storage submodules.
 
 pub mod recovery;
+pub mod registry;
+pub mod step;
+pub mod steps;
 pub mod types;
