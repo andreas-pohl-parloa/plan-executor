@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.41.4] - 2026-04-28
+
+### Bug Fixes
+
+- **cli:** Run pr-finalize pipeline synchronously ([df3c7d9](https://github.com/andreas-pohl-parloa/plan-executor/commit/df3c7d9d5241769af802fcdea5d2edcdc5bc01c2))
 ## [0.41.3] - 2026-04-28
 
 ### Miscellaneous
