@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.37.0] - 2026-04-28
+
+### Bug Fixes
+
+- **cli:** Hard-fail compile-fix-waves on --plan vs manifest.plan.path mismatch (F5) ([42109fc](https://github.com/andreas-pohl-parloa/plan-executor/commit/42109fc684fb47b04fe62e4558a8231b0d342c2b))
+- **compile:** Address review findings F1-F4,F6-F10,F12 in append_fix_waves ([28b84c8](https://github.com/andreas-pohl-parloa/plan-executor/commit/28b84c8c7a934bffab671dc7ed5b26377214fc9c))
+- **cli:** Cap manifest preflight read at 16 MiB to match append_fix_waves (N2) ([b2d9285](https://github.com/andreas-pohl-parloa/plan-executor/commit/b2d92859526b69efdd0f8e77373e92fdd2bafe89))
+- **compile:** Address attempt-2 review findings N1,N3,N4,SEC-9..SEC-11 ([adf0661](https://github.com/andreas-pohl-parloa/plan-executor/commit/adf066149cbc33e308df15f24c8145d34169d503))
+- **compile:** Kill child on wait_timeout Err + correct SEC-11 cleanup doc ([f38bd2f](https://github.com/andreas-pohl-parloa/plan-executor/commit/f38bd2fe01d2850d91ffc8cc07af59d68834d068))
+
+### Features
+
+- Add Finding type mirroring findings.schema.json ([f2d44c1](https://github.com/andreas-pohl-parloa/plan-executor/commit/f2d44c1603c85ea66bf67466598635bf99641d93))
+- Add append_fix_waves for code-review fix-loop ([29a2d92](https://github.com/andreas-pohl-parloa/plan-executor/commit/29a2d92348db250a9585f8edbc43d64b9b9bbcfe))
+- Add plan-executor compile-fix-waves CLI subcommand ([ddd2033](https://github.com/andreas-pohl-parloa/plan-executor/commit/ddd20336c847e0827b59ef682d562430ab7e4825))
 ## [0.36.1] - 2026-04-27
 
 ### Refactoring
