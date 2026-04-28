@@ -3,9 +3,9 @@
 //! Provides types and functions for triggering plan execution in a
 //! remote GitHub repository via the GitHub API and CLI.
 
-use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// Metadata describing a remote execution request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,8 +30,15 @@ pub fn branch_name(plan_filename: &str, iso_timestamp: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or(plan_filename);
     // Sanitize stem: keep only safe characters for git branch names
-    let safe_stem: String = stem.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
+    let safe_stem: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     // Parse "2026-04-08T14:30:22Z" -> "20260408-143022"
     let ts = iso_timestamp
@@ -52,8 +59,8 @@ pub fn branch_name(plan_filename: &str, iso_timestamp: &str) -> String {
 /// Returns an error if git commands fail or the remote URL cannot be parsed.
 pub fn gather_git_context(repo_dir: &Path) -> Result<(String, String, String)> {
     let origin_url = run_git(repo_dir, &["remote", "get-url", "origin"])?;
-    let repo_slug = parse_repo_slug(&origin_url)
-        .context("Could not parse owner/repo from git remote URL")?;
+    let repo_slug =
+        parse_repo_slug(&origin_url).context("Could not parse owner/repo from git remote URL")?;
     let head_sha = run_git(repo_dir, &["rev-parse", "HEAD"])?;
     let branch = run_git(repo_dir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     Ok((repo_slug, head_sha, branch))
@@ -80,25 +87,36 @@ pub fn parse_repo_slug(url: &str) -> Option<String> {
         return None;
     };
     // Validate owner/repo format — reject traversal or injection attempts
-    if validate_repo_slug(&slug) { Some(slug) } else { None }
+    if validate_repo_slug(&slug) {
+        Some(slug)
+    } else {
+        None
+    }
 }
 
 /// Returns true if the string matches a valid `owner/repo` GitHub slug.
 pub fn validate_repo_slug(slug: &str) -> bool {
     let parts: Vec<&str> = slug.splitn(3, '/').collect();
-    if parts.len() != 2 { return false; }
+    if parts.len() != 2 {
+        return false;
+    }
     let valid_part = |s: &str| {
         !s.is_empty()
             && !s.contains("..")
-            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
     };
     valid_part(parts[0]) && valid_part(parts[1])
 }
 
 /// Finds `.tmp-subtask-*.md` files co-located with the plan file.
 pub fn find_prompt_files(plan_path: &Path) -> Vec<PathBuf> {
-    let Some(dir) = plan_path.parent() else { return vec![] };
-    let Ok(entries) = std::fs::read_dir(dir) else { return vec![] };
+    let Some(dir) = plan_path.parent() else {
+        return vec![];
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
     entries
         .flatten()
         .filter_map(|e| {
@@ -140,8 +158,12 @@ pub fn create_repo(repo: &str) -> Result<()> {
     // --add-readme ensures the repo has at least one commit on main,
     // which is required for the Contents API to push the workflow file.
     run_gh(&[
-        "repo", "create", repo, "--private",
-        "--description", "Remote plan execution",
+        "repo",
+        "create",
+        repo,
+        "--private",
+        "--description",
+        "Remote plan execution",
         "--add-readme",
     ])?;
     Ok(())
@@ -153,8 +175,10 @@ pub fn ensure_environment(repo: &str) -> Result<()> {
     // GitHub REST API: PUT /repos/{owner}/{repo}/environments/{name}
     // This creates or updates the environment.
     run_gh(&[
-        "api", &format!("repos/{}/environments/execution", repo),
-        "-X", "PUT",
+        "api",
+        &format!("repos/{}/environments/execution", repo),
+        "-X",
+        "PUT",
     ])?;
     Ok(())
 }
@@ -163,7 +187,8 @@ pub fn ensure_environment(repo: &str) -> Result<()> {
 const EXECUTE_PLAN_WORKFLOW: &str = include_str!("../docs/remote-execution/execute-plan.yml");
 
 fn execution_repo_readme(repo: &str) -> String {
-    format!(r#"# {repo}
+    format!(
+        r#"# {repo}
 
 Remote plan execution repo. Plans marked with `**execution:** remote` are
 executed here on GitHub Actions runners instead of locally.
@@ -198,7 +223,9 @@ Configured via `plan-executor remote-setup`:
 
 - [plan-executor](https://github.com/andreas-pohl-parloa/plan-executor) — the CLI daemon and execution engine
 - [plan-executor-plugin](https://github.com/andreas-pohl-parloa/plan-executor-plugin) — Claude Code plugin with orchestration skills
-"#, repo = repo)
+"#,
+        repo = repo
+    )
 }
 
 /// Pushes the execute-plan workflow and README to the execution repo.
@@ -216,7 +243,14 @@ pub fn push_workflow(remote_repo: &str) -> Result<()> {
     let _ = std::fs::remove_dir_all(&tmp);
 
     // Clone
-    run_gh(&["repo", "clone", remote_repo, &tmp.to_string_lossy(), "--", "--depth=1"])?;
+    run_gh(&[
+        "repo",
+        "clone",
+        remote_repo,
+        &tmp.to_string_lossy(),
+        "--",
+        "--depth=1",
+    ])?;
 
     // Write workflow file
     let wf_dir = tmp.join(".github").join("workflows");
@@ -227,7 +261,10 @@ pub fn push_workflow(remote_repo: &str) -> Result<()> {
     std::fs::write(tmp.join("README.md"), execution_repo_readme(remote_repo))?;
 
     // Commit and push
-    run_git(&tmp, &["add", ".github/workflows/execute-plan.yml", "README.md"])?;
+    run_git(
+        &tmp,
+        &["add", ".github/workflows/execute-plan.yml", "README.md"],
+    )?;
 
     // Check if there's anything to commit (files might already be up to date)
     let status = run_git(&tmp, &["status", "--porcelain"])?;
@@ -236,11 +273,18 @@ pub fn push_workflow(remote_repo: &str) -> Result<()> {
         return Ok(()); // already up to date
     }
 
-    run_git(&tmp, &[
-        "-c", "user.name=plan-executor",
-        "-c", "user.email=plan-executor@noreply",
-        "commit", "-m", "chore: update workflow and README",
-    ])?;
+    run_git(
+        &tmp,
+        &[
+            "-c",
+            "user.name=plan-executor",
+            "-c",
+            "user.email=plan-executor@noreply",
+            "commit",
+            "-m",
+            "chore: update workflow and README",
+        ],
+    )?;
 
     match run_git(&tmp, &["push"]) {
         Ok(_) => {
@@ -284,31 +328,46 @@ fn push_workflow_via_pr(remote_repo: &str, repo_dir: &Path) -> Result<()> {
     // Enable auto-merge on the repo (idempotent; ignore errors, we fall
     // back to a direct merge attempt below).
     let _ = run_gh(&[
-        "api", &format!("repos/{}", remote_repo),
-        "-X", "PATCH",
-        "-F", "allow_auto_merge=true",
+        "api",
+        &format!("repos/{}", remote_repo),
+        "-X",
+        "PATCH",
+        "-F",
+        "allow_auto_merge=true",
     ]);
 
     // Open PR (or reuse an existing one). If PR creation fails because a
     // PR already exists for this branch, look it up.
     let pr_url = match run_gh(&[
-        "pr", "create",
-        "--repo", remote_repo,
-        "--head", branch,
-        "--base", "main",
-        "--title", "chore: add execute-plan workflow",
-        "--body", "Automated setup by `plan-executor remote-setup`.\n\n\
+        "pr",
+        "create",
+        "--repo",
+        remote_repo,
+        "--head",
+        branch,
+        "--base",
+        "main",
+        "--title",
+        "chore: add execute-plan workflow",
+        "--body",
+        "Automated setup by `plan-executor remote-setup`.\n\n\
                    Adds the execute-plan GitHub Actions workflow and the README.",
     ]) {
         Ok(url) => url.trim().to_string(),
         Err(_) => {
             let out = run_gh(&[
-                "pr", "list",
-                "--repo", remote_repo,
-                "--head", branch,
-                "--state", "open",
-                "--json", "url",
-                "--jq", ".[0].url",
+                "pr",
+                "list",
+                "--repo",
+                remote_repo,
+                "--head",
+                branch,
+                "--state",
+                "open",
+                "--json",
+                "url",
+                "--jq",
+                ".[0].url",
             ])?;
             let url = out.trim().to_string();
             anyhow::ensure!(!url.is_empty(), "failed to create or find setup PR");
@@ -325,18 +384,27 @@ fn push_workflow_via_pr(remote_repo: &str, repo_dir: &Path) -> Result<()> {
     // required checks exist). Otherwise fall back to auto-merge, which
     // completes once required checks pass.
     match run_gh(&[
-        "pr", "merge", &pr_num_s,
-        "--repo", remote_repo,
-        "--squash", "--delete-branch",
+        "pr",
+        "merge",
+        &pr_num_s,
+        "--repo",
+        remote_repo,
+        "--squash",
+        "--delete-branch",
     ]) {
         Ok(_) => {
             println!("  Merged.");
             Ok(())
         }
         Err(immediate_err) => match run_gh(&[
-            "pr", "merge", &pr_num_s,
-            "--repo", remote_repo,
-            "--squash", "--auto", "--delete-branch",
+            "pr",
+            "merge",
+            &pr_num_s,
+            "--repo",
+            remote_repo,
+            "--squash",
+            "--auto",
+            "--delete-branch",
         ]) {
             Ok(_) => {
                 println!("  Auto-merge enabled. PR will merge once required checks pass.");
@@ -374,10 +442,14 @@ pub fn trigger_remote_execution(
 
     // Create branch from main
     run_gh(&[
-        "api", &format!("repos/{}/git/refs", remote_repo),
-        "-X", "POST",
-        "-f", &format!("ref=refs/heads/{}", branch),
-        "-f", &format!("sha={}", get_main_sha(remote_repo)?),
+        "api",
+        &format!("repos/{}/git/refs", remote_repo),
+        "-X",
+        "POST",
+        "-f",
+        &format!("ref=refs/heads/{}", branch),
+        "-f",
+        &format!("sha={}", get_main_sha(remote_repo)?),
     ])?;
 
     // Push execution.json
@@ -392,7 +464,10 @@ pub fn trigger_remote_execution(
 
     // Push prompt files
     for pf in &prompt_files {
-        let name = pf.file_name().and_then(|n| n.to_str()).unwrap_or("prompt.md");
+        let name = pf
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("prompt.md");
         let content = std::fs::read_to_string(pf)?;
         let dest = format!("prompt-files/{}", name);
         push_file_to_branch(remote_repo, &branch, &dest, &content)?;
@@ -400,11 +475,16 @@ pub fn trigger_remote_execution(
 
     // Create PR
     let pr_url = run_gh(&[
-        "pr", "create",
-        "--repo", remote_repo,
-        "--head", &branch,
-        "--title", &title,
-        "--body", &format!(
+        "pr",
+        "create",
+        "--repo",
+        remote_repo,
+        "--head",
+        &branch,
+        "--title",
+        &title,
+        "--body",
+        &format!(
             "## Remote Execution\n\n\
              **Target:** {repo}@{ref_short}\n\
              **Branch:** {branch}\n\
@@ -428,11 +508,16 @@ pub fn trigger_remote_execution(
 /// Returns an error if the `gh` command or JSON parsing fails.
 pub fn list_remote_executions(remote_repo: &str) -> Result<Vec<RemoteJob>> {
     let output = run_gh(&[
-        "pr", "list",
-        "--repo", remote_repo,
-        "--state", "all",
-        "--limit", "20",
-        "--json", "number,title,state,labels,createdAt,closedAt",
+        "pr",
+        "list",
+        "--repo",
+        remote_repo,
+        "--state",
+        "all",
+        "--limit",
+        "20",
+        "--json",
+        "number,title,state,labels,createdAt,closedAt",
     ])?;
     let prs: Vec<serde_json::Value> = serde_json::from_str(&output)?;
     let now = chrono::Utc::now();
@@ -481,7 +566,9 @@ pub fn list_remote_executions(remote_repo: &str) -> Result<Vec<RemoteJob>> {
             .as_str()
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
         let duration_seconds = created_at.map(|start| {
-            let end = closed_at.map(|c| c.with_timezone(&chrono::Utc)).unwrap_or(now);
+            let end = closed_at
+                .map(|c| c.with_timezone(&chrono::Utc))
+                .unwrap_or(now);
             (end - start.with_timezone(&chrono::Utc))
                 .num_seconds()
                 .max(0) as u64
@@ -515,16 +602,23 @@ pub struct RemoteJob {
 /// `state` is "OPEN", "CLOSED", or "MERGED".
 pub fn get_pr_status(remote_repo: &str, pr_number: u64) -> Result<(String, Vec<String>)> {
     let output = run_gh(&[
-        "pr", "view",
+        "pr",
+        "view",
         &pr_number.to_string(),
-        "--repo", remote_repo,
-        "--json", "state,labels",
+        "--repo",
+        remote_repo,
+        "--json",
+        "state,labels",
     ])?;
     let val: serde_json::Value = serde_json::from_str(&output)?;
     let state = val["state"].as_str().unwrap_or("UNKNOWN").to_string();
     let labels: Vec<String> = val["labels"]
         .as_array()
-        .map(|arr| arr.iter().filter_map(|l| l["name"].as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| l["name"].as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     Ok((state, labels))
 }
@@ -568,29 +662,43 @@ fn run_gh(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn get_main_sha(remote_repo: &str) -> Result<String> {
+pub(crate) fn get_main_sha(remote_repo: &str) -> Result<String> {
     let output = run_gh(&[
-        "api", &format!("repos/{}/git/ref/heads/main", remote_repo),
-        "--jq", ".object.sha",
+        "api",
+        &format!("repos/{}/git/ref/heads/main", remote_repo),
+        "--jq",
+        ".object.sha",
     ])?;
     Ok(output.trim().to_string())
 }
 
-fn push_file_to_branch(repo: &str, branch: &str, path: &str, content: &str) -> Result<()> {
+pub(crate) fn push_file_to_branch(
+    repo: &str,
+    branch: &str,
+    path: &str,
+    content: &str,
+) -> Result<()> {
     // Reject path traversal attempts
     anyhow::ensure!(
         !path.contains("..") && !path.starts_with('/'),
-        "invalid file path: {}", path
+        "invalid file path: {}",
+        path
     );
     // GitHub Contents API requires base64-encoded content
     let encoded = base64_encode(content.as_bytes());
     run_gh(&[
-        "api", &format!("repos/{}/contents/{}", repo, path),
-        "-X", "PUT",
-        "-f", &format!("message=add {}", path),
-        "-f", &format!("branch={}", branch),
-        "-f", &format!("content={}", encoded),
-    ]).map(|_| ())
+        "api",
+        &format!("repos/{}/contents/{}", repo, path),
+        "-X",
+        "PUT",
+        "-f",
+        &format!("message=add {}", path),
+        "-f",
+        &format!("branch={}", branch),
+        "-f",
+        &format!("content={}", encoded),
+    ])
+    .map(|_| ())
 }
 
 /// Returns true if the execution repo already has a secret with this name.
@@ -598,9 +706,11 @@ fn push_file_to_branch(repo: &str, branch: &str, path: &str, content: &str) -> R
 /// wire.
 pub fn gh_secret_exists(repo: &str, name: &str) -> Result<bool> {
     let output = run_gh(&["secret", "list", "--repo", repo, "--json", "name"])?;
-    let secrets: Vec<serde_json::Value> = serde_json::from_str(&output)
-        .map_err(|e| anyhow::anyhow!("parse gh secret list: {e}"))?;
-    Ok(secrets.iter().any(|s| s.get("name").and_then(|v| v.as_str()) == Some(name)))
+    let secrets: Vec<serde_json::Value> =
+        serde_json::from_str(&output).map_err(|e| anyhow::anyhow!("parse gh secret list: {e}"))?;
+    Ok(secrets
+        .iter()
+        .any(|s| s.get("name").and_then(|v| v.as_str()) == Some(name)))
 }
 
 /// Marker embedded in a CI signing key's uid comment so subsequent
@@ -652,9 +762,15 @@ pub fn find_ci_signing_key() -> Option<CiSigningKey> {
                 if !uid.contains(CI_SIGNING_KEY_MARKER) {
                     continue;
                 }
-                let Some(fpr) = current_fpr.clone() else { continue };
+                let Some(fpr) = current_fpr.clone() else {
+                    continue;
+                };
                 let (name, email) = parse_uid(uid);
-                let key = CiSigningKey { fingerprint: fpr, name, email };
+                let key = CiSigningKey {
+                    fingerprint: fpr,
+                    name,
+                    email,
+                };
                 let is_newer = best.as_ref().map_or(true, |(ts, _)| current_created > *ts);
                 if is_newer {
                     best = Some((current_created, key));
@@ -691,8 +807,7 @@ pub fn gpg_generate_ci_key(name: &str, email: &str) -> Result<String> {
     // Forbid characters that break the uid schema. `(` and `)` are reserved
     // for the comment block; `<` and `>` terminate Name-Real.
     anyhow::ensure!(
-        !name.contains('<') && !name.contains('>')
-            && !name.contains('(') && !name.contains(')'),
+        !name.contains('<') && !name.contains('>') && !name.contains('(') && !name.contains(')'),
         "signing-key name must not contain angle brackets or parentheses"
     );
 
@@ -756,7 +871,11 @@ pub fn gpg_export_secret(fingerprint: &str) -> Result<String> {
 }
 
 fn gpg_export(fingerprint: &str, secret: bool) -> Result<String> {
-    let flag = if secret { "--export-secret-keys" } else { "--export" };
+    let flag = if secret {
+        "--export-secret-keys"
+    } else {
+        "--export"
+    };
     let output = std::process::Command::new("gpg")
         .args(["--batch", "--armor", flag, fingerprint])
         .output()
@@ -815,7 +934,11 @@ pub fn github_check_gpg_key(fingerprint: &str) -> Result<GithubGpgKeyCheck> {
         let s = l.trim().to_uppercase();
         !s.is_empty() && (fp_upper.ends_with(&s) || s.ends_with(&fp_upper))
     });
-    Ok(if hit { GithubGpgKeyCheck::Present } else { GithubGpgKeyCheck::Absent })
+    Ok(if hit {
+        GithubGpgKeyCheck::Present
+    } else {
+        GithubGpgKeyCheck::Absent
+    })
 }
 
 /// Outcome of attempting to upload the armored public key to GitHub.
@@ -835,9 +958,16 @@ pub fn github_upload_gpg_key(armored_public: &str) -> Result<GithubGpgUploadResu
     // stdin rather than argv; large keys and multiline content don't fit
     // in a shell argument cleanly anyway.
     let mut child = std::process::Command::new("gh")
-        .args(["api", "user/gpg_keys", "-X", "POST",
-               "-H", "Accept: application/vnd.github+json",
-               "-f", "armored_public_key=@-"])
+        .args([
+            "api",
+            "user/gpg_keys",
+            "-X",
+            "POST",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-f",
+            "armored_public_key=@-",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -874,7 +1004,11 @@ pub fn gh_secret_set_stdin(name: &str, repo: &str, value: &str) -> Result<()> {
     }
     let output = child.wait_with_output()?;
     if !output.status.success() {
-        anyhow::bail!("gh secret set {} failed: {}", name, String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "gh secret set {} failed: {}",
+            name,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     Ok(())
 }
@@ -940,7 +1074,10 @@ mod tests {
             plan_filename: "plan-add-feature.md".to_string(),
             started_at: "2026-04-08T14:30:00Z".to_string(),
         };
-        assert_eq!(pr_title(&meta), "exec: plan-add-feature.md @ owner/my-service");
+        assert_eq!(
+            pr_title(&meta),
+            "exec: plan-add-feature.md @ owner/my-service"
+        );
     }
 
     #[test]

@@ -115,6 +115,13 @@ pub enum RunCommand {
         /// required-reviewer checks). Mutually exclusive with `--merge`.
         #[arg(long = "merge-admin")]
         merge_admin: bool,
+        /// Dispatch to the configured execution repo via GitHub Actions
+        /// instead of running locally. Requires `remote_repo` in
+        /// `~/.plan-executor/config.json` (run `plan-executor remote-setup`
+        /// first). Pushes a `job-spec.json` to a new `exec/` branch and
+        /// opens a PR there; the GHA workflow runs the actual finalize.
+        #[arg(long)]
+        remote: bool,
     },
 }
 
@@ -646,13 +653,171 @@ fn run_pr_finalize(
     Ok(())
 }
 
+/// Run a `gh` invocation, returning trimmed stdout. Wraps spawn failures and
+/// non-zero exits into `anyhow::Error` so `?` propagates cleanly.
+fn run_gh_capture(args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new("gh")
+        .args(args)
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to run gh: {e}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "gh {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Dispatch a `pr-finalize` job to the configured remote execution repo
+/// instead of running it locally.
+///
+/// Pushes a single `job-spec.json` file to a fresh `exec/pr-finalize-…`
+/// branch on `config.remote_repo`, opens a PR against the default branch,
+/// and prints the resulting PR URL. The `kind: pr-finalize` arm of the
+/// execute-plan GHA workflow then runs `plan-executor run pr-finalize`
+/// inside a runner.
+///
+/// # Errors
+///
+/// Returns an error when:
+/// * `remote_repo` is missing from the loaded config (operator hasn't
+///   completed `plan-executor remote-setup`),
+/// * `--owner`/`--repo` are absent and `gh repo view` cannot resolve
+///   the current directory,
+/// * either slug fails [`crate::remote::validate_repo_slug`],
+/// * any of the underlying `gh api` / `gh pr create` calls fail.
+fn run_pr_finalize_remote(
+    pr: u32,
+    owner: Option<String>,
+    repo: Option<String>,
+    merge: bool,
+    merge_admin: bool,
+    config_path: Option<&Path>,
+) -> Result<()> {
+    // Mirror the local path's mutual-exclusion guard so the same error
+    // surface applies whether or not `--remote` is passed.
+    if merge && merge_admin {
+        anyhow::bail!("--merge and --merge-admin are mutually exclusive");
+    }
+
+    // Resolve the execution repo from config.
+    let cfg = crate::config::Config::load(config_path).context("loading config")?;
+    let remote_repo = cfg.remote_repo.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "remote_repo is not set in plan-executor config — run `plan-executor remote-setup` first"
+        )
+    })?;
+    if !crate::remote::validate_repo_slug(remote_repo) {
+        anyhow::bail!(
+            "invalid remote_repo in config: '{remote_repo}' — must match owner/name with chars [A-Za-z0-9._-]"
+        );
+    }
+
+    // Resolve target owner/repo: explicit args win; otherwise auto-detect
+    // the cwd via gh repo view (matches the local path's contract).
+    let (resolved_owner, resolved_repo) = match (owner, repo) {
+        (Some(o), Some(r)) => (o, r),
+        (o_opt, r_opt) => {
+            let detected = detect_owner_repo_via_gh().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "could not detect owner/repo from `gh repo view` — pass --owner and --repo explicitly, or run from a directory with a configured gh remote"
+                )
+            })?;
+            (o_opt.unwrap_or(detected.0), r_opt.unwrap_or(detected.1))
+        }
+    };
+
+    let combined_slug = format!("{resolved_owner}/{resolved_repo}");
+    if !crate::remote::validate_repo_slug(&combined_slug) {
+        anyhow::bail!(
+            "invalid owner/repo: '{combined_slug}' — must match ^[A-Za-z0-9._-]+$ for both owner and repo"
+        );
+    }
+
+    // Build job-spec.json. Field order matches the GHA workflow contract
+    // (kind, pr, merge, merge_admin, owner, repo) — the workflow parses
+    // these via jq, so the on-disk order is informational, not load-bearing.
+    let job_spec = serde_json::json!({
+        "kind": "pr-finalize",
+        "pr": pr,
+        "merge": merge,
+        "merge_admin": merge_admin,
+        "owner": resolved_owner,
+        "repo": resolved_repo,
+    });
+    let job_spec_str =
+        serde_json::to_string_pretty(&job_spec).context("serializing job-spec.json")?;
+
+    // Branch name: `exec/pr-finalize-<owner>-<repo>-<pr>-<UTC-timestamp>`.
+    // Sanitize the slug components defensively even though
+    // `validate_repo_slug` already guarantees they match `[A-Za-z0-9._-]+`.
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let branch = format!(
+        "exec/pr-finalize-{owner}-{repo}-{pr}-{ts}",
+        owner = resolved_owner,
+        repo = resolved_repo,
+    );
+
+    // 1. Look up the default branch SHA on remote_repo. The execution repo
+    //    is created with `main` as the default by `remote-setup`; reuse the
+    //    existing helper that hard-codes that assumption.
+    let base_sha = crate::remote::get_main_sha(remote_repo)
+        .context("looking up base branch SHA on remote_repo")?;
+
+    // 2. Create the new ref pointing at base_sha.
+    run_gh_capture(&[
+        "api",
+        &format!("repos/{}/git/refs", remote_repo),
+        "-X",
+        "POST",
+        "-f",
+        &format!("ref=refs/heads/{}", branch),
+        "-f",
+        &format!("sha={}", base_sha),
+    ])
+    .context("creating exec branch ref")?;
+
+    // 3. Push job-spec.json to the new branch via the Contents API.
+    crate::remote::push_file_to_branch(remote_repo, &branch, "job-spec.json", &job_spec_str)
+        .context("pushing job-spec.json")?;
+
+    // 4. Open the PR against the default branch.
+    let title = format!("pr-finalize {resolved_owner}/{resolved_repo}#{pr}");
+    let body = format!(
+        "Remote pr-finalize for {resolved_owner}/{resolved_repo}#{pr}.\n\n\
+         Triggered by `plan-executor run pr-finalize --remote`.",
+    );
+    let pr_url = run_gh_capture(&[
+        "pr",
+        "create",
+        "--repo",
+        remote_repo,
+        "--head",
+        &branch,
+        "--title",
+        &title,
+        "--body",
+        &body,
+    ])
+    .context("opening pr-finalize PR on remote_repo")?;
+
+    println!("{}", pr_url.trim());
+    Ok(())
+}
+
 /// Dispatch entry point for the `plan-executor run <subcommand>` CLI group.
+///
+/// `config_path` is the canonicalized `--config` override (or `None` for the
+/// default location). Forwarded to remote dispatch handlers that need to
+/// read `remote_repo` from the user's config.
 ///
 /// # Errors
 ///
 /// Propagates the underlying handler's error (currently only
 /// `RunCommand::PrFinalize`).
-fn run_subcommand(command: RunCommand) -> Result<()> {
+fn run_subcommand(command: RunCommand, config_path: Option<&Path>) -> Result<()> {
     match command {
         RunCommand::PrFinalize {
             pr,
@@ -660,7 +825,14 @@ fn run_subcommand(command: RunCommand) -> Result<()> {
             repo,
             merge,
             merge_admin,
-        } => run_pr_finalize(pr, owner, repo, merge, merge_admin),
+            remote,
+        } => {
+            if remote {
+                run_pr_finalize_remote(pr, owner, repo, merge, merge_admin, config_path)
+            } else {
+                run_pr_finalize(pr, owner, repo, merge, merge_admin)
+            }
+        }
     }
 }
 
@@ -717,7 +889,14 @@ pub fn run() {
             return;
         }
         Commands::Run { command } => {
-            if let Err(e) = run_subcommand(command.clone()) {
+            // Resolve --config to an absolute path before dispatch so the
+            // remote dispatch path can read `remote_repo` from the user's
+            // config file.
+            let config_path: Option<std::path::PathBuf> = cli.config.as_ref().map(|p| {
+                std::fs::canonicalize(p)
+                    .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(p))
+            });
+            if let Err(e) = run_subcommand(command.clone(), config_path.as_deref()) {
                 eprintln!("Error: {:#}", e);
                 std::process::exit(1);
             }
@@ -945,10 +1124,7 @@ fn parse_subagent_done_index(line: &str) -> Option<usize> {
     }
 }
 
-async fn execute_plan(
-    manifest_arg: String,
-    config: crate::config::Config,
-) -> Result<()> {
+async fn execute_plan(manifest_arg: String, config: crate::config::Config) -> Result<()> {
     let manifest_path = resolve_manifest_path(&manifest_arg)?;
     let (plan_path, status) = read_manifest_plan_block(&manifest_path)?;
 
@@ -1042,10 +1218,7 @@ async fn trigger_remote(
 /// the registry, runs each step against a fresh `StepContext`, and exits with
 /// status 1 on the first non-success [`AttemptOutcome`]. Sub-agent dispatch
 /// flows through `handoff::dispatch_all` inside each step.
-async fn execute_foreground(
-    manifest_arg: String,
-    config: crate::config::Config,
-) -> Result<()> {
+async fn execute_foreground(manifest_arg: String, config: crate::config::Config) -> Result<()> {
     use crate::job::registry;
     use crate::job::storage::JobStore;
     use crate::job::types::{Job, JobId, JobKind, JobState, StepInstance, StepStatus};
@@ -1112,12 +1285,9 @@ async fn execute_foreground(
 
     let _ = resolved_path; // kept in scope to mirror prior contract
 
-    let success = run_rust_scheduler_pipeline(
-        runtime_steps,
-        job_dir.path().to_path_buf(),
-        execution_root,
-    )
-    .await;
+    let success =
+        run_rust_scheduler_pipeline(runtime_steps, job_dir.path().to_path_buf(), execution_root)
+            .await;
     if !success {
         std::process::exit(1);
     }
@@ -1509,7 +1679,11 @@ fn list_jobs() {
                         .unwrap_or_else(|| "-".to_string());
                     let line = format!(
                         "#{:<width$}  {:<r_plan_w$}  {:<r_status_w$}  {:<r_target_w$}  {:>r_dur_w$}",
-                        rj.number, plan_display, rj.status, target_display, duration,
+                        rj.number,
+                        plan_display,
+                        rj.status,
+                        target_display,
+                        duration,
                         width = pr_w - 1,
                     );
                     if rj.status == "running" {
@@ -1912,7 +2086,10 @@ fn configure_commit_signing(
         } else {
             format!("{} <{}>", existing.name, existing.email)
         };
-        print!("  Found existing CI key {} ({label}). (u)se / (g)enerate new / (s)kip [default: use]: ", short);
+        print!(
+            "  Found existing CI key {} ({label}). (u)se / (g)enerate new / (s)kip [default: use]: ",
+            short
+        );
         let _ = stdout.flush();
         let mut choice = String::new();
         let _ = stdin.lock().read_line(&mut choice);
@@ -2249,11 +2426,13 @@ mod tests {
         // Verify manifest was rewritten with fix-wave 100
         let reread: serde_json::Value =
             serde_json::from_slice(&fs::read(exec_root.join("tasks.json")).unwrap()).unwrap();
-        assert!(reread["waves"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w["id"].as_u64() == Some(100) && w["kind"] == "fix"));
+        assert!(
+            reread["waves"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w["id"].as_u64() == Some(100) && w["kind"] == "fix")
+        );
 
         // Verify the fake captured 5 args
         let captured = invoker.captured_args.borrow();
