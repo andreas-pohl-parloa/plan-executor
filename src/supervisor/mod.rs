@@ -7,3 +7,4 @@
 pub mod detector;
 pub mod prompts;
 pub mod violation;
+pub mod wiring;
