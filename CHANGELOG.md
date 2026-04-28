@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.40.1] - 2026-04-28
+
+### Documentation
+
+- Refresh README for Phase D4 architecture (Rust scheduler + new CLI) ([6ff5748](https://github.com/andreas-pohl-parloa/plan-executor/commit/6ff57484edf9b94a0a362f23bca2a3f79e8b57f1))
 ## [0.40.0] - 2026-04-28
 
 ### Bug Fixes
