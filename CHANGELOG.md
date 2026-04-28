@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.41.5] - 2026-04-28
+
+### Bug Fixes
+
+- **cli:** Surface step diagnostics from run pr-finalize pipeline ([77ce9eb](https://github.com/andreas-pohl-parloa/plan-executor/commit/77ce9eb512d46fef7e85fc6177e6688c559842cf))
 ## [0.41.4] - 2026-04-28
 
 ### Bug Fixes
