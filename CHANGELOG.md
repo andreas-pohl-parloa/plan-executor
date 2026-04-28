@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.41.1] - 2026-04-28
+
+### CI/CD
+
+- Publish .sha256 sidecars alongside release zips ([15f547b](https://github.com/andreas-pohl-parloa/plan-executor/commit/15f547b54d6f9e12655f475d7b9869d55656d11d))
 ## [0.41.0] - 2026-04-28
 
 ### Features
