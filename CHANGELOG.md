@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.38.0] - 2026-04-28
+
+### Bug Fixes
+
+- Address Phase A+B code-review findings (H1-H4, M1-M3) ([331cb26](https://github.com/andreas-pohl-parloa/plan-executor/commit/331cb2611704efb1baa785ebb63b899f65e67eb0))
+
+### Documentation
+
+- Design doc for Job Framework + Protocol-Recovery Supervisor (Task 0) ([0a17fdf](https://github.com/andreas-pohl-parloa/plan-executor/commit/0a17fdfe32ed119d58169730ee9eb2415f263ffb))
+
+### Features
+
+- Introduce Job/Step/JobState core types (Phase A1.1) ([aa46fbe](https://github.com/andreas-pohl-parloa/plan-executor/commit/aa46fbe72e021c904a33065446ed6419732f5854))
+- Introduce RecoveryPolicy and Backoff types (Phase A1.2) ([45fe822](https://github.com/andreas-pohl-parloa/plan-executor/commit/45fe82217cb7baa8a0e944011e84287ee0dfd4f3))
+- Step trait + JobKind→steps registry with stub plan-step shells (Phase A2.1) ([40f597c](https://github.com/andreas-pohl-parloa/plan-executor/commit/40f597c8204cd07ce97f3ddd71364c306032e109))
+- Per-step append-only job storage (Phase A3.1) ([be0f256](https://github.com/andreas-pohl-parloa/plan-executor/commit/be0f256e9930048072634ae0018bfbffff6cf67b))
+- JobDir sub_agent_dir + JobStore::list_all back-compat (Phase A3.2 storage-side) ([1a5b73e](https://github.com/andreas-pohl-parloa/plan-executor/commit/1a5b73ef7df12f2e36c0a4fd139e76e1e793181d))
+- Plan-executor jobs subcommand group (Phase A4.1) ([9af4a82](https://github.com/andreas-pohl-parloa/plan-executor/commit/9af4a827c82aec36d724345cb16d731b02741c9e))
+- ProtocolViolation taxonomy, detector, and corrective-prompt catalog (Phase B1.1+B1.2) ([5cef6bb](https://github.com/andreas-pohl-parloa/plan-executor/commit/5cef6bbceb2cca348009c304de688c1af8f7678e))
+- SupervisorState + observe_turn wiring layer (Phase B2.1 wiring-only) ([8c396b4](https://github.com/andreas-pohl-parloa/plan-executor/commit/8c396b413a14733d75793e3ca43bb591ce528d51))
+- Rollback layer + ExhaustedNext routing in SupervisorAction (Phase B2.2) ([ba0bea3](https://github.com/andreas-pohl-parloa/plan-executor/commit/ba0bea3c3db63df6bb5d624574c0c7f09bf893cf))
 ## [0.37.0] - 2026-04-28
 
 ### Bug Fixes
