@@ -15,7 +15,7 @@ permissions:
 # `**add-marketplaces:**` / `**add-plugins:**` header lines from the plan
 # and feeds them to `claude plugin marketplace add` / `claude plugin install`.
 # Without an allow-list a malicious plan could install arbitrary plugins
-# that then run with full repo secrets (Sec F-6).
+# that then run with full repo secrets.
 #
 # Operators add new marketplaces/plugins by editing this workflow file
 # (PR-reviewed) and appending the new slug to the corresponding env var
@@ -208,7 +208,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
         run: |
-          # Sec F-14: every release zip MUST be accompanied by a sibling
+          # Every release zip MUST be accompanied by a sibling
           # `<asset>.sha256` release asset (produced by `gh release upload`
           # alongside the zip). The workflow downloads both, recomputes the
           # SHA256, and fails closed on mismatch or missing checksum file.
@@ -272,7 +272,7 @@ jobs:
 
           # Install additional marketplaces from **add-marketplaces:** header.
           # Each entry MUST appear in $ALLOWED_MARKETPLACES (workflow env at
-          # top of file) — see Sec F-6. Unknown values fail the build.
+          # top of file). Unknown values fail the build.
           MARKETPLACES=$(grep -i '^\*\*add-marketplaces:\*\*' "$PLAN_FILE" | sed 's/.*\*\*[[:space:]]*//' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
           for mp in $MARKETPLACES; do
             [ -z "$mp" ] && continue
@@ -291,7 +291,7 @@ jobs:
 
           # Install additional plugins from **add-plugins:** header.
           # Each entry MUST appear in $ALLOWED_PLUGINS (workflow env at top
-          # of file) — see Sec F-6. Unknown values fail the build.
+          # of file). Unknown values fail the build.
           PLUGINS=$(grep -i '^\*\*add-plugins:\*\*' "$PLAN_FILE" | sed 's/.*\*\*[[:space:]]*//' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
           for pl in $PLUGINS; do
             [ -z "$pl" ] && continue

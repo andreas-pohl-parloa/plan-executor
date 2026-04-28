@@ -587,7 +587,7 @@ fn run_pr_finalize(
         }
     };
 
-    // Defense-in-depth (Sec F-4): validate owner/repo charset against the same
+    // Defense-in-depth: validate owner/repo charset against the same
     // shape the GHA workflow enforces (`^[A-Za-z0-9._-]+$`). Reuses
     // `crate::remote::validate_repo_slug`, which checks both halves of the
     // slug and rejects `..`, slashes, or other injection-prone characters.

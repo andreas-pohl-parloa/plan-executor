@@ -540,8 +540,8 @@ fn run_gh_capture(args: &[&str]) -> Result<String, GhError> {
 /// Returns `true` when stderr indicates a transient gh API hiccup that the
 /// supervisor's `RetryTransient` policy is meant to absorb.
 ///
-/// Sec F-12: HTTP status codes (`502`/`503`/`504`) and the `timeout` keyword
-/// are matched as whole tokens (split on non-alphanumerics) rather than
+/// HTTP status codes (`502`/`503`/`504`) and the `timeout` keyword are
+/// matched as whole tokens (split on non-alphanumerics) rather than
 /// substrings, so unrelated text containing those characters cannot
 /// misclassify a hard failure as transient.
 fn is_transient_gh_error(stderr: &str) -> bool {

@@ -46,7 +46,7 @@ use crate::scheduler::{self, Manifest, SchedulerError};
 /// machinery can take over.
 const MAX_FIX_LOOP_ITERATIONS: u32 = 3;
 
-/// Wall-clock budget for a single `run_helper_fix_loop` invocation (Sec F-9).
+/// Wall-clock budget for a single `run_helper_fix_loop` invocation.
 ///
 /// Complements [`MAX_FIX_LOOP_ITERATIONS`]: each iteration may take 30+
 /// minutes (helper timeout + wave dispatch), so an iteration cap alone does
@@ -419,7 +419,7 @@ async fn run_helper_fix_loop(
     let loop_started = Instant::now();
     loop {
         iteration += 1;
-        // Sec F-9: enforce wall-clock budget on top of the iteration cap.
+        // Enforce wall-clock budget on top of the iteration cap.
         // Each iteration can take 30+ minutes, so without a wall-clock guard
         // the loop can far exceed any reasonable step timeout.
         if loop_started.elapsed() > MAX_FIX_LOOP_BUDGET {
@@ -589,7 +589,7 @@ async fn dispatch_fix_wave(
     // mutates `tasks.json` in place via APPEND mode. Canonicalize the
     // findings path and confirm it stays within the workdir before passing
     // it into the child process — defends against helper-supplied paths
-    // that escape the workdir via traversal or symlinks (Sec F-2).
+    // that escape the workdir via traversal or symlinks.
     let canonical_findings = match std::fs::canonicalize(&findings_path) {
         Ok(p) => p,
         Err(e) => {
@@ -783,7 +783,7 @@ fn detect_language(workdir: &Path) -> String {
 ///   the findings.json shape; otherwise wraps the helper-supplied
 ///   `findings_path` in a synthetic findings document. The triage-supplied
 ///   path is canonicalized and confirmed to live under `ctx.workdir` before
-///   it is returned (Sec F-2).
+///   it is returned.
 /// - For [`HelperLoopKind::Validation`], reads the validator's `gaps` array
 ///   from the helper's `state_updates` payload (no re-invocation — the
 ///   outer loop already paid the cost), converts each gap into a
@@ -829,7 +829,7 @@ fn build_findings_for_fix_wave(
             // consumes directly). The reviewer-team `findings_path` (when
             // present) and the validator `validation_report_path` are also
             // helper-supplied paths; we canonicalize each one and require
-            // it to remain under `ctx.workdir` before trusting it (Sec F-2).
+            // it to remain under `ctx.workdir` before trusting it.
             let triaged_findings_path = raw
                 .state_updates
                 .get("triaged_findings_path")
@@ -864,7 +864,7 @@ fn build_findings_for_fix_wave(
             // `HelperError::SemanticFailure` so we do not re-invoke the
             // helper. Decode `gaps` into `Vec<ValidationGap>` directly.
             // Optionally containment-check `validation_report_path` when the
-            // helper supplied one (Sec F-2).
+            // helper supplied one.
             if let Some(report_path_str) = state_updates
                 .get("validation_report_path")
                 .and_then(|v| v.as_str())
@@ -911,7 +911,7 @@ fn build_findings_for_fix_wave(
 /// (also canonicalized). Returns [`AttemptOutcome::ProtocolViolation`] with a
 /// `<field>_canonicalize` or `<field>_escape` category when the path cannot
 /// be canonicalized or escapes the workdir. Defends helper-supplied paths
-/// against directory-traversal and symlink escapes (Sec F-2).
+/// against directory-traversal and symlink escapes.
 fn ensure_path_under_workdir(
     path: &Path,
     workdir: &Path,
@@ -1216,7 +1216,7 @@ fn run_integration_tests(ctx: &StepContext) -> AttemptOutcome {
 /// [`crate::job::steps::pr_finalize::is_transient_gh_error`] but tuned for
 /// `cargo test` output.
 ///
-/// Sec F-12: single-word markers (`timeout`) are matched against tokens
+/// Single-word markers (`timeout`) are matched against tokens
 /// rather than substrings to avoid false positives when the marker appears
 /// inside an unrelated identifier (e.g. `MyTimeoutError`). Multi-word
 /// markers (`connection reset`, `network is unreachable`) are still matched
@@ -1242,7 +1242,7 @@ fn is_transient_test_error(stderr: &str) -> bool {
 /// Tokens are runs of ASCII alphanumerics; everything else (whitespace,
 /// punctuation, brackets, quotes, slashes, etc.) is treated as a separator.
 /// Used by [`is_transient_test_error`] and [`is_transient_gh_error`] to
-/// avoid substring false positives (Sec F-12). `lower` is expected to be
+/// avoid substring false positives. `lower` is expected to be
 /// pre-lowercased by the caller; `targets` MUST also be lowercase.
 fn has_transient_token(lower: &str, targets: &[&str]) -> bool {
     lower
@@ -1602,8 +1602,8 @@ fn run_gh_in(repo_dir: &Path, args: &[&str]) -> Result<String, GhError> {
 /// Pattern list mirrors [`crate::job::steps::pr_finalize`] so behavior stays
 /// uniform across PR-touching steps.
 ///
-/// Sec F-12: HTTP status codes (`502`/`503`/`504`) and the `timeout` keyword
-/// are matched as whole tokens via [`has_transient_token`] so unrelated
+/// HTTP status codes (`502`/`503`/`504`) and the `timeout` keyword are
+/// matched as whole tokens via [`has_transient_token`] so unrelated
 /// identifiers or numeric noise (e.g. a path containing `503`) cannot
 /// classify a hard failure as transient.
 fn is_transient_gh_error(stderr: &str) -> bool {
@@ -1696,7 +1696,7 @@ fn delegate_to_pr_finalize(ctx: &StepContext, url: &str) -> AttemptOutcome {
 /// segments. Returns `None` for any URL that doesn't match. The host is
 /// pinned to `github.com` over `https`; non-`https` schemes, alternative
 /// hosts, the misspelled `pulls` segment, and missing/non-numeric PR ids
-/// all fail (Sec F-8).
+/// all fail.
 fn parse_pr_url(url: &str) -> Option<(String, String, u32)> {
     const PREFIX: &str = "https://github.com/";
     let trimmed = url.trim();
