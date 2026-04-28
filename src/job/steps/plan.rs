@@ -24,15 +24,15 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::json;
 
 use crate::finding::{Finding, Severity};
 use crate::helper::{
-    HelperError, HelperOutput, HelperSkill, HelperStatus, PrFinalizeInput, PrFinalizeMergeMode,
-    ReviewTeamInput, ReviewTriageInput, ValidatorInput, invoke_helper, invoke_pr_finalize,
+    invoke_helper, invoke_pr_finalize, HelperError, HelperOutput, HelperSkill, HelperStatus,
+    PrFinalizeInput, PrFinalizeMergeMode, ReviewTeamInput, ReviewTriageInput, ValidatorInput,
 };
 use crate::job::recovery::{Backoff, CorrectivePromptKey, RecoveryPolicy};
 use crate::job::step::{Step, StepContext};
@@ -45,6 +45,15 @@ use crate::scheduler::{self, Manifest, SchedulerError};
 /// surfaces a `SemanticMistake` outcome so the registry-level retry/abort
 /// machinery can take over.
 const MAX_FIX_LOOP_ITERATIONS: u32 = 3;
+
+/// Wall-clock budget for a single `run_helper_fix_loop` invocation (Sec F-9).
+///
+/// Complements [`MAX_FIX_LOOP_ITERATIONS`]: each iteration may take 30+
+/// minutes (helper timeout + wave dispatch), so an iteration cap alone does
+/// not bound total wall-clock time. When this budget is exceeded the loop
+/// returns [`AttemptOutcome::TransientInfra`] so the registry-level recovery
+/// policy can decide whether to retry the step.
+const MAX_FIX_LOOP_BUDGET: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// Stub. Real preflight logic lands in a later D-phase task.
 ///
@@ -407,8 +416,24 @@ async fn run_helper_fix_loop(
     max_iterations: u32,
 ) -> AttemptOutcome {
     let mut iteration: u32 = 0;
+    let loop_started = Instant::now();
     loop {
         iteration += 1;
+        // Sec F-9: enforce wall-clock budget on top of the iteration cap.
+        // Each iteration can take 30+ minutes, so without a wall-clock guard
+        // the loop can far exceed any reasonable step timeout.
+        if loop_started.elapsed() > MAX_FIX_LOOP_BUDGET {
+            tracing::warn!(
+                kind = ?kind,
+                iteration,
+                elapsed_s = loop_started.elapsed().as_secs(),
+                budget_s = MAX_FIX_LOOP_BUDGET.as_secs(),
+                "fix-loop wall-clock budget exceeded; surfacing transient infra",
+            );
+            return AttemptOutcome::TransientInfra {
+                error: "fix-loop wall-clock budget (2h) exceeded".into(),
+            };
+        }
         let started = Instant::now();
         let helper_result = invoke_loop_helper(ctx, manifest_path, kind, iteration);
         tracing::info!(
@@ -442,14 +467,9 @@ async fn run_helper_fix_loop(
                     // `state_updates` payload from the helper's SemanticFailure
                     // is forwarded so the validation branch can decode `gaps`
                     // without re-invoking the helper.
-                    let dispatch = dispatch_fix_wave(
-                        ctx,
-                        manifest_path,
-                        kind,
-                        iteration,
-                        &state_updates,
-                    )
-                    .await;
+                    let dispatch =
+                        dispatch_fix_wave(ctx, manifest_path, kind, iteration, &state_updates)
+                            .await;
                     match dispatch {
                         FixWaveOutcome::Continue => continue,
                         FixWaveOutcome::Outcome(outcome) => return outcome,
@@ -819,11 +839,8 @@ fn build_findings_for_fix_wave(
                     detail: "triage state_updates missing triaged_findings_path".to_string(),
                 })?;
             let triaged_buf = PathBuf::from(triaged_findings_path);
-            let canonical = ensure_path_under_workdir(
-                &triaged_buf,
-                &ctx.workdir,
-                "triaged_findings_path",
-            )?;
+            let canonical =
+                ensure_path_under_workdir(&triaged_buf, &ctx.workdir, "triaged_findings_path")?;
             // If the reviewer team also reported its raw `findings_path`,
             // confirm it is contained too. We do not consume that path here
             // (the triaged file is what the CLI ingests), but a missing
@@ -1145,8 +1162,7 @@ fn run_integration_tests(ctx: &StepContext) -> AttemptOutcome {
     };
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    let mut combined =
-        Vec::with_capacity(output.stdout.len() + output.stderr.len() + 256);
+    let mut combined = Vec::with_capacity(output.stdout.len() + output.stderr.len() + 256);
     combined.extend_from_slice(b"# integration-tests\n# command: ");
     combined.extend_from_slice(INTEGRATION_TEST_PROGRAM.as_bytes());
     for arg in INTEGRATION_TEST_ARGS {
@@ -1163,10 +1179,7 @@ fn run_integration_tests(ctx: &StepContext) -> AttemptOutcome {
     combined.extend_from_slice(&output.stderr);
     if let Err(e) = std::fs::write(&log_path, &combined) {
         return AttemptOutcome::HardInfra {
-            error: format!(
-                "write integration-tests.log to {}: {e}",
-                log_path.display()
-            ),
+            error: format!("write integration-tests.log to {}: {e}", log_path.display()),
         };
     }
 
@@ -1202,17 +1215,39 @@ fn run_integration_tests(ctx: &StepContext) -> AttemptOutcome {
 /// than a `SemanticMistake`. Conservative — pattern set mirrors
 /// [`crate::job::steps::pr_finalize::is_transient_gh_error`] but tuned for
 /// `cargo test` output.
+///
+/// Sec F-12: single-word markers (`timeout`) are matched against tokens
+/// rather than substrings to avoid false positives when the marker appears
+/// inside an unrelated identifier (e.g. `MyTimeoutError`). Multi-word
+/// markers (`connection reset`, `network is unreachable`) are still matched
+/// as substrings because their phrasing is specific enough that incidental
+/// matches are negligible.
 fn is_transient_test_error(stderr: &str) -> bool {
     let lower = stderr.to_ascii_lowercase();
+    if has_transient_token(&lower, &["timeout"]) {
+        return true;
+    }
     lower.contains("connection reset")
         || lower.contains("network is unreachable")
         || lower.contains("timed out")
-        || lower.contains("timeout")
         || lower.contains("temporary failure")
         || lower.contains("rate limit")
         || lower.contains("could not download")
         || lower.contains("text file busy")
         || lower.contains("resource temporarily unavailable")
+}
+
+/// Returns `true` when any of `targets` appears as a whole token in `lower`.
+///
+/// Tokens are runs of ASCII alphanumerics; everything else (whitespace,
+/// punctuation, brackets, quotes, slashes, etc.) is treated as a separator.
+/// Used by [`is_transient_test_error`] and [`is_transient_gh_error`] to
+/// avoid substring false positives (Sec F-12). `lower` is expected to be
+/// pre-lowercased by the caller; `targets` MUST also be lowercase.
+fn has_transient_token(lower: &str, targets: &[&str]) -> bool {
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| targets.iter().any(|t| tok == *t))
 }
 
 // ---------------------------------------------------------------------------
@@ -1490,7 +1525,11 @@ fn lookup_existing_pr(branch: &str, repo: Option<&str>) -> Option<String> {
     match Command::new("gh").args(&args).output() {
         Ok(out) if out.status.success() => {
             let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if url.is_empty() { None } else { Some(url) }
+            if url.is_empty() {
+                None
+            } else {
+                Some(url)
+            }
         }
         _ => None,
     }
@@ -1562,16 +1601,20 @@ fn run_gh_in(repo_dir: &Path, args: &[&str]) -> Result<String, GhError> {
 /// Returns `true` when stderr indicates a transient gh API hiccup.
 /// Pattern list mirrors [`crate::job::steps::pr_finalize`] so behavior stays
 /// uniform across PR-touching steps.
+///
+/// Sec F-12: HTTP status codes (`502`/`503`/`504`) and the `timeout` keyword
+/// are matched as whole tokens via [`has_transient_token`] so unrelated
+/// identifiers or numeric noise (e.g. a path containing `503`) cannot
+/// classify a hard failure as transient.
 fn is_transient_gh_error(stderr: &str) -> bool {
     let lower = stderr.to_ascii_lowercase();
+    if has_transient_token(&lower, &["502", "503", "504", "timeout"]) {
+        return true;
+    }
     lower.contains("rate limit")
         || lower.contains("connection reset")
         || lower.contains("timed out")
-        || lower.contains("timeout")
         || lower.contains("temporary failure")
-        || lower.contains("503")
-        || lower.contains("502")
-        || lower.contains("504")
         || lower.contains("network is unreachable")
 }
 
@@ -1602,9 +1645,7 @@ fn run_summary(ctx: &StepContext, manifest_path: &Path) -> AttemptOutcome {
         }
         // skip_pr=false but no PR URL on disk; fall through to the local
         // summary so the run still produces an artifact.
-        tracing::warn!(
-            "summary: skip_pr=false but no pr-url file present; writing local summary",
-        );
+        tracing::warn!("summary: skip_pr=false but no pr-url file present; writing local summary",);
     }
 
     write_local_summary(ctx, manifest_path, &plan_meta, pr_url.as_deref())
@@ -1700,10 +1741,7 @@ fn write_local_summary(
     } else {
         body.push_str("- pr_url: (none)\n");
     }
-    body.push_str(&format!(
-        "- manifest: {}\n",
-        manifest_path.display()
-    ));
+    body.push_str(&format!("- manifest: {}\n", manifest_path.display()));
     body.push_str(&format!("- job_dir: {}\n", ctx.job_dir.display()));
 
     let path = ctx.job_dir.join(SUMMARY_FILE);
