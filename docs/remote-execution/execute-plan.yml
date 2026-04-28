@@ -415,10 +415,15 @@ jobs:
           # Read execution summary written by the skill. Scope find to the
           # canonical execution directory (workspace/) to avoid picking up
           # attacker-placed files elsewhere in the runner home.
+          # workspace/ is only created when the plan path runs `Clone target
+          # repo`; pr-finalize jobs skip that step, so guard the find to
+          # avoid bash -e killing the script on missing-directory.
           SUMMARY=""
-          SUMMARY_FILE=$(find workspace -maxdepth 3 -name .tmp-execution-summary.md -not -path '*/.git/*' -print -quit 2>/dev/null)
-          if [ -n "$SUMMARY_FILE" ]; then
-            SUMMARY=$(head -c 60000 "$SUMMARY_FILE")
+          if [ -d workspace ]; then
+            SUMMARY_FILE=$(find workspace -maxdepth 3 -name .tmp-execution-summary.md -not -path '*/.git/*' -print -quit 2>/dev/null)
+            if [ -n "$SUMMARY_FILE" ]; then
+              SUMMARY=$(head -c 60000 "$SUMMARY_FILE")
+            fi
           fi
 
           if [ "$JOB_KIND" = "pr-finalize" ]; then
