@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.41.3] - 2026-04-28
+
+### Miscellaneous
+
+- Strip review-finding numbers from user-facing strings ([3f144bb](https://github.com/andreas-pohl-parloa/plan-executor/commit/3f144bb9f1440f54e5f96980b5af44325c144d1b))
 ## [0.41.2] - 2026-04-28
 
 ### Bug Fixes
