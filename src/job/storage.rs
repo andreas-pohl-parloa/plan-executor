@@ -23,10 +23,12 @@
 
 use std::fs;
 use std::io;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
 use thiserror::Error;
 
 use crate::config::Config;
@@ -129,15 +131,27 @@ type Result<T> = std::result::Result<T, JobStoreError>;
 impl JobStore {
     /// Default store at `Config::base_dir().join("jobs")`.
     ///
+    /// Hardens both `~/.plan-executor/` (the user-wide base) and
+    /// `~/.plan-executor/jobs/` to mode `0700` on Unix so other users on the
+    /// host cannot enumerate or read job state.
+    ///
     /// # Errors
     ///
     /// Returns `JobStoreError::Io` if the base directory cannot be created.
     pub fn new() -> Result<Self> {
-        let base = Config::base_dir().join("jobs");
+        let user_base = Config::base_dir();
+        fs::create_dir_all(&user_base).map_err(|source| JobStoreError::Io {
+            path: user_base.clone(),
+            source,
+        })?;
+        harden_dir_mode(&user_base)?;
+
+        let base = user_base.join("jobs");
         fs::create_dir_all(&base).map_err(|source| JobStoreError::Io {
             path: base.clone(),
             source,
         })?;
+        harden_dir_mode(&base)?;
         Ok(Self { base })
     }
 
@@ -152,6 +166,7 @@ impl JobStore {
             path: base.clone(),
             source,
         })?;
+        harden_dir_mode(&base)?;
         Ok(Self { base })
     }
 
@@ -177,6 +192,9 @@ impl JobStore {
             path: path.clone(),
             source,
         })?;
+        // Per-job dir holds plan inputs, sub-agent outputs, and credentials
+        // surfaces; lock it down so other users on the host cannot read it.
+        harden_dir_mode(&path)?;
         for step in &job.steps {
             let step_dir = step_dir_for(&path, step.seq, &step.name);
             fs::create_dir_all(step_dir.join("attempts")).map_err(|source| JobStoreError::Io {
@@ -554,18 +572,64 @@ impl JobDir {
     }
 }
 
-/// Atomic write: write to `<path>.tmp` then rename. Avoids torn files when
-/// the process crashes mid-write.
+/// Atomic write: stage bytes in a unique `<path>.<random>` temp file in the
+/// destination's parent directory, then atomically rename to `path`.
+///
+/// Uses [`tempfile::NamedTempFile`] so each writer gets its own randomized
+/// temp filename — concurrent writers no longer race on a shared `<path>.tmp`
+/// (Codex #7 / F2 hardening). On error, the temp file is dropped (and its
+/// inode unlinked) automatically; on success, `persist` performs the rename
+/// atomically on the same filesystem.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes).map_err(|source| JobStoreError::Io {
-        path: tmp.clone(),
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|source| JobStoreError::Io {
+        path: parent.to_path_buf(),
         source,
     })?;
-    fs::rename(&tmp, path).map_err(|source| JobStoreError::Io {
-        path: path.to_path_buf(),
+    let mut tmp = NamedTempFile::new_in(parent).map_err(|source| JobStoreError::Io {
+        path: parent.to_path_buf(),
         source,
-    })
+    })?;
+    tmp.write_all(bytes).map_err(|source| JobStoreError::Io {
+        path: tmp.path().to_path_buf(),
+        source,
+    })?;
+    tmp.as_file_mut()
+        .sync_all()
+        .map_err(|source| JobStoreError::Io {
+            path: tmp.path().to_path_buf(),
+            source,
+        })?;
+    tmp.persist(path).map_err(|e| JobStoreError::Io {
+        path: path.to_path_buf(),
+        source: e.error,
+    })?;
+    Ok(())
+}
+
+/// Apply `0o700` to `path` on Unix so only the owning user can list or read
+/// the directory. No-op on non-Unix targets.
+fn harden_dir_mode(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(path)
+            .map_err(|source| JobStoreError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(path, perms).map_err(|source| JobStoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
