@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::job::recovery::RecoveryPolicy;
 use crate::supervisor::detector::detect;
 use crate::supervisor::prompts::corrective_for;
 use crate::supervisor::violation::ProtocolViolation;
@@ -56,6 +57,44 @@ impl SupervisorState {
     pub fn is_exhausted(&self) -> bool {
         self.attempts_used >= self.max_attempts
     }
+
+    /// Returns the attempt number whose `attempts/<n>/checkpoint.json`
+    /// the daemon should restore on rollback, or `None` if no attempt
+    /// has run yet (and therefore no checkpoint exists).
+    ///
+    /// Returns `Some(self.attempts_used)` rather than `attempts_used - 1`
+    /// because the snapshot for attempt n is taken BEFORE attempt n
+    /// starts and lives in the dir for attempt `attempts_used`.
+    #[must_use]
+    pub fn previous_attempt(&self) -> Option<u8> {
+        if self.attempts_used >= 1 {
+            Some(self.attempts_used)
+        } else {
+            None
+        }
+    }
+}
+
+/// What the daemon should do when the retry budget is exhausted.
+///
+/// `observe_turn` always returns `ExhaustedNext::Fail` for the
+/// `Exhausted` action because it has no `RecoveryPolicy` in scope; the
+/// daemon overrides via [`classify_exhaustion`] using the configured
+/// policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExhaustedNext {
+    /// Apply rollback before continuing. `to_attempt` selects which
+    /// attempt directory's `checkpoint.json` to restore; `then` is the
+    /// recovery policy to apply after the rollback completes.
+    Rollback {
+        /// 1-indexed attempt whose checkpoint should be restored.
+        to_attempt: u8,
+        /// Recovery policy applied after the rollback.
+        then: RecoveryPolicy,
+    },
+    /// No applicable rollback configured; fail the step with
+    /// `AttemptOutcome::ProtocolViolation`.
+    Fail,
 }
 
 /// What the daemon should do after observing a turn.
@@ -76,12 +115,13 @@ pub enum SupervisorAction {
         /// The first violation observed on this turn.
         violation: ProtocolViolation,
     },
-    /// Retry budget exhausted. The daemon should hand control to the
-    /// rollback layer (B2.2) or, if rollback is also unavailable, fail
-    /// the step with `AttemptOutcome::ProtocolViolation`.
+    /// Retry budget exhausted. The daemon should consult `next_step` to
+    /// decide whether to roll back or fail the step.
     Exhausted {
         /// The first violation observed on the exhausting turn.
         last_violation: ProtocolViolation,
+        /// What the daemon should do next: roll back or fail.
+        next_step: ExhaustedNext,
     },
 }
 
@@ -113,6 +153,7 @@ pub fn observe_turn(turn: &Value, state: &mut SupervisorState) -> SupervisorActi
     if state.attempts_used >= state.max_attempts {
         return SupervisorAction::Exhausted {
             last_violation: first,
+            next_step: ExhaustedNext::Fail,
         };
     }
     state.attempts_used = recording_attempt;
@@ -121,6 +162,30 @@ pub fn observe_turn(turn: &Value, state: &mut SupervisorState) -> SupervisorActi
         corrective,
         attempt: state.attempts_used,
         violation: first,
+    }
+}
+
+/// Decides the daemon's next step on retry-budget exhaustion given the
+/// configured `RecoveryPolicy`.
+///
+/// Returns [`ExhaustedNext::Rollback`] when the policy is a
+/// `RecoveryPolicy::Rollback` whose target resolves for the current
+/// attempt; otherwise [`ExhaustedNext::Fail`].
+#[must_use]
+pub fn classify_exhaustion(
+    state: &SupervisorState,
+    policy: &RecoveryPolicy,
+    _last_violation: &ProtocolViolation,
+) -> ExhaustedNext {
+    let Some(attempt) = state.previous_attempt() else {
+        return ExhaustedNext::Fail;
+    };
+    match crate::supervisor::rollback::resolve_rollback_target(policy, attempt) {
+        Some(target) => ExhaustedNext::Rollback {
+            to_attempt: target.attempt,
+            then: target.then,
+        },
+        None => ExhaustedNext::Fail,
     }
 }
 
@@ -199,11 +264,15 @@ mod tests {
         assert!(s.is_exhausted());
         let action = observe_turn(&schedule_wakeup_turn(), &mut s);
         match action {
-            SupervisorAction::Exhausted { last_violation } => {
+            SupervisorAction::Exhausted {
+                last_violation,
+                next_step,
+            } => {
                 assert_eq!(
                     last_violation,
                     ProtocolViolation::ScheduleWakeupInNonInteractive
                 );
+                assert_eq!(next_step, ExhaustedNext::Fail);
             }
             _ => panic!("expected Exhausted, got {action:?}"),
         }
@@ -269,9 +338,89 @@ mod tests {
         let mut s = SupervisorState::new(0);
         let action = observe_turn(&forbidden_tool_turn(), &mut s);
         match action {
-            SupervisorAction::Exhausted { .. } => {}
-            other => panic!("expected Exhausted, got {other:?}"),
+            SupervisorAction::Exhausted {
+                next_step: ExhaustedNext::Fail,
+                ..
+            } => {}
+            other => panic!("expected Exhausted/Fail, got {other:?}"),
         }
         assert_eq!(s.attempts_used, 0);
+    }
+
+    #[test]
+    fn previous_attempt_is_none_for_fresh_state() {
+        let s = SupervisorState::new(3);
+        assert!(s.previous_attempt().is_none());
+    }
+
+    #[test]
+    fn previous_attempt_returns_attempts_used_after_recover() {
+        let mut s = SupervisorState::new(3);
+        let _ = observe_turn(&schedule_wakeup_turn(), &mut s);
+        assert_eq!(s.previous_attempt(), Some(1));
+    }
+
+    #[test]
+    fn classify_exhaustion_returns_fail_for_fresh_state() {
+        let s = SupervisorState::new(3);
+        let next = classify_exhaustion(
+            &s,
+            &RecoveryPolicy::None,
+            &ProtocolViolation::ScheduleWakeupInNonInteractive,
+        );
+        assert_eq!(next, ExhaustedNext::Fail);
+    }
+
+    #[test]
+    fn classify_exhaustion_returns_fail_when_policy_is_not_rollback() {
+        let mut s = SupervisorState::new(3);
+        let _ = observe_turn(&schedule_wakeup_turn(), &mut s);
+        let next = classify_exhaustion(
+            &s,
+            &RecoveryPolicy::None,
+            &ProtocolViolation::ScheduleWakeupInNonInteractive,
+        );
+        assert_eq!(next, ExhaustedNext::Fail);
+    }
+
+    #[test]
+    fn classify_exhaustion_returns_rollback_for_applicable_policy() {
+        use crate::job::recovery::CheckpointTarget;
+        let mut s = SupervisorState::new(3);
+        let _ = observe_turn(&schedule_wakeup_turn(), &mut s);
+        let _ = observe_turn(&schedule_wakeup_turn(), &mut s);
+        let policy = RecoveryPolicy::Rollback {
+            to: CheckpointTarget::PreviousAttempt,
+            then: Box::new(RecoveryPolicy::None),
+        };
+        let next = classify_exhaustion(
+            &s,
+            &policy,
+            &ProtocolViolation::ScheduleWakeupInNonInteractive,
+        );
+        assert_eq!(
+            next,
+            ExhaustedNext::Rollback {
+                to_attempt: 1,
+                then: RecoveryPolicy::None,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_exhaustion_returns_fail_for_rollback_when_no_previous_attempt() {
+        use crate::job::recovery::CheckpointTarget;
+        let mut s = SupervisorState::new(3);
+        let _ = observe_turn(&schedule_wakeup_turn(), &mut s);
+        let policy = RecoveryPolicy::Rollback {
+            to: CheckpointTarget::PreviousAttempt,
+            then: Box::new(RecoveryPolicy::None),
+        };
+        let next = classify_exhaustion(
+            &s,
+            &policy,
+            &ProtocolViolation::ScheduleWakeupInNonInteractive,
+        );
+        assert_eq!(next, ExhaustedNext::Fail);
     }
 }

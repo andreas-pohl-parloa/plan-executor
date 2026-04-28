@@ -6,5 +6,6 @@
 
 pub mod detector;
 pub mod prompts;
+pub mod rollback;
 pub mod violation;
 pub mod wiring;
