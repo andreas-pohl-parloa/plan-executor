@@ -5,13 +5,17 @@
 //! show/cancel/gc/replay verbs. The replay verb is an informational stub in
 //! Phase A; full replay arrives in Phase D.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Utc};
+use serde::Serialize;
 
 use crate::cli::JobsCommand;
+use crate::job::metrics::{AttemptOutcomeKind, JobMetrics, RecoveryKind};
 use crate::job::storage::{JobStore, JobStoreEntry};
 use crate::job::types::{Job, JobId, JobState};
 use crate::jobs::{JobMetadata, JobStatus};
@@ -29,7 +33,34 @@ pub fn dispatch(command: JobsCommand) -> Result<()> {
         JobsCommand::Cancel { id } => cmd_cancel(&id),
         JobsCommand::Gc { older_than } => cmd_gc(older_than.as_deref()),
         JobsCommand::Replay { id, from_step } => cmd_replay(&id, from_step),
+        JobsCommand::Metrics(args) => cmd_metrics(&args),
     }
+}
+
+/// Output format selection for `plan-executor jobs metrics`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum MetricsFormat {
+    /// Human-readable sectioned tables.
+    Text,
+    /// Single JSON object with all aggregates.
+    Json,
+}
+
+/// CLI arguments for `plan-executor jobs metrics`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct MetricsArgs {
+    /// Filter to jobs whose `started_at` is more recent than `now - DURATION`.
+    /// Accepts `7d`, `48h`, `30m`, `5s`. Default: no filter.
+    #[arg(long)]
+    pub since: Option<String>,
+    /// Filter by JobKind discriminant: `plan`, `pr_finalize`, `review`,
+    /// `validate`, `compile_fix_waves`. Default: all kinds.
+    #[arg(long = "job-kind")]
+    pub job_kind: Option<String>,
+    /// Output format. Default: `text`.
+    #[arg(long, value_enum, default_value_t = MetricsFormat::Text)]
+    pub format: MetricsFormat,
 }
 
 fn cmd_list() -> Result<()> {
@@ -326,7 +357,9 @@ fn job_kind_label(k: &crate::job::types::JobKind) -> String {
     use crate::job::types::JobKind::{CompileFixWaves, Plan, PrFinalize, Review, Validate};
     match k {
         Plan { manifest_path } => format!("plan(manifest={})", manifest_path.display()),
-        PrFinalize { owner, repo, pr } => format!("pr_finalize({owner}/{repo}#{pr})"),
+        PrFinalize {
+            owner, repo, pr, ..
+        } => format!("pr_finalize({owner}/{repo}#{pr})"),
         Review { branch, base } => format!("review({branch} <-> {base})"),
         Validate { manifest_path } => format!("validate(manifest={})", manifest_path.display()),
         CompileFixWaves {
@@ -365,6 +398,382 @@ fn attempt_outcome_label(o: &crate::job::types::AttemptOutcome) -> String {
         SpecDrift { gap } => format!("spec_drift({gap})"),
         Pending => "pending".to_string(),
     }
+}
+
+/// Aggregate persisted `JobMetrics` across the store and render the report.
+fn cmd_metrics(args: &MetricsArgs) -> Result<()> {
+    let store = JobStore::new().context("opening job store")?;
+    let entries = store.list_all().context("listing jobs")?;
+
+    let since_cutoff = match args.since.as_deref() {
+        None => None,
+        Some(raw) => Some(parse_since_cutoff(raw)?),
+    };
+    let job_kind_filter = args.job_kind.as_deref();
+
+    let mut report = MetricsReport::empty(args);
+    for entry in entries {
+        let JobStoreEntry::New { summary, path } = entry else {
+            continue;
+        };
+        if let Some(kind) = job_kind_filter {
+            if summary.kind_tag != kind {
+                continue;
+            }
+        }
+        let job_dir = match store.open(&summary.id) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let metrics = match job_dir.read_metrics() {
+            Ok(Some(m)) => m,
+            Ok(None) => continue,
+            Err(_) => continue,
+        };
+        if let Some(cutoff) = since_cutoff {
+            if !is_after_cutoff(&metrics.started_at, cutoff) {
+                continue;
+            }
+        }
+        let job = match job_dir.read_job() {
+            Ok(j) => j,
+            Err(_) => continue,
+        };
+        let _ = path;
+        report.absorb(&metrics, &job);
+    }
+
+    match args.format {
+        MetricsFormat::Json => emit_json(&report),
+        MetricsFormat::Text => emit_text(&report),
+    }
+    Ok(())
+}
+
+/// Parses an `--since` duration string and returns the absolute cutoff time.
+fn parse_since_cutoff(raw: &str) -> Result<DateTime<Utc>> {
+    let duration =
+        parse_duration(raw).with_context(|| format!("parsing --since value {raw:?}"))?;
+    let secs = i64::try_from(duration.as_secs())
+        .map_err(|_| anyhow!("--since duration {raw:?} is too large"))?;
+    let chrono_dur = chrono::Duration::try_seconds(secs)
+        .ok_or_else(|| anyhow!("--since duration {raw:?} is too large"))?;
+    Utc::now()
+        .checked_sub_signed(chrono_dur)
+        .ok_or_else(|| anyhow!("--since duration {raw:?} underflows current time"))
+}
+
+/// Returns true when the RFC 3339 timestamp `started_at` is at or after `cutoff`.
+fn is_after_cutoff(started_at: &str, cutoff: DateTime<Utc>) -> bool {
+    DateTime::parse_from_rfc3339(started_at)
+        .map(|dt| dt.with_timezone(&Utc) >= cutoff)
+        .unwrap_or(false)
+}
+
+/// Aggregated metrics report assembled from per-job `JobMetrics` snapshots.
+#[derive(Debug, Clone, Serialize)]
+struct MetricsReport {
+    filter: ReportFilter,
+    job_count: u32,
+    attempts_total: u32,
+    recoveries_total: u32,
+    outcomes: HashMap<String, BucketCount>,
+    recoveries: HashMap<String, BucketCount>,
+    top_retried_steps: Vec<TopStep>,
+    retry_budget_utilization: HashMap<String, BudgetUtilization>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ReportFilter {
+    since: Option<String>,
+    job_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BucketCount {
+    count: u32,
+    pct: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TopStep {
+    step: String,
+    attempts: u32,
+    most_common_outcome: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BudgetUtilization {
+    cap_hit_pct: f64,
+}
+
+/// Per-step accumulator (transient, internal to the report builder).
+#[derive(Debug, Default)]
+struct StepAccumulator {
+    attempts: u32,
+    outcome_counts: HashMap<String, u32>,
+}
+
+impl MetricsReport {
+    fn empty(args: &MetricsArgs) -> Self {
+        Self {
+            filter: ReportFilter {
+                since: args.since.clone(),
+                job_kind: args.job_kind.clone(),
+            },
+            job_count: 0,
+            attempts_total: 0,
+            recoveries_total: 0,
+            outcomes: HashMap::new(),
+            recoveries: HashMap::new(),
+            top_retried_steps: Vec::new(),
+            retry_budget_utilization: HashMap::new(),
+        }
+    }
+
+    /// Folds one job's metrics + job record into the running aggregate.
+    fn absorb(&mut self, metrics: &JobMetrics, job: &Job) {
+        self.job_count = self.job_count.saturating_add(1);
+        self.attempts_total = self.attempts_total.saturating_add(metrics.attempts_total);
+
+        for (outcome_kind, count) in &metrics.outcomes_by_kind {
+            let key = serialize_outcome_kind(outcome_kind);
+            let entry = self.outcomes.entry(key).or_insert(BucketCount {
+                count: 0,
+                pct: 0.0,
+            });
+            entry.count = entry.count.saturating_add(*count);
+        }
+
+        for (recovery_kind, count) in &metrics.recoveries_by_kind {
+            let key = serialize_recovery_kind(recovery_kind);
+            let entry = self.recoveries.entry(key.clone()).or_insert(BucketCount {
+                count: 0,
+                pct: 0.0,
+            });
+            entry.count = entry.count.saturating_add(*count);
+            self.recoveries_total = self.recoveries_total.saturating_add(*count);
+        }
+
+        // Retry-budget utilization proxy: a job whose terminal state is
+        // Failed AND that recorded recoveries of kind K is treated as having
+        // hit the cap for K. (No richer signal exists in F2.1 metrics; the
+        // task explicitly forbids adding new metrics computation.)
+        let job_failed = matches!(job.state, JobState::Failed { .. });
+        if job_failed {
+            for recovery_kind in metrics.recoveries_by_kind.keys() {
+                let key = serialize_recovery_kind(recovery_kind);
+                let bud = self
+                    .retry_budget_utilization
+                    .entry(key)
+                    .or_insert(BudgetUtilization { cap_hit_pct: 0.0 });
+                // Reuse `cap_hit_pct` as an integer accumulator until
+                // finalization, where we divide by job_count.
+                bud.cap_hit_pct += 1.0;
+            }
+        }
+
+        // Track per-step accumulator for top-K retried steps.
+        self.merge_step_accumulator(job);
+    }
+
+    /// Appends one entry per (job, step) into `top_retried_steps` as a scratch
+    /// buffer. `finalize()` collapses by step name.
+    fn merge_step_accumulator(&mut self, job: &Job) {
+        for step in &job.steps {
+            let mut counts: HashMap<String, u32> = HashMap::new();
+            for attempt in &step.attempts {
+                let kind = AttemptOutcomeKind::from(&attempt.outcome);
+                let key = serialize_outcome_kind(&kind);
+                *counts.entry(key).or_insert(0) += 1;
+            }
+            let attempts = u32::try_from(step.attempts.len()).unwrap_or(u32::MAX);
+            if attempts == 0 {
+                continue;
+            }
+            let most_common = pick_most_common(&counts).unwrap_or_else(|| "pending".to_string());
+            self.top_retried_steps.push(TopStep {
+                step: step.name.clone(),
+                attempts,
+                most_common_outcome: most_common,
+            });
+        }
+    }
+
+    /// Compute final percentages, top-K retried steps, and per-kind cap-hit
+    /// percentages. Must be called once after all jobs have been absorbed.
+    fn finalize(&mut self) {
+        let attempts_total_f = f64::from(self.attempts_total);
+        if attempts_total_f > 0.0 {
+            for bucket in self.outcomes.values_mut() {
+                bucket.pct = (f64::from(bucket.count) / attempts_total_f) * 100.0;
+            }
+        }
+        let recoveries_total_f = f64::from(self.recoveries_total);
+        if recoveries_total_f > 0.0 {
+            for bucket in self.recoveries.values_mut() {
+                bucket.pct = (f64::from(bucket.count) / recoveries_total_f) * 100.0;
+            }
+        }
+
+        // Collapse per-(job, step) entries into per-step totals.
+        let mut per_step: HashMap<String, StepAccumulator> = HashMap::new();
+        for entry in self.top_retried_steps.drain(..) {
+            let acc = per_step.entry(entry.step).or_default();
+            acc.attempts = acc.attempts.saturating_add(entry.attempts);
+            *acc.outcome_counts.entry(entry.most_common_outcome).or_insert(0) += entry.attempts;
+        }
+        let mut collapsed: Vec<TopStep> = per_step
+            .into_iter()
+            .map(|(name, acc)| TopStep {
+                step: name,
+                attempts: acc.attempts,
+                most_common_outcome: pick_most_common(&acc.outcome_counts)
+                    .unwrap_or_else(|| "pending".to_string()),
+            })
+            .collect();
+        collapsed.sort_by(|a, b| b.attempts.cmp(&a.attempts).then_with(|| a.step.cmp(&b.step)));
+        collapsed.truncate(10);
+        self.top_retried_steps = collapsed;
+
+        // Normalize cap-hit percentages: numerator currently holds a count
+        // of failed jobs that recorded the kind; divide by `job_count` so
+        // the metric reads as "% of in-scope jobs that hit cap on kind".
+        let job_count_f = f64::from(self.job_count);
+        if job_count_f > 0.0 {
+            for bud in self.retry_budget_utilization.values_mut() {
+                bud.cap_hit_pct = (bud.cap_hit_pct / job_count_f) * 100.0;
+            }
+        } else {
+            self.retry_budget_utilization.clear();
+        }
+    }
+}
+
+/// Picks the key with the largest count; ties broken alphabetically.
+fn pick_most_common(counts: &HashMap<String, u32>) -> Option<String> {
+    counts
+        .iter()
+        .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+        .map(|(k, _)| k.clone())
+}
+
+/// Serializes an `AttemptOutcomeKind` to its snake_case wire string via serde.
+fn serialize_outcome_kind(kind: &AttemptOutcomeKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.as_str().map(std::string::ToString::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Serializes a `RecoveryKind` to its snake_case wire string via serde.
+fn serialize_recovery_kind(kind: &RecoveryKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.as_str().map(std::string::ToString::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// JSON output. Single object as documented in the task contract.
+fn emit_json(report: &MetricsReport) {
+    let mut report = report.clone();
+    report.finalize();
+    match serde_json::to_string_pretty(&report) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("error serializing metrics report: {e}"),
+    }
+}
+
+/// Human-readable sectioned text output.
+fn emit_text(report: &MetricsReport) {
+    let mut report = report.clone();
+    report.finalize();
+
+    if report.job_count == 0 {
+        println!("no metrics found for filter");
+        return;
+    }
+
+    println!("Metrics aggregate ({} job(s))", report.job_count);
+    if let Some(since) = &report.filter.since {
+        println!("  filter.since:    {since}");
+    }
+    if let Some(kind) = &report.filter.job_kind {
+        println!("  filter.job_kind: {kind}");
+    }
+    println!("  attempts_total:   {}", report.attempts_total);
+    println!("  recoveries_total: {}", report.recoveries_total);
+    println!();
+
+    println!("Outcomes:");
+    print_bucket_table(&report.outcomes);
+    println!();
+
+    println!("Recoveries:");
+    if report.recoveries.is_empty() {
+        println!("  (none)");
+    } else {
+        print_bucket_table(&report.recoveries);
+    }
+    println!();
+
+    println!("Top retried steps (up to 10):");
+    if report.top_retried_steps.is_empty() {
+        println!("  (none)");
+    } else {
+        println!("  {:<32} {:>10} {:<24}", "STEP", "ATTEMPTS", "MOST_COMMON");
+        for entry in &report.top_retried_steps {
+            println!(
+                "  {:<32} {:>10} {:<24}",
+                truncate(&entry.step, 32),
+                entry.attempts,
+                truncate(&entry.most_common_outcome, 24),
+            );
+        }
+    }
+    println!();
+
+    println!("Retry-budget utilization (% of in-scope jobs that hit cap):");
+    if report.retry_budget_utilization.is_empty() {
+        println!("  (none)");
+    } else {
+        let mut entries: Vec<_> = report.retry_budget_utilization.iter().collect();
+        entries.sort_by(|a, b| {
+            b.1.cap_hit_pct
+                .partial_cmp(&a.1.cap_hit_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(b.0))
+        });
+        println!("  {:<24} {:>10}", "RECOVERY_KIND", "CAP_HIT%");
+        for (kind, util) in entries {
+            println!("  {:<24} {:>10.2}", truncate(kind, 24), util.cap_hit_pct);
+        }
+    }
+}
+
+/// Prints a `(name, count, pct)` bucket table sorted by count desc, then
+/// alphabetical.
+fn print_bucket_table(buckets: &HashMap<String, BucketCount>) {
+    let mut entries: Vec<_> = buckets.iter().collect();
+    entries.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
+    println!("  {:<24} {:>10} {:>10}", "KIND", "COUNT", "PCT");
+    for (kind, bucket) in entries {
+        println!(
+            "  {:<24} {:>10} {:>9.2}%",
+            truncate(kind, 24),
+            bucket.count,
+            bucket.pct
+        );
+    }
+}
+
+/// Truncates `s` to `max` chars; appends `…` when truncated.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
 }
 
 fn parse_duration(s: &str) -> Result<Duration> {
