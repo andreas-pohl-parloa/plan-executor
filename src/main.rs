@@ -12,6 +12,7 @@ mod plan;
 mod proctree;
 mod remote;
 mod schema;
+mod supervisor;
 mod validate;
 
 pub use config::Config;
