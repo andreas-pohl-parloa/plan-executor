@@ -27,6 +27,13 @@
 //! Mirrors [`crate::compile::ClaudeInvoker`]:
 //! - `--allowed-tools "Read,Write,Edit"` whitelists tool surface entirely
 //!   so a prompt-injected child cannot reach Bash / Grep / WebFetch.
+//! - `--add-dir <ctx.workdir>` jails the whitelisted Read/Write/Edit tools
+//!   to the per-step workdir so a prompt-injected child cannot exfiltrate
+//!   files outside the job's working tree (e.g. `~/.ssh/`,
+//!   `~/.aws/credentials`, `~/.codex/auth.json`). The helper sidecar
+//!   directory (`<ctx.workdir>/.plan-executor/helpers`) is nested inside
+//!   `ctx.workdir`, so a single `--add-dir` covers both the sidecar I/O and
+//!   the working tree the helper legitimately needs.
 //! - `--dangerously-skip-permissions` removes interactive permission
 //!   prompts so the subprocess runs unattended; orthogonal to allowed-tools.
 //! - Sensitive credential env vars are scrubbed via
@@ -278,7 +285,7 @@ pub fn invoke_helper_with(
     options: &HelperInvocation,
 ) -> Result<HelperOutput, HelperError> {
     let sidecar_path = write_input_sidecar(skill, &input, ctx)?;
-    let stdout = run_claude_subprocess(skill, &sidecar_path, options)?;
+    let stdout = run_claude_subprocess(skill, &sidecar_path, &ctx.workdir, options)?;
     parse_and_validate_output(skill, &stdout)
 }
 
@@ -320,15 +327,30 @@ fn write_input_sidecar(
 ///
 /// The process pattern (allowed-tools, scrubbed env, drainer threads,
 /// timeout, kill-on-timeout) mirrors [`crate::compile::ClaudeInvoker`].
+///
+/// `workdir` is passed verbatim to `claude --add-dir <workdir>` so the
+/// whitelisted Read/Write/Edit tools cannot escape the per-step working
+/// directory. This is the security boundary that prevents a prompt-injected
+/// helper from reading host secrets such as `~/.ssh/`, `~/.aws/credentials`,
+/// or `~/.codex/auth.json`. The helper sidecar directory lives inside
+/// `workdir`, so one `--add-dir` covers both the sidecar I/O and the
+/// working tree.
 fn run_claude_subprocess(
     skill: HelperSkill,
     sidecar_path: &std::path::Path,
+    workdir: &std::path::Path,
     options: &HelperInvocation,
 ) -> Result<String, HelperError> {
     let sidecar_str = sidecar_path.to_str().ok_or_else(|| {
         HelperError::HardInfra(format!(
             "sidecar path is not valid UTF-8: {}",
             sidecar_path.display()
+        ))
+    })?;
+    let workdir_str = workdir.to_str().ok_or_else(|| {
+        HelperError::HardInfra(format!(
+            "workdir path is not valid UTF-8: {}",
+            workdir.display()
         ))
     })?;
     let prompt = format!(
@@ -344,6 +366,8 @@ fn run_claude_subprocess(
         .arg(&prompt)
         .arg("--allowed-tools")
         .arg("Read,Write,Edit")
+        .arg("--add-dir")
+        .arg(workdir_str)
         .arg("--dangerously-skip-permissions")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
