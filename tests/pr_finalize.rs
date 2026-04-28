@@ -329,11 +329,26 @@ exit 1
 
 #[tokio::test]
 async fn monitor_step_returns_transient_when_script_exits_nonzero() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let monitor = dir.path().join("pr-monitor.sh");
+    // MonitorStep first calls `gh pr view` to capture HEAD SHA; shim it
+    // alongside the monitor script. The script exits non-zero on purpose
+    // — that's what this test verifies routes to TransientInfra.
+    let body = r#"
+case "$1 $2" in
+  "pr view")
+    echo '{"headRefOid":"deadbeef"}'
+    exit 0
+    ;;
+  *)
+    echo "unexpected gh args: $@" >&2
+    exit 99
+    ;;
+esac
+"#;
+    let h = GhHarness::new(body);
+    let monitor = h.dir.path().join("pr-monitor.sh");
     write_script(&monitor, "#!/bin/sh\necho boom >&2\nexit 1\n");
 
-    let mut ctx = step_ctx(dir.path());
+    let mut ctx = step_ctx(h.dir.path());
     let step = MonitorStep {
         owner: "octo".to_string(),
         repo: "demo".to_string(),
@@ -342,6 +357,7 @@ async fn monitor_step_returns_transient_when_script_exits_nonzero() {
     };
 
     let outcome = step.run(&mut ctx).await;
+    drop(h);
 
     assert_eq!(outcome_kind(&outcome), "transient_infra");
 }

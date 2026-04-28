@@ -269,7 +269,7 @@ impl Step for MonitorStep {
         }
     }
 
-    async fn run(&self, _ctx: &mut StepContext) -> AttemptOutcome {
+    async fn run(&self, ctx: &mut StepContext) -> AttemptOutcome {
         let resolved = self
             .script_path
             .as_ref()
@@ -286,13 +286,76 @@ impl Step for MonitorStep {
                 };
             }
         };
+
+        // pr-monitor.sh requires 8 args: --owner --repo --pr --head-sha
+        // --push-time --workdir --summary-file --log-file. Capture HEAD SHA
+        // via gh, derive push-time from now, and place per-attempt summary
+        // + log files under the step's attempt directory.
+        let pr_str = self.pr.to_string();
+        let repo_slug = format!("{}/{}", self.owner, self.repo);
+        let head_sha = match run_gh_capture(&[
+            "pr",
+            "view",
+            pr_str.as_str(),
+            "--repo",
+            repo_slug.as_str(),
+            "--json",
+            "headRefOid",
+            "--jq",
+            ".headRefOid",
+        ]) {
+            Ok(stdout) => stdout.trim().to_string(),
+            Err(GhError { kind, error }) => match kind {
+                GhFailureKind::SpawnFailed | GhFailureKind::Transient => {
+                    return AttemptOutcome::TransientInfra { error };
+                }
+                GhFailureKind::Hard => {
+                    return AttemptOutcome::HardInfra { error };
+                }
+            },
+        };
+        if head_sha.is_empty() {
+            return AttemptOutcome::TransientInfra {
+                error: "gh pr view returned empty headRefOid".into(),
+            };
+        }
+
+        let push_time = chrono::Utc::now().to_rfc3339();
+        let attempt_dir = ctx
+            .job_dir
+            .join("steps")
+            .join(format!("{:03}-{}", ctx.step_seq, self.name()))
+            .join("attempts")
+            .join(ctx.attempt_n.to_string());
+        if let Err(e) = std::fs::create_dir_all(&attempt_dir) {
+            return AttemptOutcome::HardInfra {
+                error: format!(
+                    "failed to create monitor attempt dir {}: {e}",
+                    attempt_dir.display()
+                ),
+            };
+        }
+        let summary_file = attempt_dir.join("monitor-summary.md");
+        let log_file = attempt_dir.join("monitor.log");
+
         let pr_arg = self.pr.to_string();
-        let repo_arg = format!("{}/{}", self.owner, self.repo);
         let mut cmd = Command::new(script_path.as_os_str());
-        cmd.arg("--repo")
-            .arg(repo_arg.as_str())
+        cmd.arg("--owner")
+            .arg(self.owner.as_str())
+            .arg("--repo")
+            .arg(self.repo.as_str())
             .arg("--pr")
             .arg(pr_arg.as_str())
+            .arg("--head-sha")
+            .arg(head_sha.as_str())
+            .arg("--push-time")
+            .arg(push_time.as_str())
+            .arg("--workdir")
+            .arg(ctx.workdir.as_os_str())
+            .arg("--summary-file")
+            .arg(summary_file.as_os_str())
+            .arg("--log-file")
+            .arg(log_file.as_os_str())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
