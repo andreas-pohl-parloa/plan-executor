@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.41.8] - 2026-04-29
+
+### Bug Fixes
+
+- **cli:** Trim duplicative tracing rows and re-add yellow [plan-executor] prefix in run pr-finalize (#20) ([947c6c8](https://github.com/andreas-pohl-parloa/plan-executor/commit/947c6c8512d79971adb24a3d8b524d94e7c87ffc))
 ## [0.41.7] - 2026-04-29
 
 ### Bug Fixes
