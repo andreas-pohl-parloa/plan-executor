@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.41.9] - 2026-04-29
+
+### Bug Fixes
+
+- **pr_finalize:** Bump MonitorStep wall-clock cap from 45m to 4h, add env override (#21) ([b9e23be](https://github.com/andreas-pohl-parloa/plan-executor/commit/b9e23be67e6de8844ecd7f181de9cc4b6276a2a4))
 ## [0.41.8] - 2026-04-29
 
 ### Bug Fixes
