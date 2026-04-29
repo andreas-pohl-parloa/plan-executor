@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.41.7] - 2026-04-29
+
+### Bug Fixes
+
+- **pr_finalize:** Stream pr-monitor.sh stdout/stderr live to parent (#19) ([39a7bb2](https://github.com/andreas-pohl-parloa/plan-executor/commit/39a7bb28ee9caf31701df179e2761ddb099c4694))
 ## [0.41.6] - 2026-04-28
 
 ### Bug Fixes
