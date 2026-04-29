@@ -38,10 +38,23 @@ fn default_backoff() -> Backoff {
     }
 }
 
-/// Maximum wall-clock for a single `pr-monitor.sh` invocation. The script
-/// has its own internal retry/poll loop; this guard prevents a runaway
-/// child from blocking the whole job indefinitely.
-const MONITOR_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+/// Default wall-clock cap for a single `pr-monitor.sh` invocation. The
+/// script has its own internal retry/poll loop (up to MAX_FIX_SESSIONS=20
+/// fix sessions × 30 min each = ~10h theoretical worst case); this is a
+/// kill-switch for runaways, not a budget for normal work. 4 hours sits
+/// well under GHA's 6-hour per-job limit while leaving room for PRs that
+/// need 4-6 fix rounds. Override via env `PLAN_EXECUTOR_MONITOR_TIMEOUT_SECS`.
+const MONITOR_TIMEOUT_DEFAULT: Duration = Duration::from_secs(4 * 60 * 60);
+const MONITOR_TIMEOUT_ENV: &str = "PLAN_EXECUTOR_MONITOR_TIMEOUT_SECS";
+
+fn monitor_timeout() -> Duration {
+    std::env::var(MONITOR_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(MONITOR_TIMEOUT_DEFAULT)
+}
 
 /// Maximum wall-clock for a single `gh` invocation. The supervisor's
 /// retry policy handles per-call transients; this hard ceiling protects
@@ -368,7 +381,8 @@ impl Step for MonitorStep {
             }
         };
 
-        let wait_result = child.wait_timeout(MONITOR_TIMEOUT);
+        let timeout = monitor_timeout();
+        let wait_result = child.wait_timeout(timeout);
         let needs_kill = matches!(wait_result, Ok(None) | Err(_));
         if needs_kill {
             let _ = child.kill();
@@ -381,10 +395,7 @@ impl Step for MonitorStep {
                 error: format!("pr-monitor.sh exited with code {:?}", status.code()),
             },
             Ok(None) => AttemptOutcome::TransientInfra {
-                error: format!(
-                    "pr-monitor.sh exceeded {} s timeout",
-                    MONITOR_TIMEOUT.as_secs()
-                ),
+                error: format!("pr-monitor.sh exceeded {} s timeout", timeout.as_secs()),
             },
             Err(e) => AttemptOutcome::TransientInfra {
                 error: format!("pr-monitor.sh wait failed: {e}"),
