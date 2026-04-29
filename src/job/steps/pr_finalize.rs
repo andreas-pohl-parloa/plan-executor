@@ -357,8 +357,8 @@ impl Step for MonitorStep {
             .arg("--log-file")
             .arg(log_file.as_os_str())
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -367,17 +367,6 @@ impl Step for MonitorStep {
                 };
             }
         };
-        // Drainers MUST run alongside `wait_timeout`. Without them the
-        // child blocks on `write()` once the pipe buffer fills, and the
-        // wait deadline cannot fire until the child exits on its own.
-        let stdout_handle = child
-            .stdout
-            .take()
-            .map(|s| spawn_drainer(s, SUBPROCESS_STREAM_CAP_BYTES));
-        let stderr_handle = child
-            .stderr
-            .take()
-            .map(|s| spawn_drainer(s, SUBPROCESS_STREAM_CAP_BYTES));
 
         let wait_result = child.wait_timeout(MONITOR_TIMEOUT);
         let needs_kill = matches!(wait_result, Ok(None) | Err(_));
@@ -385,8 +374,6 @@ impl Step for MonitorStep {
             let _ = child.kill();
             let _ = child.wait();
         }
-        let _stdout = stdout_handle.map(join_drainer).unwrap_or_default();
-        let _stderr = stderr_handle.map(join_drainer).unwrap_or_default();
 
         match wait_result {
             Ok(Some(status)) if status.success() => AttemptOutcome::Success,
