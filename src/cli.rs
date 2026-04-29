@@ -844,18 +844,13 @@ fn run_subcommand(command: RunCommand, config_path: Option<&Path>) -> Result<()>
             if remote {
                 run_pr_finalize_remote(pr, owner, repo, merge, merge_admin, config_path)
             } else {
-                // Initialize tracing so step traces from the pipeline are
-                // visible (e.g. on a CI runner where stderr is the
-                // workflow log). RUST_LOG defaults to info-level for
-                // plan-executor crates.
-                if std::env::var("RUST_LOG").is_err() {
-                    // SAFETY: single-threaded entry point before the
-                    // tokio runtime is built; no other thread can race.
-                    unsafe {
-                        std::env::set_var("RUST_LOG", "plan_executor=info");
-                    }
+                // Only honour an explicit RUST_LOG opt-in. Default output
+                // is the eprintln status lines from run_rust_scheduler_pipeline;
+                // tracing's INFO duplicates them. Set
+                // `RUST_LOG=plan_executor=info` to surface structured tracing.
+                if std::env::var("RUST_LOG").is_ok() {
+                    let _ = tracing_subscriber::fmt::try_init();
                 }
-                let _ = tracing_subscriber::fmt::try_init();
 
                 // The pipeline awaits sub-step async work (gh subprocesses,
                 // monitor wait). Spin up a multi-thread runtime locally
@@ -1350,34 +1345,24 @@ pub(crate) async fn run_rust_scheduler_pipeline(
             workdir: workdir.clone(),
         };
         let step_name = step.name();
-        tracing::info!(step = step_name, seq, "running step");
-        eprintln!("[plan-executor] step {seq:03} {step_name}: running");
+        // Yellow `[plan-executor]` prefix matches format_message_line;
+        // status keyword colored to match severity.
+        let prefix = "\x1b[33m[plan-executor]\x1b[0m";
+        eprintln!("{prefix} step {seq:03} {step_name}: running");
         let outcome = step.run(&mut ctx).await;
         match outcome {
             AttemptOutcome::Success => {
-                tracing::info!(step = step_name, seq, "step succeeded");
-                eprintln!("[plan-executor] step {seq:03} {step_name}: success");
+                eprintln!("{prefix} step {seq:03} {step_name}: \x1b[32msuccess\x1b[0m");
             }
             AttemptOutcome::Pending => {
                 // `Pending` is currently emitted by the placeholder
                 // `PreflightStep` and `PrFinalizeStep` shells. Treat as
                 // a no-op pass so the rest of the pipeline can run.
-                tracing::info!(
-                    step = step_name,
-                    seq,
-                    "step returned Pending (placeholder); continuing",
-                );
-                eprintln!("[plan-executor] step {seq:03} {step_name}: pending (placeholder)");
+                eprintln!("{prefix} step {seq:03} {step_name}: pending (placeholder)");
             }
             other => {
-                tracing::error!(
-                    step = step_name,
-                    seq,
-                    outcome = ?other,
-                    "step failed; aborting pipeline",
-                );
                 eprintln!(
-                    "[plan-executor] step {seq:03} {step_name}: FAILED — {other:?}\n[plan-executor] aborting pipeline. attempt log: {}/steps/{seq:03}-{step_name}/attempts/1/",
+                    "{prefix} step {seq:03} {step_name}: \x1b[31mFAILED\x1b[0m — {other:?}\n{prefix} aborting pipeline. attempt log: {}/steps/{seq:03}-{step_name}/attempts/1/",
                     job_dir.display()
                 );
                 return false;
