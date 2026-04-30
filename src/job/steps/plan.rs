@@ -136,6 +136,16 @@ fn run_preflight(ctx: &mut StepContext, manifest_path: &Path) -> AttemptOutcome 
     let worktree_path = compute_worktree_path(&source_repo, &plan_stem, &plan_meta);
     let branch = derive_branch_name(&plan_meta, &plan_stem);
 
+    if let Err(detail) = ensure_plan_executor_excluded(&source_repo) {
+        // The exclude write is best-effort; surfacing the failure as a
+        // protocol_violation makes it visible in `plan-executor jobs`
+        // without losing the diagnostic.
+        return AttemptOutcome::ProtocolViolation {
+            category: "preflight_exclude_write_failed".to_string(),
+            detail,
+        };
+    }
+
     match ensure_worktree(&source_repo, &worktree_path, &branch) {
         Ok(()) => {
             tracing::info!(
@@ -184,27 +194,66 @@ fn plan_stem_from_manifest(manifest_path: &Path) -> String {
         .unwrap_or_else(|| "plan".to_string())
 }
 
-/// Computes the target worktree path per the project's
-/// `<source-repo>/../.my/worktrees/<repo>-<plan-stem>[-<jira>]` convention.
+/// Subdirectory of the source repo that holds plan-executor worktrees.
+/// Kept out of `git status` via a `.git/info/exclude` entry written
+/// during preflight (see [`ensure_plan_executor_excluded`]).
+const WORKTREE_DIR_NAME: &str = ".plan-executor";
+
+/// Computes the target worktree path per the convention
+/// `<source-repo>/.plan-executor/<plan-stem>[-<jira>]`. Keeping the
+/// worktree inside the source repo means the entire plan run lives next
+/// to the code it operates on, and cleanup at the end of the pipeline
+/// (see [`cleanup_worktree`]) reaches a single well-known location.
 fn compute_worktree_path(
     source_repo: &Path,
     plan_stem: &str,
     plan_meta: &PlanMeta,
 ) -> PathBuf {
-    let repo_name = source_repo
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("repo");
-    let mut name = format!("{repo_name}-{plan_stem}");
+    let mut name = plan_stem.to_string();
     if let Some(jira) = plan_meta.jira.as_deref() {
-        name.push('-');
-        name.push_str(jira);
+        if !jira.is_empty() {
+            name.push('-');
+            name.push_str(jira);
+        }
     }
-    let parent = source_repo
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| source_repo.to_path_buf());
-    parent.join(".my").join("worktrees").join(name)
+    source_repo.join(WORKTREE_DIR_NAME).join(name)
+}
+
+/// Appends `.plan-executor/` to `<source-repo>/.git/info/exclude` when
+/// the file does not already mention it. `.git/info/exclude` is the
+/// per-clone gitignore, so this keeps the convention dir out of
+/// `git status` without committing changes to the user's `.gitignore`.
+/// Idempotent — repeated calls are a no-op once the entry is present.
+fn ensure_plan_executor_excluded(source_repo: &Path) -> Result<(), String> {
+    let exclude_path = source_repo.join(".git").join("info").join("exclude");
+    let entry_line = format!("{WORKTREE_DIR_NAME}/");
+    let existing = match std::fs::read_to_string(&exclude_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(format!(
+                "read {}: {e}",
+                exclude_path.display()
+            ))
+        }
+    };
+    if existing.lines().any(|l| l.trim() == entry_line) {
+        return Ok(());
+    }
+    if let Some(parent) = exclude_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return Err(format!("create {}: {e}", parent.display()));
+        }
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str("# plan-executor: per-plan worktrees (auto-managed)\n");
+    updated.push_str(&entry_line);
+    updated.push('\n');
+    std::fs::write(&exclude_path, updated)
+        .map_err(|e| format!("write {}: {e}", exclude_path.display()))
 }
 
 /// Common base-branch names that callers sometimes drop into
@@ -236,6 +285,34 @@ fn derive_branch_name(plan_meta: &PlanMeta, plan_stem: &str) -> String {
         other => other,
     };
     format!("{prefix}/{plan_stem}")
+}
+
+/// Removes the worktree at `worktree_path` (best-effort). Idempotent: a
+/// missing worktree path is treated as success because the cleanup ran
+/// already on a prior summary attempt or the path was never created
+/// (e.g. `plan.flags.no_worktree=true`). Any failure to remove is
+/// surfaced as `Err` so the caller can decide whether to log it or
+/// abort — the summary step downgrades it to a warning so a half-baked
+/// cleanup never poisons an otherwise-successful run.
+fn cleanup_worktree(source_repo: &Path, worktree_path: &Path) -> Result<(), String> {
+    if !worktree_path.exists() {
+        return Ok(());
+    }
+    let output = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(source_repo)
+        .args(["worktree", "remove", "--force"])
+        .arg(worktree_path)
+        .output()
+        .map_err(|e| format!("git worktree remove (spawn): {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "git worktree remove {} failed: {}",
+        worktree_path.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
 }
 
 /// Idempotent worktree setup. When the target path already exists and
@@ -2249,16 +2326,83 @@ fn run_summary(ctx: &StepContext, manifest_path: &Path) -> AttemptOutcome {
 
     let pr_url = read_pr_url(ctx);
 
-    if !plan_meta.flags.skip_pr {
-        if let Some(url) = pr_url.as_deref() {
-            return delegate_to_pr_finalize(ctx, url, plan_meta.flags);
+    let outcome = if !plan_meta.flags.skip_pr && pr_url.is_some() {
+        delegate_to_pr_finalize(ctx, pr_url.as_deref().expect("checked"), plan_meta.flags)
+    } else {
+        if !plan_meta.flags.skip_pr {
+            // skip_pr=false but no PR URL on disk; fall through to the
+            // local summary so the run still produces an artifact.
+            tracing::warn!(
+                "summary: skip_pr=false but no pr-url file present; writing local summary",
+            );
         }
-        // skip_pr=false but no PR URL on disk; fall through to the local
-        // summary so the run still produces an artifact.
-        tracing::warn!("summary: skip_pr=false but no pr-url file present; writing local summary",);
-    }
+        write_local_summary(ctx, manifest_path, &plan_meta, pr_url.as_deref())
+    };
 
-    write_local_summary(ctx, manifest_path, &plan_meta, pr_url.as_deref())
+    if matches!(outcome, AttemptOutcome::Success) && !plan_meta.flags.no_worktree {
+        cleanup_worktree_after_summary(ctx, manifest_path, &plan_meta);
+    }
+    outcome
+}
+
+/// Removes the per-plan worktree once summary completes successfully.
+/// The source repo is rediscovered from the manifest path (preflight's
+/// `find_source_repo` walks `ctx.workdir`, but by summary time
+/// `ctx.workdir` has been redirected to the worktree itself, so the
+/// manifest is the only stable anchor). Failures are logged and
+/// swallowed — a stale worktree on disk is preferable to flipping a
+/// successful run into a failure on a cosmetic teardown step.
+fn cleanup_worktree_after_summary(
+    ctx: &StepContext,
+    manifest_path: &Path,
+    plan_meta: &PlanMeta,
+) {
+    let Some(source_repo) = find_source_repo_for_cleanup(ctx, manifest_path) else {
+        tracing::warn!("summary: cleanup skipped — could not resolve source repo");
+        return;
+    };
+    let plan_stem = plan_stem_from_manifest(manifest_path);
+    let worktree_path = compute_worktree_path(&source_repo, &plan_stem, plan_meta);
+    if let Err(e) = cleanup_worktree(&source_repo, &worktree_path) {
+        tracing::warn!(
+            worktree = %worktree_path.display(),
+            error = %e,
+            "summary: worktree cleanup failed (best-effort)",
+        );
+    } else {
+        tracing::info!(
+            worktree = %worktree_path.display(),
+            "summary: worktree cleaned up",
+        );
+    }
+}
+
+/// Walks parents of either `ctx.workdir` (when it is itself the worktree
+/// inside `<repo>/.plan-executor/<name>`, two levels up resolves to the
+/// source repo) or `manifest_path` to find a directory containing a
+/// `.git` entry. `find_source_repo` is preflight-only because it
+/// short-circuits when `ctx.workdir/.git` exists; by summary time
+/// `ctx.workdir` has been redirected to the worktree, whose `.git` is a
+/// file pointer rather than a directory, so a dedicated lookup is
+/// clearer than overloading the existing helper.
+fn find_source_repo_for_cleanup(
+    ctx: &StepContext,
+    manifest_path: &Path,
+) -> Option<PathBuf> {
+    let candidates: [Option<&Path>; 2] = [Some(ctx.workdir.as_path()), manifest_path.parent()];
+    for start in candidates.into_iter().flatten() {
+        let mut dir = start.to_path_buf();
+        loop {
+            if dir.join(".git").is_dir() {
+                return Some(dir);
+            }
+            match dir.parent() {
+                Some(parent) if parent != dir => dir = parent.to_path_buf(),
+                _ => break,
+            }
+        }
+    }
+    None
 }
 
 /// Reads `<job_dir>/pr-url` if it exists, returning the trimmed URL or
@@ -2418,14 +2562,14 @@ mod preflight_tests {
     }
 
     #[test]
-    fn worktree_path_uses_repo_name_and_plan_stem() {
+    fn worktree_path_lives_inside_source_repo_under_dot_plan_executor() {
         let repo = std::path::Path::new("/Users/me/code/my-repo");
         let meta = meta_with(None, None, "feature");
         let path = compute_worktree_path(repo, "month-reporting-fix", &meta);
         assert_eq!(
             path,
             std::path::PathBuf::from(
-                "/Users/me/code/.my/worktrees/my-repo-month-reporting-fix"
+                "/Users/me/code/my-repo/.plan-executor/month-reporting-fix"
             )
         );
     }
@@ -2437,8 +2581,50 @@ mod preflight_tests {
         let path = compute_worktree_path(repo, "stem", &meta);
         assert_eq!(
             path,
-            std::path::PathBuf::from("/Users/me/code/.my/worktrees/my-repo-stem-CCP-123")
+            std::path::PathBuf::from("/Users/me/code/my-repo/.plan-executor/stem-CCP-123")
         );
+    }
+
+    #[test]
+    fn worktree_path_omits_jira_when_empty_string() {
+        let repo = std::path::Path::new("/Users/me/code/my-repo");
+        let meta = meta_with(Some(""), None, "feature");
+        let path = compute_worktree_path(repo, "stem", &meta);
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/Users/me/code/my-repo/.plan-executor/stem")
+        );
+    }
+
+    #[test]
+    fn ensure_plan_executor_excluded_appends_when_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".git/info")).expect("git/info");
+        std::fs::write(repo.join(".git/info/exclude"), "# preexisting\n").expect("seed");
+        ensure_plan_executor_excluded(repo).expect("write");
+        let body = std::fs::read_to_string(repo.join(".git/info/exclude")).expect("read");
+        assert!(body.contains("# preexisting"), "preserved existing content: {body:?}");
+        assert!(body.lines().any(|l| l.trim() == ".plan-executor/"), "appended entry: {body:?}");
+    }
+
+    #[test]
+    fn ensure_plan_executor_excluded_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".git/info")).expect("git/info");
+        ensure_plan_executor_excluded(repo).expect("write 1");
+        let body1 = std::fs::read_to_string(repo.join(".git/info/exclude")).expect("read 1");
+        ensure_plan_executor_excluded(repo).expect("write 2");
+        let body2 = std::fs::read_to_string(repo.join(".git/info/exclude")).expect("read 2");
+        assert_eq!(body1, body2, "second call must not duplicate the entry");
+    }
+
+    #[test]
+    fn cleanup_worktree_is_a_noop_when_path_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join(".plan-executor").join("does-not-exist");
+        cleanup_worktree(dir.path(), &missing).expect("noop on missing path");
     }
 
     #[test]
