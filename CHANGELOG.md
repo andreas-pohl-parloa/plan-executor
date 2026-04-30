@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.47.0] - 2026-04-30
+
+### Features
+
+- Bring back sub-agent dispatch protocol via state_updates.handoffs (#34) ([5960d34](https://github.com/andreas-pohl-parloa/plan-executor/commit/5960d342fa7a6731015f4a24be7757055f7e94b4))
 ## [0.46.0] - 2026-04-30
 
 ### Features
