@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.43.0] - 2026-04-30
+
+### Features
+
+- **jobs:** Show percent + step N/total in PROGRESS column (#26) ([6fc8394](https://github.com/andreas-pohl-parloa/plan-executor/commit/6fc839455f8f5a150c334cc3714daeef7b5ecd15))
 ## [0.42.0] - 2026-04-30
 
 ### Features
