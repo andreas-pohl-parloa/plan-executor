@@ -72,7 +72,7 @@ fn cmd_list() -> Result<()> {
     }
     let job_processes = query_daemon_processes();
     println!(
-        "{:<10} {:<14} {:<11} {:<21} {:<28} TITLE",
+        "{:<10} {:<14} {:<11} {:<21} {:<38} TITLE",
         "ID", "KIND", "STATE", "CREATED_AT", "PROGRESS"
     );
     for entry in entries {
@@ -84,14 +84,15 @@ fn cmd_list() -> Result<()> {
                     .map(job_title)
                     .unwrap_or_else(|| path.display().to_string());
                 let total_steps = job_opt.as_ref().map(|j| j.steps.len() as u32);
-                let progress = progress_label(&summary.id.0, total_steps);
+                let total_waves = job_opt.as_ref().and_then(plan_total_waves);
+                let progress = progress_label(&summary.id.0, total_steps, total_waves);
                 println!(
-                    "{:<10} {:<14} {:<11} {:<21} {:<28} {}",
+                    "{:<10} {:<14} {:<11} {:<21} {:<38} {}",
                     short_id(&summary.id.0),
                     summary.kind_tag,
                     state_label(&summary.state),
                     short_timestamp(&summary.created_at),
-                    truncate_to(&progress, 28),
+                    truncate_to(&progress, 38),
                     title,
                 );
                 if matches!(summary.state, JobState::Running) {
@@ -102,14 +103,14 @@ fn cmd_list() -> Result<()> {
             }
             JobStoreEntry::Legacy { id, path } => {
                 let (kind, state, created, title) = legacy_summary(&path);
-                let progress = progress_label(&id, None);
+                let progress = progress_label(&id, None, None);
                 println!(
-                    "{:<10} {:<14} {:<11} {:<21} {:<28} {}",
+                    "{:<10} {:<14} {:<11} {:<21} {:<38} {}",
                     short_id(&id),
                     kind,
                     state,
                     short_timestamp(&created),
-                    truncate_to(&progress, 28),
+                    truncate_to(&progress, 38),
                     title,
                 );
                 if state == "running" {
@@ -121,6 +122,23 @@ fn cmd_list() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Reads the plan job's compiled `tasks.json` and returns its wave count, so
+/// `progress_label` can render `wave X/Y` while step 2 (`wave_execution`) is
+/// running. Returns `None` for non-`Plan` job kinds, when the manifest path
+/// is unreachable, or when the JSON does not parse — the column then falls
+/// back to step-only progress.
+fn plan_total_waves(job: &Job) -> Option<u32> {
+    use crate::job::types::JobKind;
+    let manifest_path = match &job.kind {
+        JobKind::Plan { manifest_path } => manifest_path,
+        _ => return None,
+    };
+    let raw = fs::read_to_string(manifest_path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let count = v.get("waves")?.as_array()?.len();
+    u32::try_from(count).ok()
 }
 
 /// Connects to the daemon for a single GetState snapshot and returns the
@@ -166,11 +184,20 @@ fn query_daemon_processes() -> HashMap<String, crate::ipc::JobProcesses> {
 /// Derives a short PROGRESS label from the job's `display.log`. Counts how
 /// many `step N (name) <terminal-status>` lines have been written to compute
 /// completion percentage out of `total_steps`, then identifies the currently
-/// running step and formats `<pct>% step <N>/<total> <name>`.
+/// running step and formats `<pct>% step <N>/<total> <name>`. When the
+/// current step is the wave executor and `total_waves` is known, also
+/// appends ` wave <X>/<Y>` so callers see how far through the wave DAG the
+/// run has progressed.
+///
+/// `wave X` is computed from the count of `dispatching N sub-agent(s)` lines
+/// in `display.log` — each wave dispatch emits exactly one such line via
+/// `SchedulerHooks::announce_wave_dispatch`. `wave Y` comes from the
+/// caller-supplied total (parsed from the compiled `tasks.json` once per
+/// listing render).
 ///
 /// Falls back to `-` when no display.log exists yet or no step line has been
 /// emitted (job freshly queued).
-fn progress_label(job_id: &str, total_steps: Option<u32>) -> String {
+fn progress_label(job_id: &str, total_steps: Option<u32>, total_waves: Option<u32>) -> String {
     let path = crate::config::Config::base_dir()
         .join("jobs")
         .join(job_id)
@@ -178,12 +205,16 @@ fn progress_label(job_id: &str, total_steps: Option<u32>) -> String {
     let Ok(content) = fs::read_to_string(&path) else {
         return "-".to_string();
     };
-    // Walk every line; track per-step status. When the same seq has both a
-    // `starting` line and a non-starting status line, count that step as
-    // completed. The latest step seen with `starting` is the current step.
+    // Walk every line; track per-step status, count wave dispatches, and
+    // remember which step seq dispatched each wave. When the same seq has
+    // both a `starting` line and a non-starting status line, count that
+    // step as completed. The latest step seen with `starting` is the
+    // current step.
     let mut current: Option<(u32, String)> = None;
     let mut completed: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut max_seq: u32 = 0;
+    let mut waves_dispatched_in_current_step: u32 = 0;
+    let mut last_starting_seq: Option<u32> = None;
     for raw in content.lines() {
         let cleaned = strip_bullet_prefix(raw);
         if let Some((seq, name, status)) = parse_step_line(&cleaned) {
@@ -191,12 +222,18 @@ fn progress_label(job_id: &str, total_steps: Option<u32>) -> String {
                 max_seq = seq;
             }
             if status == "starting" {
+                // A new step starts; reset the wave counter so we only
+                // attribute dispatches to the active step.
                 current = Some((seq, name));
+                last_starting_seq = Some(seq);
+                waves_dispatched_in_current_step = 0;
             } else {
                 // Any non-starting status line marks the step as resolved
                 // (success, pending placeholder, semantic_mistake, …).
                 completed.insert(seq);
             }
+        } else if last_starting_seq.is_some() && is_dispatch_line(&cleaned) {
+            waves_dispatched_in_current_step += 1;
         }
     }
     let Some((cur_seq, cur_name)) = current else {
@@ -211,7 +248,21 @@ fn progress_label(job_id: &str, total_steps: Option<u32>) -> String {
     } else {
         (completed_count * 100) / total
     };
-    format!("{pct:>3}% step {cur_seq}/{total} {cur_name}")
+    let mut label = format!("{pct:>3}% step {cur_seq}/{total} {cur_name}");
+    if cur_name == "wave_execution" {
+        if let Some(total_w) = total_waves {
+            let cur_wave = waves_dispatched_in_current_step.max(1).min(total_w);
+            label.push_str(&format!(" wave {cur_wave}/{total_w}"));
+        }
+    }
+    label
+}
+
+/// Returns `true` when `line` is the canonical
+/// `dispatching N sub-agent(s) (kind: …)` marker
+/// `SchedulerHooks::announce_wave_dispatch` writes once per wave dispatch.
+fn is_dispatch_line(line: &str) -> bool {
+    line.starts_with("dispatching ") && line.contains("sub-agent(s)")
 }
 
 fn strip_bullet_prefix(line: &str) -> String {
