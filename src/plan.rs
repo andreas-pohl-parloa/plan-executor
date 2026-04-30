@@ -1,66 +1,6 @@
 use std::path::Path;
 use anyhow::Result;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum PlanStatus {
-    Ready,
-    Wip,
-    Executing,
-    Completed,
-    Unknown(String),
-}
-
-impl std::fmt::Display for PlanStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PlanStatus::Ready => write!(f, "READY"),
-            PlanStatus::Wip => write!(f, "WIP"),
-            PlanStatus::Executing => write!(f, "EXECUTING"),
-            PlanStatus::Completed => write!(f, "COMPLETED"),
-            PlanStatus::Unknown(s) => write!(f, "{}", s),
-        }
-    }
-}
-
-impl PlanStatus {
-    fn from_str(s: &str) -> Self {
-        match s.trim().to_ascii_uppercase().as_str() {
-            "READY" => PlanStatus::Ready,
-            "WIP" => PlanStatus::Wip,
-            "EXECUTING" => PlanStatus::Executing,
-            "COMPLETED" => PlanStatus::Completed,
-            other => PlanStatus::Unknown(other.to_string()),
-        }
-    }
-}
-
-/// Reads a plan file and extracts its **Status:** field.
-pub fn parse_plan_status(path: &Path) -> Result<PlanStatus> {
-    let content = std::fs::read_to_string(path)?;
-    for line in content.lines() {
-        let lower = line.to_ascii_lowercase();
-        if lower.starts_with("**status:**") {
-            let rest = &line["**status:**".len()..];
-            return Ok(PlanStatus::from_str(rest));
-        }
-    }
-    Ok(PlanStatus::Unknown("missing".to_string()))
-}
-
-/// Reads a plan header value by key (case-insensitive).
-/// E.g. `get_plan_header(path, "remote-pr")` reads `**remote-pr:** 42`.
-pub fn get_plan_header(path: &Path, key: &str) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let prefix = format!("**{}:**", key.to_ascii_lowercase());
-    for line in content.lines() {
-        if line.trim().to_ascii_lowercase().starts_with(&prefix) {
-            let rest = &line.trim()[prefix.len()..];
-            return Some(rest.trim().to_string());
-        }
-    }
-    None
-}
-
 /// Sets or inserts a plan header value. If the key already exists (case-insensitive),
 /// the line is replaced. Otherwise the header is inserted after the last existing
 /// `**...**` header line.
@@ -98,34 +38,32 @@ pub fn set_plan_header(path: &Path, key: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use std::io::Write;
+    use tempfile::NamedTempFile;
 
-    fn write_plan(content: &str) -> NamedTempFile {
+    #[test]
+    fn set_plan_header_replaces_existing_key() {
         let mut f = NamedTempFile::new().unwrap();
-        write!(f, "{}", content).unwrap();
-        f
+        write!(f, "# Plan\n\n**Status:** READY\n**Goal:** test\n").unwrap();
+        set_plan_header(f.path(), "Status", "EXECUTING").unwrap();
+        let content = std::fs::read_to_string(f.path()).unwrap();
+        assert!(content.contains("**Status:** EXECUTING"));
+        assert!(!content.contains("**Status:** READY"));
+        assert!(content.contains("**Goal:** test"));
     }
 
     #[test]
-    fn test_parse_ready_status() {
-        let f = write_plan("# My Plan\n\n**Status:** READY\n\n## Tasks\n");
-        let status = parse_plan_status(f.path()).unwrap();
-        assert_eq!(status, PlanStatus::Ready);
+    fn set_plan_header_inserts_after_last_header_when_key_missing() {
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, "# Plan\n\n**Goal:** test\n\n## Tasks\n").unwrap();
+        set_plan_header(f.path(), "remote-pr", "42").unwrap();
+        let content = std::fs::read_to_string(f.path()).unwrap();
+        assert!(content.contains("**remote-pr:** 42"));
+        // remote-pr should land between Goal (last header) and Tasks (heading).
+        let goal_pos = content.find("**Goal:**").unwrap();
+        let pr_pos = content.find("**remote-pr:**").unwrap();
+        let tasks_pos = content.find("## Tasks").unwrap();
+        assert!(goal_pos < pr_pos);
+        assert!(pr_pos < tasks_pos);
     }
-
-    #[test]
-    fn test_parse_wip_status() {
-        let f = write_plan("**Status:** WIP\n");
-        let status = parse_plan_status(f.path()).unwrap();
-        assert_eq!(status, PlanStatus::Wip);
-    }
-
-    #[test]
-    fn test_parse_missing_status() {
-        let f = write_plan("# No status here\n");
-        let status = parse_plan_status(f.path()).unwrap();
-        assert!(matches!(status, PlanStatus::Unknown(_)));
-    }
-
 }
