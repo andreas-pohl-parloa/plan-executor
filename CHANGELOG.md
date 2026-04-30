@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.45.1] - 2026-04-30
+
+### Bug Fixes
+
+- **daemon:** Retry loop honors Compose policy (CodeReview / Validation) (#32) ([cd7c7a8](https://github.com/andreas-pohl-parloa/plan-executor/commit/cd7c7a8d758d9d68559a852d048a2e42b8aa7142))
 ## [0.45.0] - 2026-04-30
 
 ### Features
