@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.43.2] - 2026-04-30
+
+### Miscellaneous
+
+- Zero warnings — delete genuinely dead code, no allow(dead_code) (#28) ([50dc045](https://github.com/andreas-pohl-parloa/plan-executor/commit/50dc045318137df70cc5f136ca2f8d4d37b16df5))
 ## [0.43.1] - 2026-04-30
 
 ### Miscellaneous
