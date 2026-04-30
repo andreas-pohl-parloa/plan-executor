@@ -72,7 +72,7 @@ fn cmd_list() -> Result<()> {
     }
     let job_processes = query_daemon_processes();
     println!(
-        "{:<10} {:<14} {:<11} {:<21} {:<26} TITLE",
+        "{:<10} {:<14} {:<11} {:<21} {:<28} TITLE",
         "ID", "KIND", "STATE", "CREATED_AT", "PROGRESS"
     );
     for entry in entries {
@@ -83,14 +83,15 @@ fn cmd_list() -> Result<()> {
                     .as_ref()
                     .map(job_title)
                     .unwrap_or_else(|| path.display().to_string());
-                let progress = progress_label(&summary.id.0);
+                let total_steps = job_opt.as_ref().map(|j| j.steps.len() as u32);
+                let progress = progress_label(&summary.id.0, total_steps);
                 println!(
-                    "{:<10} {:<14} {:<11} {:<21} {:<26} {}",
+                    "{:<10} {:<14} {:<11} {:<21} {:<28} {}",
                     short_id(&summary.id.0),
                     summary.kind_tag,
                     state_label(&summary.state),
                     short_timestamp(&summary.created_at),
-                    truncate_to(&progress, 26),
+                    truncate_to(&progress, 28),
                     title,
                 );
                 if matches!(summary.state, JobState::Running) {
@@ -101,14 +102,14 @@ fn cmd_list() -> Result<()> {
             }
             JobStoreEntry::Legacy { id, path } => {
                 let (kind, state, created, title) = legacy_summary(&path);
-                let progress = progress_label(&id);
+                let progress = progress_label(&id, None);
                 println!(
-                    "{:<10} {:<14} {:<11} {:<21} {:<26} {}",
+                    "{:<10} {:<14} {:<11} {:<21} {:<28} {}",
                     short_id(&id),
                     kind,
                     state,
                     short_timestamp(&created),
-                    truncate_to(&progress, 26),
+                    truncate_to(&progress, 28),
                     title,
                 );
                 if state == "running" {
@@ -162,14 +163,14 @@ fn query_daemon_processes() -> HashMap<String, crate::ipc::JobProcesses> {
     }
 }
 
-/// Derives a short PROGRESS label from the job's `display.log`. Reads the
-/// last few lines, finds the most recent `step N (name) ...` entry, and
-/// distills it into either `step N (name): <status>` or `step N: dispatch
-/// W (X agents)` when the step is in the middle of a wave dispatch.
+/// Derives a short PROGRESS label from the job's `display.log`. Counts how
+/// many `step N (name) <terminal-status>` lines have been written to compute
+/// completion percentage out of `total_steps`, then identifies the currently
+/// running step and formats `<pct>% step <N>/<total> <name>`.
 ///
-/// Returns `-` when no display.log exists or no step line has been emitted
-/// yet (job freshly queued / preflight not started).
-fn progress_label(job_id: &str) -> String {
+/// Falls back to `-` when no display.log exists yet or no step line has been
+/// emitted (job freshly queued).
+fn progress_label(job_id: &str, total_steps: Option<u32>) -> String {
     let path = crate::config::Config::base_dir()
         .join("jobs")
         .join(job_id)
@@ -177,31 +178,40 @@ fn progress_label(job_id: &str) -> String {
     let Ok(content) = fs::read_to_string(&path) else {
         return "-".to_string();
     };
-    let mut latest_step: Option<(u32, String, String)> = None;
-    let mut latest_dispatch: Option<(u32, String)> = None;
+    // Walk every line; track per-step status. When the same seq has both a
+    // `starting` line and a non-starting status line, count that step as
+    // completed. The latest step seen with `starting` is the current step.
+    let mut current: Option<(u32, String)> = None;
+    let mut completed: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut max_seq: u32 = 0;
     for raw in content.lines() {
-        // Strip the leading bullet + ANSI prefix added by append_display.
         let cleaned = strip_bullet_prefix(raw);
         if let Some((seq, name, status)) = parse_step_line(&cleaned) {
-            latest_step = Some((seq, name, status));
-            latest_dispatch = None; // new step resets dispatch counter
-        } else if let Some((count, kind)) = parse_dispatch_line(&cleaned) {
-            latest_dispatch = Some((count, kind));
-        }
-    }
-    match (latest_step, latest_dispatch) {
-        (Some((seq, name, _status)), Some((count, kind))) => {
-            format!("step {seq} ({name}): {count}× {kind}")
-        }
-        (Some((seq, name, status)), None) => {
+            if seq > max_seq {
+                max_seq = seq;
+            }
             if status == "starting" {
-                format!("step {seq} ({name}): running")
+                current = Some((seq, name));
             } else {
-                format!("step {seq} ({name}): {status}")
+                // Any non-starting status line marks the step as resolved
+                // (success, pending placeholder, semantic_mistake, …).
+                completed.insert(seq);
             }
         }
-        _ => "-".to_string(),
     }
+    let Some((cur_seq, cur_name)) = current else {
+        return "-".to_string();
+    };
+    // total: prefer the manifest-declared step count; fall back to the
+    // highest seq seen in the log when job.json is unreadable.
+    let total = total_steps.unwrap_or(max_seq).max(cur_seq);
+    let completed_count = completed.len() as u32;
+    let pct = if total == 0 {
+        0
+    } else {
+        (completed_count * 100) / total
+    };
+    format!("{pct:>3}% step {cur_seq}/{total} {cur_name}")
 }
 
 fn strip_bullet_prefix(line: &str) -> String {
@@ -245,19 +255,6 @@ fn parse_step_line(line: &str) -> Option<(u32, String, String)> {
         status
     };
     Some((seq, name.to_string(), status))
-}
-
-fn parse_dispatch_line(line: &str) -> Option<(u32, String)> {
-    // Matches: "dispatching <N> sub-agent(s) (kind: <kind>)"
-    let after = line.strip_prefix("dispatching ")?;
-    let (count_str, rest) = after.split_once(' ')?;
-    let count: u32 = count_str.parse().ok()?;
-    let kind = rest
-        .split_once("(kind: ")
-        .and_then(|(_, k)| k.strip_suffix(')'))
-        .unwrap_or("dispatch")
-        .to_string();
-    Some((count, kind))
 }
 
 fn truncate_to(s: &str, max: usize) -> String {
