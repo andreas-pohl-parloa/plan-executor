@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.52.1] - 2026-04-30
+
+### Bug Fixes
+
+- **schemas:** Open helper triage state_updates so SKILLs can persist their own state (#42) ([36346b8](https://github.com/andreas-pohl-parloa/plan-executor/commit/36346b88b26890102dddc42a8bfd8f3789d02744))
 ## [0.52.0] - 2026-04-30
 
 ### Features
