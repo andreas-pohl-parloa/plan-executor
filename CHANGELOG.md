@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.52.4] - 2026-04-30
+
+### Bug Fixes
+
+- **pr_finalize:** Give the helper 35 min so pr-monitor.sh can finish (#45) ([7e211d6](https://github.com/andreas-pohl-parloa/plan-executor/commit/7e211d6766c4ce86c76c4ac941b477dd9ffc873e))
 ## [0.52.3] - 2026-04-30
 
 ### Bug Fixes
