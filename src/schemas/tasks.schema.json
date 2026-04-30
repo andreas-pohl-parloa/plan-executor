@@ -45,6 +45,11 @@
           "enum": ["READY", "EXECUTING", "COMPLETED", "FAILED"],
           "default": "READY"
         },
+        "execution_mode": {
+          "description": "Where to run the plan. 'local' executes the Rust scheduler in the current process; 'remote' submits a job-spec.json to the configured remote_repo and lets a GitHub Actions runner execute it. Lives in the manifest, not in the plan markdown.",
+          "enum": ["local", "remote"],
+          "default": "local"
+        },
         "flags": {
           "type": "object",
           "required": [

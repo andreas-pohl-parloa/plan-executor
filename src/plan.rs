@@ -1,13 +1,6 @@
 use std::path::Path;
 use anyhow::Result;
 
-/// Execution mode for a plan: local (default) or remote.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ExecutionMode {
-    Local,
-    Remote,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlanStatus {
     Ready,
@@ -52,25 +45,6 @@ pub fn parse_plan_status(path: &Path) -> Result<PlanStatus> {
         }
     }
     Ok(PlanStatus::Unknown("missing".to_string()))
-}
-
-/// Reads a plan file and extracts its `**execution:**` field.
-/// Defaults to `ExecutionMode::Local` when absent or unrecognized.
-pub fn parse_execution_mode(path: &Path) -> ExecutionMode {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return ExecutionMode::Local;
-    };
-    for line in content.lines() {
-        let lower = line.to_ascii_lowercase();
-        if lower.starts_with("**execution:**") {
-            let rest = &line["**execution:**".len()..];
-            return match rest.trim().to_ascii_lowercase().as_str() {
-                "remote" => ExecutionMode::Remote,
-                _ => ExecutionMode::Local,
-            };
-        }
-    }
-    ExecutionMode::Local
 }
 
 /// Reads a plan header value by key (case-insensitive).
@@ -154,27 +128,4 @@ mod tests {
         assert!(matches!(status, PlanStatus::Unknown(_)));
     }
 
-    #[test]
-    fn test_parse_execution_mode_remote() {
-        let f = write_plan("# Plan\n**execution:** remote\n**Status:** READY\n");
-        assert_eq!(parse_execution_mode(f.path()), ExecutionMode::Remote);
-    }
-
-    #[test]
-    fn test_parse_execution_mode_local_explicit() {
-        let f = write_plan("# Plan\n**execution:** local\n**Status:** READY\n");
-        assert_eq!(parse_execution_mode(f.path()), ExecutionMode::Local);
-    }
-
-    #[test]
-    fn test_parse_execution_mode_missing_defaults_to_local() {
-        let f = write_plan("# Plan\n**Status:** READY\n");
-        assert_eq!(parse_execution_mode(f.path()), ExecutionMode::Local);
-    }
-
-    #[test]
-    fn test_parse_execution_mode_unknown_defaults_to_local() {
-        let f = write_plan("# Plan\n**execution:** cloud\n");
-        assert_eq!(parse_execution_mode(f.path()), ExecutionMode::Local);
-    }
 }

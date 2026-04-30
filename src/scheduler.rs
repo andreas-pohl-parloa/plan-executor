@@ -74,6 +74,18 @@ pub struct PlanBlock {
     pub status: String,
     /// Absolute path to the source plan markdown.
     pub path: String,
+    /// Where to run the plan: "local" (default) runs the Rust scheduler in
+    /// the current process; "remote" submits a job-spec to the configured
+    /// remote_repo so a GitHub Actions runner executes it. Stored as the
+    /// raw schema string; the manifest schema enforces the {local, remote}
+    /// enum at validation time. Older manifests without the field
+    /// deserialize as "local" via the `default_execution_mode` fallback.
+    #[serde(default = "default_execution_mode")]
+    pub execution_mode: String,
+}
+
+fn default_execution_mode() -> String {
+    "local".to_string()
 }
 
 /// One wave: a parallel batch of tasks that runs after `depends_on` waves complete.
@@ -526,6 +538,7 @@ mod tests {
             plan: PlanBlock {
                 status: "READY".to_string(),
                 path: "/tmp/plan.md".to_string(),
+                execution_mode: "local".to_string(),
             },
             waves,
             tasks: tasks
