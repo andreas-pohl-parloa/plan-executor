@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.41.10] - 2026-04-30
+
+### Refactoring
+
+- Move execution_mode from plan markdown into compiled manifest (#22) ([932e9a5](https://github.com/andreas-pohl-parloa/plan-executor/commit/932e9a5c477fabd414f01f193949c5c1561aa47f))
 ## [0.41.9] - 2026-04-29
 
 ### Bug Fixes
