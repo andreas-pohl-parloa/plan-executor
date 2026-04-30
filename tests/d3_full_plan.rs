@@ -862,5 +862,5 @@ fn _api_surface() {
     let _ = invoke_helper;
     let _ = HelperSkill::RunReviewerTeam;
     let _: Option<Manifest> = None;
-    let _: fn(_, _) -> _ = scheduler::run_wave_execution;
+    let _: fn(_, _, _) -> _ = scheduler::run_wave_execution;
 }

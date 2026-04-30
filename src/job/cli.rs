@@ -71,31 +71,71 @@ fn cmd_list() -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<38} {:<18} {:<16} {:<24} {}",
-        "ID", "KIND", "STATE", "CREATED_AT", "LAYOUT"
+        "{:<10} {:<14} {:<11} {:<21} TITLE",
+        "ID", "KIND", "STATE", "CREATED_AT"
     );
     for entry in entries {
         match entry {
-            JobStoreEntry::New { summary, .. } => {
+            JobStoreEntry::New { summary, path } => {
+                let title = match store.open(&summary.id) {
+                    Ok(dir) => match dir.read_job() {
+                        Ok(job) => job_title(&job),
+                        Err(_) => path.display().to_string(),
+                    },
+                    Err(_) => path.display().to_string(),
+                };
                 println!(
-                    "{:<38} {:<18} {:<16} {:<24} {}",
-                    summary.id.0,
+                    "{:<10} {:<14} {:<11} {:<21} {}",
+                    short_id(&summary.id.0),
                     summary.kind_tag,
                     state_label(&summary.state),
-                    summary.created_at,
-                    "new"
+                    short_timestamp(&summary.created_at),
+                    title,
                 );
             }
             JobStoreEntry::Legacy { id, path } => {
-                let (kind, state, created) = legacy_summary(&path);
+                let (kind, state, created, title) = legacy_summary(&path);
                 println!(
-                    "{:<38} {:<18} {:<16} {:<24} {}",
-                    id, kind, state, created, "legacy"
+                    "{:<10} {:<14} {:<11} {:<21} {}",
+                    short_id(&id),
+                    kind,
+                    state,
+                    short_timestamp(&created),
+                    title,
                 );
             }
         }
     }
     Ok(())
+}
+
+/// Trims an RFC3339 timestamp like `2026-04-30T09:38:47.060394+00:00` down to
+/// `2026-04-30T09:38:47Z` so the column aligns regardless of fractional digits
+/// or numeric timezone offsets. Falls back to the original string when parsing
+/// fails so we never mask a real value.
+fn short_timestamp(ts: &str) -> String {
+    DateTime::parse_from_rfc3339(ts)
+        .map(|dt| dt.with_timezone(&Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|_| ts.to_string())
+}
+
+fn short_id(id: &str) -> String {
+    let len = id.len().min(8);
+    id[..len].to_string()
+}
+
+fn job_title(job: &Job) -> String {
+    use crate::job::types::JobKind;
+    match &job.kind {
+        JobKind::Plan { manifest_path } | JobKind::Validate { manifest_path } => {
+            manifest_path.display().to_string()
+        }
+        JobKind::PrFinalize {
+            owner, repo, pr, ..
+        } => format!("{owner}/{repo}#{pr}"),
+        JobKind::Review { branch, base } => format!("{branch} -> {base}"),
+        JobKind::CompileFixWaves { manifest_path, .. } => manifest_path.display().to_string(),
+    }
 }
 
 fn cmd_show(id_prefix: &str) -> Result<()> {
@@ -263,10 +303,11 @@ fn state_label(s: &JobState) -> String {
     }
 }
 
-fn legacy_summary(path: &std::path::Path) -> (String, String, String) {
+fn legacy_summary(path: &std::path::Path) -> (String, String, String, String) {
     let mut kind = "plan".to_string();
     let mut state = "?".to_string();
     let mut created = "-".to_string();
+    let mut title = path.display().to_string();
     if let Ok(raw) = fs::read_to_string(path.join("metadata.json")) {
         if let Ok(meta) = serde_json::from_str::<JobMetadata>(&raw) {
             kind = if meta.remote_repo.is_some() {
@@ -276,9 +317,13 @@ fn legacy_summary(path: &std::path::Path) -> (String, String, String) {
             };
             state = legacy_state_label(&meta.status);
             created = meta.started_at.to_rfc3339();
+            title = match (meta.remote_repo.as_deref(), meta.remote_pr) {
+                (Some(repo), Some(pr)) => format!("{repo}#{pr}"),
+                _ => meta.plan_path.display().to_string(),
+            };
         }
     }
-    (kind, state, created)
+    (kind, state, created, title)
 }
 
 fn legacy_state_label(s: &JobStatus) -> String {

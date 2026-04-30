@@ -115,7 +115,18 @@ impl Step for WaveExecutionStep {
                 };
             }
         };
-        scheduler::run_wave_execution(ctx, &manifest).await
+        let manifest_dir = match self.manifest_path.parent() {
+            Some(p) => p.to_path_buf(),
+            None => {
+                return AttemptOutcome::HardInfra {
+                    error: format!(
+                        "manifest_path `{}` has no parent directory",
+                        self.manifest_path.display()
+                    ),
+                };
+            }
+        };
+        scheduler::run_wave_execution(ctx, &manifest, &manifest_dir).await
     }
 }
 
@@ -645,7 +656,8 @@ async fn dispatch_fix_wave(
         Ok(m) => m,
         Err(outcome) => return FixWaveOutcome::Outcome(outcome),
     };
-    let scheduler_outcome = scheduler::run_wave_execution(ctx, &scoped).await;
+    let scheduler_outcome =
+        scheduler::run_wave_execution(ctx, &scoped, &execution_root).await;
     match scheduler_outcome {
         AttemptOutcome::Success => FixWaveOutcome::Continue,
         other => FixWaveOutcome::Outcome(other),
