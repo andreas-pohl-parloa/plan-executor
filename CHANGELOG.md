@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.45.0] - 2026-04-30
+
+### Features
+
+- **daemon,scheduler:** Retry transient agent failures at step + sub-agent level (#31) ([865737d](https://github.com/andreas-pohl-parloa/plan-executor/commit/865737da2bdc9a2906753612c7ba7b580473f5f3))
 ## [0.44.1] - 2026-04-30
 
 ### Bug Fixes
