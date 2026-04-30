@@ -84,7 +84,7 @@
         "properties": {
           "state_updates": {
             "type": "object",
-            "additionalProperties": false,
+            "additionalProperties": true,
             "required": ["findings_path", "reviewer_runs"],
             "properties": {
               "findings_path": {
