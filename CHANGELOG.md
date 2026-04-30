@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.43.1] - 2026-04-30
+
+### Miscellaneous
+
+- Drop dead code, gate supervisor scaffolding behind allow(dead_code) (#27) ([210d55f](https://github.com/andreas-pohl-parloa/plan-executor/commit/210d55f75dfbad7efe013347bddb90a9012537c5))
 ## [0.43.0] - 2026-04-30
 
 ### Features
