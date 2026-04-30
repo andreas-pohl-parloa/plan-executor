@@ -12,6 +12,7 @@ mod plan;
 mod proctree;
 mod remote;
 mod schema;
+mod schema_registry;
 mod scheduler;
 mod validate;
 
