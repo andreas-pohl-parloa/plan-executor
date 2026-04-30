@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.41.12] - 2026-04-30
+
+### Bug Fixes
+
+- **scheduler:** Wire sub-agent channels through StepContext for daemon runs (#24) ([c0c5b5f](https://github.com/andreas-pohl-parloa/plan-executor/commit/c0c5b5fa581a68802a31ad4b708815771b56aa79))
 ## [0.41.11] - 2026-04-30
 
 ### Bug Fixes
