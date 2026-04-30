@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.46.0] - 2026-04-30
+
+### Features
+
+- Configurable plan pipeline via plan.pipeline.steps (#33) ([23402bc](https://github.com/andreas-pohl-parloa/plan-executor/commit/23402bcab9c4369c3adf77b7c5315080f2cb449c))
 ## [0.45.1] - 2026-04-30
 
 ### Bug Fixes
