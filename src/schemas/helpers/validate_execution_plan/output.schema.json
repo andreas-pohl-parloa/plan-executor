@@ -2,43 +2,107 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://parloa.dev/plan-executor/skills/validate-execution-plan-non-interactive/output.schema.json",
   "title": "validate-execution-plan-non-interactive output",
+  "description": "Two shapes: dispatch (status=waiting_for_handoffs, state_updates carries the validator/validation-fix handoff list) and triage (status in success/fix_required/blocked/abort, state_updates carries validation_report_path + gaps). The orchestrator dispatches the handoffs from dispatch mode and re-invokes the skill in triage mode with the captured outputs.",
   "type": "object",
   "additionalProperties": false,
   "required": ["status", "next_step", "notes", "state_updates"],
   "properties": {
     "status": {
       "type": "string",
-      "enum": ["success", "fix_required", "blocked", "abort"]
+      "enum": ["success", "fix_required", "blocked", "abort", "waiting_for_handoffs"]
     },
     "next_step": {
-      "type": "string",
-      "enum": ["proceed_to_pr", "dispatch_validation_fix", "escalate", "terminate"]
+      "type": "string"
     },
     "notes": {
       "type": "string"
     },
     "state_updates": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["validation_report_path", "gaps"],
-      "properties": {
-        "validation_report_path": {
-          "type": "string",
-          "minLength": 1
-        },
-        "gaps": {
-          "type": "array",
-          "items": {
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "status": { "const": "waiting_for_handoffs" } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "state_updates": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["goal", "missing_evidence"],
+            "required": ["handoffs"],
             "properties": {
-              "goal":             { "type": "string", "minLength": 1 },
-              "missing_evidence": { "type": "string", "minLength": 1 }
+              "handoffs": {
+                "description": "Sub-agents the orchestrator must dispatch via handoff::dispatch_all. Mirrors the standalone handoffs.schema.json (use `plan-executor validate-handoffs` to self-check).",
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 16,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["index", "agent_type", "prompt_file"],
+                  "properties": {
+                    "index": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 16
+                    },
+                    "agent_type": {
+                      "type": "string",
+                      "enum": ["claude", "codex", "gemini", "bash"]
+                    },
+                    "can_fail": {
+                      "type": "boolean",
+                      "default": false
+                    },
+                    "prompt_file": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": { "enum": ["success", "fix_required", "blocked", "abort"] }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "state_updates": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["validation_report_path", "gaps"],
+            "properties": {
+              "validation_report_path": {
+                "type": "string",
+                "minLength": 1
+              },
+              "gaps": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["goal", "missing_evidence"],
+                  "properties": {
+                    "goal":             { "type": "string", "minLength": 1 },
+                    "missing_evidence": { "type": "string", "minLength": 1 }
+                  }
+                }
+              }
             }
           }
         }
       }
     }
-  }
+  ]
 }
