@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.49.1] - 2026-04-30
+
+### Bug Fixes
+
+- **helper:** Put helper child in own pgroup + register pgid with daemon (#37) ([e49e562](https://github.com/andreas-pohl-parloa/plan-executor/commit/e49e562a31f1a47a6ecd90d0b5eafe3c2b373f4e))
 ## [0.49.0] - 2026-04-30
 
 ### Features
