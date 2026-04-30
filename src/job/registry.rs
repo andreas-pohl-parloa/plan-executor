@@ -142,7 +142,9 @@ pub fn steps_for_plan_filtered(
 /// at validate time).
 fn build_plan_step(name: &str, manifest_path: &std::path::Path) -> Box<dyn Step> {
     match name {
-        "preflight" => Box::new(steps::plan::PreflightStep),
+        "preflight" => Box::new(steps::plan::PreflightStep {
+            manifest_path: manifest_path.to_path_buf(),
+        }),
         "wave_execution" => Box::new(steps::plan::WaveExecutionStep {
             manifest_path: manifest_path.to_path_buf(),
         }),

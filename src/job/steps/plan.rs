@@ -59,7 +59,33 @@ const MAX_FIX_LOOP_BUDGET: Duration = Duration::from_secs(2 * 60 * 60);
 ///
 /// Today the orchestrator skill performs preflight checks; this shell exists
 /// so the registry has an 8-element vector for `JobKind::Plan`.
-pub struct PreflightStep;
+/// Preflight: prepares the working tree for the plan.
+///
+/// When `plan.flags.no_worktree` is `false` (the default), creates a fresh
+/// `git worktree` rooted at `<source-repo>/../.my/worktrees/<repo>-<plan-stem>[-<jira>]`
+/// and checks out the manifest's `target_branch` (or a derived
+/// `<type>/<plan-stem>` when omitted). On success, mutates `ctx.workdir`
+/// so every subsequent step (`wave_execution`, `code_review`,
+/// `pr_creation`, …) runs inside the new worktree instead of the source
+/// repo's main checkout.
+///
+/// When `plan.flags.no_worktree` is `true`, the step is a no-op — useful
+/// for one-shot manifests where the caller has already arranged the
+/// working tree.
+///
+/// Idempotent: when the target worktree path already exists and resolves
+/// to the requested branch, the step short-circuits to
+/// [`AttemptOutcome::Success`] and updates `ctx.workdir` so re-runs land
+/// in the same place. When the path exists but points at a different
+/// branch, the step surfaces a `ProtocolViolation` rather than risk
+/// silently overwriting in-progress work.
+#[derive(Debug, Clone)]
+pub struct PreflightStep {
+    /// Absolute path to the compiled `tasks.json` manifest. Read for
+    /// `plan.flags`, `plan.target_branch`, `plan.target_repo`, `plan.type`
+    /// during worktree setup.
+    pub manifest_path: PathBuf,
+}
 
 #[async_trait]
 impl Step for PreflightStep {
@@ -72,9 +98,208 @@ impl Step for PreflightStep {
     fn recovery_policy(&self) -> RecoveryPolicy {
         RecoveryPolicy::None
     }
-    async fn run(&self, _ctx: &mut StepContext) -> AttemptOutcome {
-        AttemptOutcome::Pending
+    async fn run(&self, ctx: &mut StepContext) -> AttemptOutcome {
+        run_preflight(ctx, &self.manifest_path)
     }
+}
+
+/// Implementation of [`PreflightStep::run`]; split out as a free function
+/// for unit testability.
+fn run_preflight(ctx: &mut StepContext, manifest_path: &Path) -> AttemptOutcome {
+    let plan_meta = match load_plan_meta(manifest_path) {
+        Ok(m) => m,
+        Err(outcome) => return outcome,
+    };
+
+    if plan_meta.flags.no_worktree {
+        tracing::info!(
+            "preflight: skipped worktree setup (plan.flags.no_worktree=true)"
+        );
+        return AttemptOutcome::Success;
+    }
+
+    let source_repo = match find_source_repo(ctx, manifest_path) {
+        Some(p) => p,
+        None => {
+            return AttemptOutcome::ProtocolViolation {
+                category: "preflight_no_source_repo".to_string(),
+                detail: format!(
+                    "could not find a `.git` directory at or above ctx.workdir `{}` or manifest path `{}`",
+                    ctx.workdir.display(),
+                    manifest_path.display()
+                ),
+            };
+        }
+    };
+
+    let plan_stem = plan_stem_from_manifest(manifest_path);
+    let worktree_path = compute_worktree_path(&source_repo, &plan_stem, &plan_meta);
+    let branch = derive_branch_name(&plan_meta, &plan_stem);
+
+    match ensure_worktree(&source_repo, &worktree_path, &branch) {
+        Ok(()) => {
+            tracing::info!(
+                worktree = %worktree_path.display(),
+                branch = %branch,
+                "preflight: worktree ready",
+            );
+            ctx.workdir = worktree_path;
+            AttemptOutcome::Success
+        }
+        Err(detail) => AttemptOutcome::ProtocolViolation {
+            category: "preflight_worktree_failed".to_string(),
+            detail,
+        },
+    }
+}
+
+/// Resolves the source repository root for worktree creation. Prefers
+/// `ctx.workdir` (the daemon sets this from `find_repo_root(plan)`), and
+/// falls back to walking up from `manifest_path` for foreground / test
+/// callers that may not have a workdir-resolved-to-repo invariant.
+fn find_source_repo(ctx: &StepContext, manifest_path: &Path) -> Option<PathBuf> {
+    if ctx.workdir.join(".git").exists() {
+        return Some(ctx.workdir.clone());
+    }
+    let mut dir = manifest_path.parent()?.to_path_buf();
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir);
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+}
+
+/// Plan-file stem (filename minus extension), used as the slug component
+/// of both the worktree path and the derived branch name. Falls back to
+/// `"plan"` when the manifest path has no usable parent directory name.
+fn plan_stem_from_manifest(manifest_path: &Path) -> String {
+    // tasks.json lives at `<plan-dir>/<plan-stem>/tasks.json`; the
+    // plan-stem is the parent directory's name.
+    manifest_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "plan".to_string())
+}
+
+/// Computes the target worktree path per the project's
+/// `<source-repo>/../.my/worktrees/<repo>-<plan-stem>[-<jira>]` convention.
+fn compute_worktree_path(
+    source_repo: &Path,
+    plan_stem: &str,
+    plan_meta: &PlanMeta,
+) -> PathBuf {
+    let repo_name = source_repo
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("repo");
+    let mut name = format!("{repo_name}-{plan_stem}");
+    if let Some(jira) = plan_meta.jira.as_deref() {
+        name.push('-');
+        name.push_str(jira);
+    }
+    let parent = source_repo
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| source_repo.to_path_buf());
+    parent.join(".my").join("worktrees").join(name)
+}
+
+/// Derives the branch name. Honors `plan.target_branch` when present;
+/// otherwise generates `<type>/<plan-stem>` so the branch is
+/// human-readable and matches the project's conventional commit prefix.
+fn derive_branch_name(plan_meta: &PlanMeta, plan_stem: &str) -> String {
+    if let Some(b) = plan_meta.target_branch.as_deref() {
+        if !b.is_empty() {
+            return b.to_string();
+        }
+    }
+    let prefix = match plan_meta.plan_type.as_str() {
+        "feature" => "feat",
+        "bug" => "fix",
+        // refactor / chore / docs / infra all map to themselves
+        other => other,
+    };
+    format!("{prefix}/{plan_stem}")
+}
+
+/// Idempotent worktree setup. When the target path already exists and
+/// resolves to the requested branch, returns `Ok(())`. When it exists but
+/// points at a different branch, returns `Err` with a precise diagnostic
+/// rather than risk overwriting in-progress work.
+fn ensure_worktree(
+    source_repo: &Path,
+    worktree_path: &Path,
+    branch: &str,
+) -> Result<(), String> {
+    if worktree_path.exists() {
+        // Verify the branch matches; if so, treat as already-set-up.
+        let existing = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(worktree_path)
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .output()
+            .map_err(|e| format!("git symbolic-ref at existing worktree: {e}"))?;
+        if !existing.status.success() {
+            return Err(format!(
+                "existing worktree at {} is not a valid git checkout",
+                worktree_path.display()
+            ));
+        }
+        let existing_branch = String::from_utf8_lossy(&existing.stdout).trim().to_string();
+        if existing_branch == branch {
+            return Ok(());
+        }
+        return Err(format!(
+            "existing worktree at {} is on branch `{existing_branch}`, not the requested `{branch}`",
+            worktree_path.display()
+        ));
+    }
+
+    if let Some(parent) = worktree_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return Err(format!(
+                "create worktree parent dir {}: {e}",
+                parent.display()
+            ));
+        }
+    }
+
+    // Try `git worktree add -b <branch> <path>` first; on failure
+    // (likely "branch already exists"), retry without `-b` so the existing
+    // branch is checked out into the new worktree.
+    let new_branch_attempt = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(source_repo)
+        .args(["worktree", "add", "-b", branch])
+        .arg(worktree_path)
+        .output()
+        .map_err(|e| format!("git worktree add (new branch): {e}"))?;
+    if new_branch_attempt.status.success() {
+        return Ok(());
+    }
+
+    let existing_branch_attempt = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(source_repo)
+        .args(["worktree", "add"])
+        .arg(worktree_path)
+        .arg(branch)
+        .output()
+        .map_err(|e| format!("git worktree add (existing branch): {e}"))?;
+    if existing_branch_attempt.status.success() {
+        return Ok(());
+    }
+
+    let stderr_new = String::from_utf8_lossy(&new_branch_attempt.stderr).into_owned();
+    let stderr_existing = String::from_utf8_lossy(&existing_branch_attempt.stderr).into_owned();
+    Err(format!(
+        "git worktree add failed:\n  new-branch attempt: {}\n  existing-branch attempt: {}",
+        stderr_new.trim(),
+        stderr_existing.trim()
+    ))
 }
 
 /// Real wave-traversal step for `JobKind::Plan`.
@@ -216,6 +441,22 @@ impl Step for CodeReviewStep {
     }
 
     async fn run(&self, ctx: &mut StepContext) -> AttemptOutcome {
+        // Manifest may opt out of review entirely (e.g. one-shot tasks).
+        // The cleaner mechanism is to omit `code_review` from
+        // `plan.pipeline.steps`, but `flags.skip_code_review` is honored
+        // here too for legacy manifests that still set the flag.
+        match load_plan_meta(&self.manifest_path) {
+            Ok(meta) if meta.flags.skip_code_review => {
+                tracing::info!(
+                    "code_review: skipped (plan.flags.skip_code_review=true)"
+                );
+                return AttemptOutcome::Success;
+            }
+            Ok(_) => {}
+            // Manifest read failures fall through to the helper loop, which
+            // will surface the same problem with full context.
+            Err(_) => {}
+        }
         run_helper_fix_loop(
             ctx,
             &self.manifest_path,
@@ -1605,11 +1846,32 @@ struct PlanMeta {
 }
 
 /// Plan-flag block in the manifest. Field-for-field mirror of the schema's
-/// `plan.flags` object.
+/// `plan.flags` object. Each flag's runtime semantics are documented on its
+/// reader rather than here so the contract stays close to the consumer.
 #[derive(Debug, Clone, Copy, Default)]
 struct PlanFlags {
+    /// Honored by `summary` step's pr-finalize delegation: when true, skips
+    /// the helper invocation and writes a local summary instead.
     skip_pr: bool,
+    /// Honored by `pr_creation`: when true, runs `gh pr create --draft`.
     draft_pr: bool,
+    /// Honored by `summary` step's pr-finalize delegation: when true, the
+    /// `PrFinalizeInput.merge_mode` is set to `Merge` so the helper runs
+    /// `gh pr merge --merge` after finalization.
+    merge: bool,
+    /// Honored by `summary` step's pr-finalize delegation: when true, the
+    /// `PrFinalizeInput.merge_mode` is set to `MergeAdmin` so the helper
+    /// runs `gh pr merge --merge --admin`. Wins over `merge` when both are
+    /// set (admin merges bypass branch protections, which the plain
+    /// `--merge` cannot).
+    merge_admin: bool,
+    /// Honored by `code_review` step: when true, the step short-circuits
+    /// to `Success` without invoking the reviewer team.
+    skip_code_review: bool,
+    /// Honored by `preflight` step: when true, the step skips worktree +
+    /// branch creation. The plan runs in the source repo's existing
+    /// checkout.
+    no_worktree: bool,
 }
 
 /// Loads `plan.{goal,type,jira,target_repo,target_branch,flags}` from the
@@ -1666,15 +1928,19 @@ fn load_plan_meta(manifest_path: &Path) -> Result<PlanMeta, AttemptOutcome> {
             category: "manifest_invariant".to_string(),
             detail: "manifest plan.flags missing".to_string(),
         })?;
+    let flag_bool = |key: &str| -> bool {
+        flags_value
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
     let flags = PlanFlags {
-        skip_pr: flags_value
-            .get("skip_pr")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        draft_pr: flags_value
-            .get("draft_pr")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
+        skip_pr: flag_bool("skip_pr"),
+        draft_pr: flag_bool("draft_pr"),
+        merge: flag_bool("merge"),
+        merge_admin: flag_bool("merge_admin"),
+        skip_code_review: flag_bool("skip_code_review"),
+        no_worktree: flag_bool("no_worktree"),
     };
     Ok(PlanMeta {
         goal,
@@ -1972,7 +2238,7 @@ fn run_summary(ctx: &StepContext, manifest_path: &Path) -> AttemptOutcome {
 
     if !plan_meta.flags.skip_pr {
         if let Some(url) = pr_url.as_deref() {
-            return delegate_to_pr_finalize(ctx, url);
+            return delegate_to_pr_finalize(ctx, url, plan_meta.flags);
         }
         // skip_pr=false but no PR URL on disk; fall through to the local
         // summary so the run still produces an artifact.
@@ -2001,7 +2267,17 @@ fn read_pr_url(ctx: &StepContext) -> Option<String> {
 
 /// Calls [`invoke_pr_finalize`] for `url`. Maps helper failures onto the
 /// matching [`AttemptOutcome`] using [`helper_error_to_outcome`].
-fn delegate_to_pr_finalize(ctx: &StepContext, url: &str) -> AttemptOutcome {
+///
+/// Honors the manifest's `plan.flags.merge` / `plan.flags.merge_admin`:
+/// when `merge_admin` is set the helper merges with `gh pr merge --merge
+/// --admin` (bypassing branch protections); when only `merge` is set the
+/// helper merges with `gh pr merge --merge`; otherwise the helper monitors
+/// the PR but does not merge.
+fn delegate_to_pr_finalize(
+    ctx: &StepContext,
+    url: &str,
+    flags: PlanFlags,
+) -> AttemptOutcome {
     let (owner, repo, pr) = match parse_pr_url(url) {
         Some(parts) => parts,
         None => {
@@ -2011,11 +2287,18 @@ fn delegate_to_pr_finalize(ctx: &StepContext, url: &str) -> AttemptOutcome {
             };
         }
     };
+    let merge_mode = if flags.merge_admin {
+        PrFinalizeMergeMode::MergeAdmin
+    } else if flags.merge {
+        PrFinalizeMergeMode::Merge
+    } else {
+        PrFinalizeMergeMode::None
+    };
     let input = PrFinalizeInput {
         owner,
         repo,
         pr,
-        merge_mode: PrFinalizeMergeMode::None,
+        merge_mode,
     };
     match invoke_pr_finalize(input, ctx) {
         Ok(_) => AttemptOutcome::Success,
@@ -2089,4 +2372,101 @@ fn write_local_summary(
         };
     }
     AttemptOutcome::Success
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::*;
+
+    fn meta_with(jira: Option<&str>, target_branch: Option<&str>, plan_type: &str) -> PlanMeta {
+        PlanMeta {
+            goal: "g".into(),
+            plan_type: plan_type.into(),
+            jira: jira.map(str::to_string),
+            target_repo: None,
+            target_branch: target_branch.map(str::to_string),
+            flags: PlanFlags::default(),
+        }
+    }
+
+    #[test]
+    fn plan_stem_uses_manifest_parent_directory_name() {
+        let manifest = std::path::Path::new(
+            "/abs/repo/docs/superpowers/plans/2026-04-29-month-reporting-fix/tasks.json",
+        );
+        assert_eq!(plan_stem_from_manifest(manifest), "2026-04-29-month-reporting-fix");
+    }
+
+    #[test]
+    fn plan_stem_falls_back_when_manifest_has_no_parent() {
+        let manifest = std::path::Path::new("tasks.json");
+        // No parent → "plan"
+        assert_eq!(plan_stem_from_manifest(manifest), "plan");
+    }
+
+    #[test]
+    fn worktree_path_uses_repo_name_and_plan_stem() {
+        let repo = std::path::Path::new("/Users/me/code/my-repo");
+        let meta = meta_with(None, None, "feature");
+        let path = compute_worktree_path(repo, "month-reporting-fix", &meta);
+        assert_eq!(
+            path,
+            std::path::PathBuf::from(
+                "/Users/me/code/.my/worktrees/my-repo-month-reporting-fix"
+            )
+        );
+    }
+
+    #[test]
+    fn worktree_path_appends_jira_when_present() {
+        let repo = std::path::Path::new("/Users/me/code/my-repo");
+        let meta = meta_with(Some("CCP-123"), None, "feature");
+        let path = compute_worktree_path(repo, "stem", &meta);
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/Users/me/code/.my/worktrees/my-repo-stem-CCP-123")
+        );
+    }
+
+    #[test]
+    fn derived_branch_uses_target_branch_when_set() {
+        let meta = meta_with(None, Some("feat/CCP-123-month-reporting"), "feature");
+        assert_eq!(
+            derive_branch_name(&meta, "stem-ignored"),
+            "feat/CCP-123-month-reporting"
+        );
+    }
+
+    #[test]
+    fn derived_branch_maps_feature_to_feat_prefix() {
+        let meta = meta_with(None, None, "feature");
+        assert_eq!(derive_branch_name(&meta, "month-reporting-fix"), "feat/month-reporting-fix");
+    }
+
+    #[test]
+    fn derived_branch_maps_bug_to_fix_prefix() {
+        let meta = meta_with(None, None, "bug");
+        assert_eq!(derive_branch_name(&meta, "broken-thing"), "fix/broken-thing");
+    }
+
+    #[test]
+    fn derived_branch_passes_through_other_types() {
+        for t in ["refactor", "chore", "docs", "infra"] {
+            let meta = meta_with(None, None, t);
+            assert_eq!(
+                derive_branch_name(&meta, "x"),
+                format!("{t}/x"),
+                "type {t} should map to itself",
+            );
+        }
+    }
+
+    #[test]
+    fn empty_target_branch_falls_back_to_derived() {
+        // An empty string in target_branch shouldn't win over the derived
+        // default — it indicates an unset field, not a deliberate empty
+        // branch name.
+        let meta = meta_with(None, Some(""), "feature");
+        assert_eq!(derive_branch_name(&meta, "stem"), "feat/stem");
+    }
 }
