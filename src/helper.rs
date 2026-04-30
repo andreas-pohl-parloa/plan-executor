@@ -994,7 +994,15 @@ pub fn invoke_pr_finalize(
     ctx: &StepContext,
 ) -> Result<PrFinalizeOutput, HelperError> {
     let json = serialize_wrapper_input(&input)?;
-    let raw = invoke_helper(HelperSkill::PrFinalize, json, ctx)?;
+    // pr-finalize delegates to `pr-monitor.sh`, a poll loop with a
+    // hardcoded 30-minute upper bound (`MAX_POLL_ITERATIONS=120` × 15s).
+    // The default 10-minute helper timeout kills the helper before the
+    // script can finish under any non-trivial CI / Bugbot wait. Give
+    // pr-finalize 35 minutes so the script's own deadline fires first.
+    let options = HelperInvocation {
+        timeout: Some(Duration::from_secs(2100)),
+    };
+    let raw = invoke_helper_with(HelperSkill::PrFinalize, json, ctx, &options)?;
     decode_state_updates(raw)
 }
 
