@@ -70,43 +70,204 @@ fn cmd_list() -> Result<()> {
         println!("No jobs.");
         return Ok(());
     }
+    let job_processes = query_daemon_processes();
     println!(
-        "{:<10} {:<14} {:<11} {:<21} TITLE",
-        "ID", "KIND", "STATE", "CREATED_AT"
+        "{:<10} {:<14} {:<11} {:<21} {:<26} TITLE",
+        "ID", "KIND", "STATE", "CREATED_AT", "PROGRESS"
     );
     for entry in entries {
         match entry {
             JobStoreEntry::New { summary, path } => {
-                let title = match store.open(&summary.id) {
-                    Ok(dir) => match dir.read_job() {
-                        Ok(job) => job_title(&job),
-                        Err(_) => path.display().to_string(),
-                    },
-                    Err(_) => path.display().to_string(),
-                };
+                let job_opt = store.open(&summary.id).ok().and_then(|dir| dir.read_job().ok());
+                let title = job_opt
+                    .as_ref()
+                    .map(job_title)
+                    .unwrap_or_else(|| path.display().to_string());
+                let progress = progress_label(&summary.id.0);
                 println!(
-                    "{:<10} {:<14} {:<11} {:<21} {}",
+                    "{:<10} {:<14} {:<11} {:<21} {:<26} {}",
                     short_id(&summary.id.0),
                     summary.kind_tag,
                     state_label(&summary.state),
                     short_timestamp(&summary.created_at),
+                    truncate_to(&progress, 26),
                     title,
                 );
+                if matches!(summary.state, JobState::Running) {
+                    if let Some(procs) = job_processes.get(&summary.id.0) {
+                        crate::cli::render_job_process_tree_compat(procs);
+                    }
+                }
             }
             JobStoreEntry::Legacy { id, path } => {
                 let (kind, state, created, title) = legacy_summary(&path);
+                let progress = progress_label(&id);
                 println!(
-                    "{:<10} {:<14} {:<11} {:<21} {}",
+                    "{:<10} {:<14} {:<11} {:<21} {:<26} {}",
                     short_id(&id),
                     kind,
                     state,
                     short_timestamp(&created),
+                    truncate_to(&progress, 26),
                     title,
                 );
+                if state == "running" {
+                    if let Some(procs) = job_processes.get(&id) {
+                        crate::cli::render_job_process_tree_compat(procs);
+                    }
+                }
             }
         }
     }
     Ok(())
+}
+
+/// Connects to the daemon for a single GetState snapshot and returns the
+/// resulting `running_processes` keyed by job id. Returns an empty map when
+/// the daemon is unreachable or replies with an unexpected envelope so the
+/// listing degrades gracefully (header + rows still render, just without the
+/// sub-process tree).
+fn query_daemon_processes() -> HashMap<String, crate::ipc::JobProcesses> {
+    use crate::ipc::{DaemonEvent, TuiRequest};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    if !crate::ipc::socket_path().exists() {
+        return HashMap::new();
+    }
+    let mut stream = match UnixStream::connect(crate::ipc::socket_path()) {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+    let req = match serde_json::to_string(&TuiRequest::GetState) {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+    if stream.write_all(format!("{}\n", req).as_bytes()).is_err() {
+        return HashMap::new();
+    }
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() {
+        return HashMap::new();
+    }
+    match serde_json::from_str::<DaemonEvent>(&line) {
+        Ok(DaemonEvent::State {
+            running_processes, ..
+        }) => running_processes
+            .into_iter()
+            .map(|p| (p.job_id.clone(), p))
+            .collect(),
+        _ => HashMap::new(),
+    }
+}
+
+/// Derives a short PROGRESS label from the job's `display.log`. Reads the
+/// last few lines, finds the most recent `step N (name) ...` entry, and
+/// distills it into either `step N (name): <status>` or `step N: dispatch
+/// W (X agents)` when the step is in the middle of a wave dispatch.
+///
+/// Returns `-` when no display.log exists or no step line has been emitted
+/// yet (job freshly queued / preflight not started).
+fn progress_label(job_id: &str) -> String {
+    let path = crate::config::Config::base_dir()
+        .join("jobs")
+        .join(job_id)
+        .join("display.log");
+    let Ok(content) = fs::read_to_string(&path) else {
+        return "-".to_string();
+    };
+    let mut latest_step: Option<(u32, String, String)> = None;
+    let mut latest_dispatch: Option<(u32, String)> = None;
+    for raw in content.lines() {
+        // Strip the leading bullet + ANSI prefix added by append_display.
+        let cleaned = strip_bullet_prefix(raw);
+        if let Some((seq, name, status)) = parse_step_line(&cleaned) {
+            latest_step = Some((seq, name, status));
+            latest_dispatch = None; // new step resets dispatch counter
+        } else if let Some((count, kind)) = parse_dispatch_line(&cleaned) {
+            latest_dispatch = Some((count, kind));
+        }
+    }
+    match (latest_step, latest_dispatch) {
+        (Some((seq, name, _status)), Some((count, kind))) => {
+            format!("step {seq} ({name}): {count}× {kind}")
+        }
+        (Some((seq, name, status)), None) => {
+            if status == "starting" {
+                format!("step {seq} ({name}): running")
+            } else {
+                format!("step {seq} ({name}): {status}")
+            }
+        }
+        _ => "-".to_string(),
+    }
+}
+
+fn strip_bullet_prefix(line: &str) -> String {
+    // Lines look like "\x1b[33m⏺ [plan-executor]\x1b[0m step 2 …" or just
+    // "⏺ [plan-executor] step 2 …"; strip ANSI and the bullet so the
+    // parsers below see the bare text.
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip until the terminating 'm' (CSI sequences end in a letter;
+            // close enough for our color codes).
+            for d in chars.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    let trimmed = out.trim_start();
+    let after_bullet = trimmed.strip_prefix("⏺ ").unwrap_or(trimmed);
+    let after_tag = after_bullet
+        .strip_prefix("[plan-executor] ")
+        .unwrap_or(after_bullet);
+    after_tag.trim().to_string()
+}
+
+fn parse_step_line(line: &str) -> Option<(u32, String, String)> {
+    // Matches: "step <N> (<name>) <status...>"
+    let after = line.strip_prefix("step ")?;
+    let (seq_str, rest) = after.split_once(' ')?;
+    let seq: u32 = seq_str.parse().ok()?;
+    let rest = rest.strip_prefix('(')?;
+    let (name, after_name) = rest.split_once(')')?;
+    let status = after_name.trim().trim_start_matches(':').trim().to_string();
+    let status = if status.is_empty() {
+        "running".to_string()
+    } else {
+        status
+    };
+    Some((seq, name.to_string(), status))
+}
+
+fn parse_dispatch_line(line: &str) -> Option<(u32, String)> {
+    // Matches: "dispatching <N> sub-agent(s) (kind: <kind>)"
+    let after = line.strip_prefix("dispatching ")?;
+    let (count_str, rest) = after.split_once(' ')?;
+    let count: u32 = count_str.parse().ok()?;
+    let kind = rest
+        .split_once("(kind: ")
+        .and_then(|(_, k)| k.strip_suffix(')'))
+        .unwrap_or("dispatch")
+        .to_string();
+    Some((count, kind))
+}
+
+fn truncate_to(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
 }
 
 /// Trims an RFC3339 timestamp like `2026-04-30T09:38:47.060394+00:00` down to
