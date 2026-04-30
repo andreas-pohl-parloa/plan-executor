@@ -1275,7 +1275,11 @@ async fn execute_foreground(manifest_arg: String, config: crate::config::Config)
     let kind = JobKind::Plan {
         manifest_path: manifest_path.clone(),
     };
-    let runtime_steps = registry::steps_for(&kind);
+    let pipeline_override: Option<Vec<String>> = crate::scheduler::load_manifest(&manifest_path)
+        .ok()
+        .and_then(|m| m.plan.pipeline.map(|p| p.steps));
+    let runtime_steps =
+        registry::steps_for_plan_filtered(&manifest_path, pipeline_override.as_deref());
     let step_instances: Vec<StepInstance> = runtime_steps
         .iter()
         .enumerate()

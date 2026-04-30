@@ -884,7 +884,19 @@ async fn spawn_rust_scheduler_job(
     let kind = JobKind::Plan {
         manifest_path: manifest_path.clone(),
     };
-    let runtime_steps = registry::steps_for(&kind);
+    // Honor the manifest's `plan.pipeline.steps` override when present so
+    // the registry constructs only the requested steps in the requested
+    // order. Manifest-load failure keeps the legacy default — surfacing a
+    // submission-time error here would refuse jobs over what is at worst a
+    // mis-formed pipeline block; the scheduler's own load_manifest call
+    // will surface that with full context once execution starts.
+    let pipeline_override: Option<Vec<String>> = crate::scheduler::load_manifest(&manifest_path)
+        .ok()
+        .and_then(|m| m.plan.pipeline.map(|p| p.steps));
+    let runtime_steps = registry::steps_for_plan_filtered(
+        &manifest_path,
+        pipeline_override.as_deref(),
+    );
     let step_instances: Vec<StepInstance> = runtime_steps
         .iter()
         .enumerate()

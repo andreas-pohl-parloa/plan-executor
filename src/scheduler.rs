@@ -82,10 +82,28 @@ pub struct PlanBlock {
     /// deserialize as "local" via the `default_execution_mode` fallback.
     #[serde(default = "default_execution_mode")]
     pub execution_mode: String,
+    /// Optional override for the daemon's pipeline step list. When `None`
+    /// (older manifests, or compile-plan opting in to defaults), the
+    /// registry emits the full 7-step sequence minus `code_review`. When
+    /// `Some`, only the listed step names run, in the order given. The
+    /// manifest schema constrains the names to the registry's known set.
+    #[serde(default)]
+    pub pipeline: Option<PipelineBlock>,
 }
 
 fn default_execution_mode() -> String {
     "local".to_string()
+}
+
+/// Override block for the daemon's plan pipeline step list. Mirrors the
+/// `plan.pipeline` shape in `tasks.schema.json` exactly so a successful
+/// validate-then-deserialize round-trip never drops fields.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[non_exhaustive]
+pub struct PipelineBlock {
+    /// Ordered list of step names to construct via `registry::steps_for`.
+    /// Names outside the registry's known set fail manifest validation.
+    pub steps: Vec<String>,
 }
 
 /// One wave: a parallel batch of tasks that runs after `depends_on` waves complete.
@@ -182,6 +200,21 @@ fn validate_invariants(m: &Manifest) -> Result<(), SchedulerError> {
     }
     for (tid, task) in &m.tasks {
         validate_prompt_file_shape(tid, &task.prompt_file)?;
+    }
+    if let Some(pipeline) = &m.plan.pipeline {
+        if pipeline.steps.is_empty() {
+            return Err(SchedulerError::Invariant(
+                "plan.pipeline.steps must not be empty (omit the field to use the default sequence)".to_string(),
+            ));
+        }
+        for step in &pipeline.steps {
+            if !crate::job::registry::KNOWN_PLAN_STEPS.contains(&step.as_str()) {
+                return Err(SchedulerError::Invariant(format!(
+                    "plan.pipeline.steps contains unknown step `{step}`; known: {}",
+                    crate::job::registry::KNOWN_PLAN_STEPS.join(", ")
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -708,6 +741,7 @@ mod tests {
                 status: "READY".to_string(),
                 path: "/tmp/plan.md".to_string(),
                 execution_mode: "local".to_string(),
+                pipeline: None,
             },
             waves,
             tasks: tasks
