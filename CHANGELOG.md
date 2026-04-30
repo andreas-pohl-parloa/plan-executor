@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.48.0] - 2026-04-30
+
+### Features
+
+- Extend dispatch protocol to validate-execution-plan and review-execution-output (#35) ([42affda](https://github.com/andreas-pohl-parloa/plan-executor/commit/42affda93647a467938bb564f6d6929e282bf957))
 ## [0.47.0] - 2026-04-30
 
 ### Features
