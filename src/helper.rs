@@ -291,7 +291,7 @@ pub fn invoke_helper_with(
     options: &HelperInvocation,
 ) -> Result<HelperOutput, HelperError> {
     let sidecar_path = write_input_sidecar(skill, &input, ctx)?;
-    let stdout = run_claude_subprocess(skill, &sidecar_path, &ctx.workdir, options)?;
+    let stdout = run_claude_subprocess(skill, &sidecar_path, ctx, options)?;
     parse_and_validate_output(skill, &stdout)
 }
 
@@ -344,9 +344,10 @@ fn write_input_sidecar(
 fn run_claude_subprocess(
     skill: HelperSkill,
     sidecar_path: &std::path::Path,
-    workdir: &std::path::Path,
+    ctx: &StepContext,
     options: &HelperInvocation,
 ) -> Result<String, HelperError> {
+    let workdir = ctx.workdir.as_path();
     let sidecar_str = sidecar_path.to_str().ok_or_else(|| {
         HelperError::HardInfra(format!(
             "sidecar path is not valid UTF-8: {}",
@@ -367,7 +368,8 @@ fn run_claude_subprocess(
 
     let timeout = resolve_timeout(options);
 
-    let mut child = match scrubbed_env_command()
+    let mut command = scrubbed_env_command();
+    command
         .arg("-p")
         .arg(&prompt)
         .arg("--allowed-tools")
@@ -377,8 +379,18 @@ fn run_claude_subprocess(
         .arg("--dangerously-skip-permissions")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    // Put the helper child in its own process group so the daemon's
+    // `KillJob` can SIGKILL it (and any descendants) via the pgid the
+    // dispatcher path already uses for wave sub-agents. Without this, the
+    // helper inherits the daemon's pgid and kill -PGID would target the
+    // daemon itself.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = match command.spawn()
     {
         Ok(child) => child,
         Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -397,6 +409,16 @@ fn run_claude_subprocess(
             )));
         }
     };
+
+    // Register the helper child's pgid with the daemon so `plan-executor jobs`
+    // shows it under this job's sub-agent tree and `plan-executor kill`
+    // SIGKILLs it via the same pgroup pathway the wave dispatcher uses.
+    // No-op when ctx.daemon_hooks is unset (foreground / tests).
+    if let Some(hooks) = ctx.daemon_hooks.as_ref() {
+        let tx = hooks.spawn_pgid_registrar();
+        // With process_group(0) above, the child's PID equals its PGID.
+        let _ = tx.send(child.id());
+    }
 
     let stdout_handle = child
         .stdout
