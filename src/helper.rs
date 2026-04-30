@@ -55,7 +55,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use wait_timeout::ChildExt;
 
-use crate::compile::{join_drainer, scrubbed_env_command, spawn_drainer, truncate_for_error};
+use crate::compile::{join_drainer, scrubbed_env_command, truncate_for_error};
+use crate::handoff::SubAgentLine;
 use crate::job::step::StepContext;
 
 /// Maximum bytes captured from each subprocess stream after a timeout / exit.
@@ -370,6 +371,9 @@ fn run_claude_subprocess(
 
     let mut command = scrubbed_env_command();
     command
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("--verbose")
         .arg("-p")
         .arg(&prompt)
         .arg("--allowed-tools")
@@ -410,24 +414,42 @@ fn run_claude_subprocess(
         }
     };
 
-    // Register the helper child's pgid with the daemon so `plan-executor jobs`
-    // shows it under this job's sub-agent tree and `plan-executor kill`
-    // SIGKILLs it via the same pgroup pathway the wave dispatcher uses.
+    // Wire the helper child into the daemon's sub-agent rendering and
+    // kill paths:
+    //   * pgid_registrar so `plan-executor kill` SIGKILLs the helper's
+    //     process group via the same pathway the wave dispatcher uses;
+    //   * subagent_writer so each JSONL event the helper streams is
+    //     persisted under `<job>/sub-agents/dispatch-<N>-...` and
+    //     broadcast as a `SubAgentLine` event for `plan-executor output
+    //     -f` to render live.
     // No-op when ctx.daemon_hooks is unset (foreground / tests).
-    if let Some(hooks) = ctx.daemon_hooks.as_ref() {
-        let tx = hooks.spawn_pgid_registrar();
+    let subagent_tx = if let Some(hooks) = ctx.daemon_hooks.as_ref() {
+        let pgid_tx = hooks.spawn_pgid_registrar();
         // With process_group(0) above, the child's PID equals its PGID.
-        let _ = tx.send(child.id());
-    }
+        let _ = pgid_tx.send(child.id());
+        let dispatch_num =
+            hooks.announce_helper_dispatch(1, &format!("helper:{}", skill.skill_id()));
+        Some(hooks.spawn_subagent_writer(dispatch_num))
+    } else {
+        None
+    };
 
-    let stdout_handle = child
-        .stdout
-        .take()
-        .map(|s| spawn_drainer(s, SUBPROCESS_STREAM_CAP_BYTES));
-    let stderr_handle = child
-        .stderr
-        .take()
-        .map(|s| spawn_drainer(s, SUBPROCESS_STREAM_CAP_BYTES));
+    let stdout_handle = child.stdout.take().map(|s| {
+        spawn_streaming_drainer(
+            s,
+            SUBPROCESS_STREAM_CAP_BYTES,
+            subagent_tx.clone(),
+            false,
+        )
+    });
+    let stderr_handle = child.stderr.take().map(|s| {
+        spawn_streaming_drainer(
+            s,
+            SUBPROCESS_STREAM_CAP_BYTES,
+            subagent_tx.clone(),
+            true,
+        )
+    });
 
     let wait_result = child.wait_timeout(timeout);
 
@@ -480,6 +502,60 @@ fn resolve_timeout(options: &HelperInvocation) -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Streams `reader` line-by-line, simultaneously appending each line to a
+/// local byte buffer (returned via the join handle) and forwarding each
+/// line to the daemon's `subagent_tx` channel as a `SubAgentLine` (so
+/// `plan-executor output -f` can render helper progress live, the same
+/// way it renders wave sub-agent output).
+///
+/// `is_stderr` selects the channel marker so the renderer can split
+/// stdout (JSONL stream-json) from stderr (raw text) into sibling files.
+/// `cap` bounds the buffer to defend against runaway helpers; bytes past
+/// the cap are streamed into the channel but not retained for envelope
+/// extraction (envelope must arrive before the cap is hit, which the
+/// 5 MiB default leaves ample room for).
+fn spawn_streaming_drainer<R: std::io::Read + Send + 'static>(
+    reader: R,
+    cap: u64,
+    subagent_tx: Option<tokio::sync::mpsc::UnboundedSender<SubAgentLine>>,
+    is_stderr: bool,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    use std::io::{BufRead, BufReader};
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut buf = Vec::with_capacity(8 * 1024);
+        let mut line = String::new();
+        let mut over_cap = false;
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if !over_cap {
+                        buf.extend_from_slice(line.as_bytes());
+                        if buf.len() as u64 > cap {
+                            over_cap = true;
+                        }
+                    }
+                    if let Some(tx) = subagent_tx.as_ref() {
+                        let trimmed = line.trim_end_matches(['\n', '\r']).to_string();
+                        if !trimmed.is_empty() {
+                            let _ = tx.send(SubAgentLine {
+                                index: 1,
+                                agent_type: "claude",
+                                is_stderr,
+                                line: trimmed,
+                            });
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        buf
+    })
+}
+
 /// Locates the JSON envelope in the child's stdout, validates it against
 /// `skill.output_schema()`, and converts it into a [`HelperOutput`] (or a
 /// [`HelperError::SemanticFailure`] when status is non-success).
@@ -487,8 +563,19 @@ fn parse_and_validate_output(
     skill: HelperSkill,
     stdout: &str,
 ) -> Result<HelperOutput, HelperError> {
+    // The helper child runs with `--output-format stream-json --verbose`, so
+    // its stdout is JSONL (one event per line). The agent's actual textual
+    // response — which is where the envelope lives — sits in the terminal
+    // `{"type":"result","result":"..."}` event. Unwrap that first; if the
+    // stream looks like raw text (no recognizable result event), fall back
+    // to scanning stdout directly so the test fixtures and any non-stream
+    // execution path keep working.
+    let candidate: String = {
+        let lines: Vec<String> = stdout.lines().map(str::to_string).collect();
+        crate::handoff::extract_result_text(&lines).unwrap_or_else(|| stdout.to_string())
+    };
     let envelope_str =
-        extract_json_envelope(stdout).ok_or_else(|| HelperError::ProtocolViolation {
+        extract_json_envelope(&candidate).ok_or_else(|| HelperError::ProtocolViolation {
             category: "no_json_envelope".to_string(),
             detail: format!(
                 "no JSON object found in helper stdout; stdout={}",
