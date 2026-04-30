@@ -90,6 +90,7 @@ fn step_ctx(dir: &Path) -> StepContext {
         step_seq: 1,
         attempt_n: 1,
         workdir: dir.to_path_buf(),
+        daemon_hooks: None,
     }
 }
 

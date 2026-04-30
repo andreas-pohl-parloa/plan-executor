@@ -369,6 +369,25 @@ pub async fn run_wave_execution(
             "dispatching wave",
         );
 
+        // Wire daemon hooks (when present) so the daemon's `output -f`
+        // follower sees per-sub-agent JSONL streamed live, KillJob can
+        // SIGKILL the sub-agent process groups, and replay can render
+        // the persisted JSONL through sjv. Foreground runs leave hooks
+        // unset and pass `None` straight through, preserving the prior
+        // one-shot dispatch behavior.
+        let (subagent_tx, pgid_tx) = match ctx.daemon_hooks.as_ref() {
+            Some(hooks) => {
+                let dispatch_num = hooks
+                    .announce_wave_dispatch(dispatched, &wave.kind)
+                    .await;
+                (
+                    Some(hooks.spawn_subagent_writer(dispatch_num)),
+                    Some(hooks.spawn_pgid_registrar()),
+                )
+            }
+            None => (None, None),
+        };
+
         let (results, _pgids) = handoff::dispatch_all(
             handoffs,
             &config.agents.claude,
@@ -376,10 +395,16 @@ pub async fn run_wave_execution(
             &config.agents.gemini,
             &config.agents.bash,
             None,
-            None,
-            None,
+            pgid_tx,
+            subagent_tx,
         )
         .await;
+
+        if let Some(hooks) = ctx.daemon_hooks.as_ref() {
+            for r in &results {
+                hooks.announce_subagent_done(r.index, r.success, r.can_fail, r.stdout.len());
+            }
+        }
 
         let mut succeeded = 0_usize;
         let mut failed_required: Vec<usize> = Vec::new();

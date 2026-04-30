@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::job::recovery::RecoveryPolicy;
 use crate::job::types::AttemptOutcome;
@@ -37,7 +38,7 @@ pub trait Step: Send + Sync {
 ///
 /// Phase A keeps it minimal; later phases will add accessors for prior step
 /// outputs, persisted state, claude-invoker configuration, etc.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StepContext {
     /// Job-scoped working directory for state and artifacts.
     pub job_dir: PathBuf,
@@ -47,4 +48,11 @@ pub struct StepContext {
     pub attempt_n: u32,
     /// Repository workdir the step operates on.
     pub workdir: PathBuf,
+    /// Optional hooks into the daemon for sub-agent observability and
+    /// cancellation. `None` for foreground runs (the CLI one-shot path);
+    /// `Some` when dispatched by the daemon. The scheduler uses these to
+    /// stream sub-agent output, register sub-agent process groups for
+    /// `KillJob`, and emit "dispatching" / "sub-agent N done" display lines
+    /// the `output -f` follower renders via sjv.
+    pub daemon_hooks: Option<Arc<crate::daemon::SchedulerHooks>>,
 }
