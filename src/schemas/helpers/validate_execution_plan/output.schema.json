@@ -80,7 +80,7 @@
         "properties": {
           "state_updates": {
             "type": "object",
-            "additionalProperties": false,
+            "additionalProperties": true,
             "required": ["validation_report_path", "gaps"],
             "properties": {
               "validation_report_path": {

@@ -80,7 +80,7 @@
         "properties": {
           "state_updates": {
             "type": "object",
-            "additionalProperties": false,
+            "additionalProperties": true,
             "required": ["triaged_findings_path"],
             "properties": {
               "triaged_findings_path": {
