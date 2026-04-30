@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.52.2] - 2026-04-30
+
+### Bug Fixes
+
+- **daemon:** Propagate ctx.workdir across steps; stream helper output live (#43) ([4936345](https://github.com/andreas-pohl-parloa/plan-executor/commit/4936345f35024f39599e5a2f7c0279bdeabd50d4))
 ## [0.52.1] - 2026-04-30
 
 ### Bug Fixes
