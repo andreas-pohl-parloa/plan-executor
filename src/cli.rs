@@ -66,6 +66,20 @@ pub enum Commands {
         /// Path to tasks.json
         tasks_json: PathBuf,
     },
+    /// Validate a JSON document against the sub-agent handoffs schema.
+    ///
+    /// Skills that emit `state_updates.handoffs[]` from a
+    /// `waiting_for_handoffs` envelope can self-check their output by piping
+    /// the array (or a JSON file containing one) through this command before
+    /// printing it. Exits 0 with `VALID:` on stdout when the input matches;
+    /// exits 1 with one or more `ERROR:` lines on stderr when it doesn't.
+    /// Mirrors the schema embedded in `run-reviewer-team-non-interactive`'s
+    /// output schema.
+    ValidateHandoffs {
+        /// Path to a JSON file containing the handoffs array. Use `-` to
+        /// read from stdin.
+        handoffs_json: PathBuf,
+    },
     /// Append fix waves to an existing tasks.json from reviewer findings.
     CompileFixWaves {
         /// Absolute path to the plan markdown file. MUST equal manifest.plan.path; the CLI hard-fails on mismatch.
@@ -432,6 +446,82 @@ fn run_validate(tasks_json: &std::path::Path) {
         eprintln!("ERROR: {}: {}", e.category, e.message);
     }
     std::process::exit(1);
+}
+
+/// Embedded copy of `src/schemas/handoffs.schema.json`. Compiled once per
+/// process via [`compiled_handoffs_validator`]; the path-based `$id` in the
+/// schema is informational and not resolved at runtime.
+const HANDOFFS_SCHEMA: &str = include_str!("schemas/handoffs.schema.json");
+
+/// Validates `handoffs_json` against the bundled handoffs schema and exits
+/// `0` (with `VALID: <path>`) on success or `1` (with one or more
+/// `ERROR:` lines on stderr) on failure. Reads from stdin when `path` is
+/// `-`. Mirrors the `plan-executor validate` exit-code convention so
+/// pipeline scripts can chain both.
+fn run_validate_handoffs(handoffs_json: &Path) {
+    let raw = if handoffs_json == Path::new("-") {
+        use std::io::Read as _;
+        let mut buf = String::new();
+        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+            eprintln!("ERROR: cannot read stdin: {e}");
+            std::process::exit(1);
+        }
+        buf
+    } else {
+        match std::fs::read_to_string(handoffs_json) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("ERROR: cannot read {}: {e}", handoffs_json.display());
+                std::process::exit(1);
+            }
+        }
+    };
+    let label = if handoffs_json == Path::new("-") {
+        "<stdin>".to_string()
+    } else {
+        handoffs_json.display().to_string()
+    };
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("ERROR: {label} is not valid JSON: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let validator = match compiled_handoffs_validator() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("ERROR: embedded handoffs schema failed to compile: {e}");
+            std::process::exit(1);
+        }
+    };
+    let errors: Vec<String> = validator
+        .iter_errors(&value)
+        .map(|err| format!("at {}: {err}", err.instance_path()))
+        .collect();
+    if errors.is_empty() {
+        println!("VALID: {label}");
+        return;
+    }
+    for e in &errors {
+        eprintln!("ERROR: {e}");
+    }
+    std::process::exit(1);
+}
+
+fn compiled_handoffs_validator() -> Result<&'static jsonschema::Validator, String> {
+    use std::sync::OnceLock;
+    static HANDOFFS: OnceLock<jsonschema::Validator> = OnceLock::new();
+    if let Some(v) = HANDOFFS.get() {
+        return Ok(v);
+    }
+    let schema_json: serde_json::Value = serde_json::from_str(HANDOFFS_SCHEMA)
+        .map_err(|e| format!("schema is not valid JSON: {e}"))?;
+    let validator = jsonschema::validator_for(&schema_json)
+        .map_err(|e| format!("schema does not compile: {e}"))?;
+    let _ = HANDOFFS.set(validator);
+    Ok(HANDOFFS.get().expect("just inserted"))
 }
 
 fn run_compile_fix_waves(plan: &Path, execution_root: &Path, findings_json: &Path) {
@@ -903,6 +993,10 @@ pub fn run() {
             run_validate(tasks_json);
             return;
         }
+        Commands::ValidateHandoffs { handoffs_json } => {
+            run_validate_handoffs(handoffs_json);
+            return;
+        }
         Commands::CompileFixWaves {
             plan,
             execution_root,
@@ -978,6 +1072,7 @@ pub fn run() {
         | Commands::Pause { .. }
         | Commands::Unpause { .. }
         | Commands::Validate { .. }
+        | Commands::ValidateHandoffs { .. }
         | Commands::CompileFixWaves { .. }
         | Commands::Run { .. } => unreachable!(),
     };

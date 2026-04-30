@@ -384,6 +384,19 @@ enum HelperLoopKind {
     Validation,
 }
 
+impl HelperLoopKind {
+    /// Short label used as the `kind` argument to the daemon's
+    /// `dispatching N sub-agent(s) (kind: …)` display line. Distinct from
+    /// the `Wave::kind` shape so per-step dispatches don't collide with
+    /// implementation-wave naming.
+    fn display_kind(self) -> &'static str {
+        match self {
+            HelperLoopKind::CodeReview => "review",
+            HelperLoopKind::Validation => "validation",
+        }
+    }
+}
+
 /// Builds the documented `Compose([RetryTransient, RetryProtocol])` policy
 /// shared by the two helper-driven steps.
 fn helper_compose_policy(corrective_key: &str) -> RecoveryPolicy {
@@ -486,6 +499,26 @@ async fn run_helper_fix_loop(
                         FixWaveOutcome::Outcome(outcome) => return outcome,
                     }
                 }
+                HelperStatus::WaitingForHandoffs => {
+                    // Skill emitted prompt files and is asking us to dispatch.
+                    // Run the handoffs through `handoff::dispatch_all`, then
+                    // re-invoke the helper with the captured outputs so it
+                    // enters triage mode and returns a final envelope. Any
+                    // dispatch failure surfaces as the attempt outcome — the
+                    // step's RecoveryPolicy decides whether to retry.
+                    match dispatch_handoffs_and_resume(
+                        ctx,
+                        manifest_path,
+                        kind,
+                        iteration,
+                        &state_updates,
+                    )
+                    .await
+                    {
+                        DispatchOutcome::Continue => continue,
+                        DispatchOutcome::Outcome(outcome) => return outcome,
+                    }
+                }
                 HelperStatus::Blocked | HelperStatus::Abort => {
                     tracing::warn!(
                         kind = ?kind,
@@ -545,6 +578,242 @@ enum FixWaveOutcome {
     /// Definitive outcome to return from the step (failure on any rung of
     /// the fix-wave pipeline).
     Outcome(AttemptOutcome),
+}
+
+/// Result of [`dispatch_handoffs_and_resume`] — same shape as
+/// [`FixWaveOutcome`] but specific to the dispatch→triage round-trip the
+/// `WaitingForHandoffs` status triggers.
+enum DispatchOutcome {
+    /// Handoffs dispatched, outputs collected, sidecar staged. The loop body
+    /// re-invokes the helper which then enters triage mode.
+    Continue,
+    /// Definitive outcome from a malformed handoff list, dispatch failure,
+    /// or sidecar IO error.
+    Outcome(AttemptOutcome),
+}
+
+/// Parses the `state_updates.handoffs` payload, dispatches the listed
+/// sub-agents via `handoff::dispatch_all`, persists the collected outputs as
+/// a sidecar JSON file the next helper invocation reads, and returns control
+/// to the loop body so it re-invokes the helper in triage mode.
+///
+/// Sidecar shape (consumed by the run-reviewer-team-non-interactive skill):
+///
+/// ```json
+/// [
+///   { "index": 1, "exit_code": 0, "output": "...stdout..." },
+///   { "index": 2, "exit_code": 0, "output": "..." }
+/// ]
+/// ```
+///
+/// The sidecar path is `<execution_root>/.tmp-helper-handoff-outputs-attempt-<N>.json`
+/// — the next helper invocation passes its absolute path to the skill via the
+/// `prior_handoff_outputs_path` input field. The skill enters triage mode
+/// when that field is non-empty.
+async fn dispatch_handoffs_and_resume(
+    ctx: &mut StepContext,
+    manifest_path: &Path,
+    kind: HelperLoopKind,
+    iteration: u32,
+    state_updates: &serde_json::Value,
+) -> DispatchOutcome {
+    use crate::handoff::{dispatch_all, AgentType, Handoff};
+    use crate::config::Config;
+
+    // Step 1 — parse handoffs from state_updates. Any shape error becomes a
+    // protocol violation so the step's RecoveryPolicy retries with the
+    // corrective prompt.
+    let raw = match state_updates.get("handoffs") {
+        Some(v) => v,
+        None => {
+            return DispatchOutcome::Outcome(AttemptOutcome::ProtocolViolation {
+                category: "handoffs_missing".to_string(),
+                detail: "state_updates lacks `handoffs` array required by waiting_for_handoffs"
+                    .to_string(),
+            });
+        }
+    };
+    let parsed: Vec<HandoffEntry> = match serde_json::from_value(raw.clone()) {
+        Ok(v) => v,
+        Err(e) => {
+            return DispatchOutcome::Outcome(AttemptOutcome::ProtocolViolation {
+                category: "handoffs_shape".to_string(),
+                detail: format!("decode handoffs: {e}"),
+            });
+        }
+    };
+    if parsed.is_empty() {
+        return DispatchOutcome::Outcome(AttemptOutcome::ProtocolViolation {
+            category: "handoffs_empty".to_string(),
+            detail: "handoffs array is empty".to_string(),
+        });
+    }
+
+    // Step 2 — translate to the dispatcher's `Handoff` type. Reject paths
+    // outside the workdir to mirror the existing fix-wave findings-path
+    // canonicalize check.
+    let canonical_workdir = match std::fs::canonicalize(&ctx.workdir) {
+        Ok(p) => p,
+        Err(e) => {
+            return DispatchOutcome::Outcome(AttemptOutcome::HardInfra {
+                error: format!("workdir canonicalize: {e}"),
+            });
+        }
+    };
+    let mut handoffs: Vec<Handoff> = Vec::with_capacity(parsed.len());
+    for entry in &parsed {
+        let agent_type = match entry.agent_type.as_str() {
+            "claude" => AgentType::Claude,
+            "codex" => AgentType::Codex,
+            "gemini" => AgentType::Gemini,
+            "bash" => AgentType::Bash,
+            other => {
+                return DispatchOutcome::Outcome(AttemptOutcome::ProtocolViolation {
+                    category: "handoffs_agent_type".to_string(),
+                    detail: format!("unknown agent_type `{other}` (index {})", entry.index),
+                });
+            }
+        };
+        let prompt_path = std::path::PathBuf::from(&entry.prompt_file);
+        let canonical_prompt = match std::fs::canonicalize(&prompt_path) {
+            Ok(p) => p,
+            Err(e) => {
+                return DispatchOutcome::Outcome(AttemptOutcome::ProtocolViolation {
+                    category: "handoffs_prompt_missing".to_string(),
+                    detail: format!("prompt file `{}`: {e}", prompt_path.display()),
+                });
+            }
+        };
+        if !canonical_prompt.starts_with(&canonical_workdir) {
+            return DispatchOutcome::Outcome(AttemptOutcome::ProtocolViolation {
+                category: "handoffs_prompt_escape".to_string(),
+                detail: format!(
+                    "prompt file `{}` escapes execution_root `{}`",
+                    canonical_prompt.display(),
+                    canonical_workdir.display()
+                ),
+            });
+        }
+        handoffs.push(Handoff {
+            index: entry.index,
+            agent_type,
+            prompt_file: canonical_prompt,
+            can_fail: entry.can_fail.unwrap_or(false),
+        });
+    }
+
+    // Step 3 — dispatch via the same `dispatch_all` the wave executor uses,
+    // wiring SchedulerHooks (when present) so output-tail and KillJob keep
+    // working for the review wave too.
+    let config = match Config::load(None) {
+        Ok(c) => c,
+        Err(e) => {
+            return DispatchOutcome::Outcome(AttemptOutcome::HardInfra {
+                error: format!("config load failed: {e}"),
+            });
+        }
+    };
+    let (subagent_tx, pgid_tx) = match ctx.daemon_hooks.as_ref() {
+        Some(hooks) => {
+            let dispatch_num = hooks
+                .announce_wave_dispatch(handoffs.len(), kind.display_kind())
+                .await;
+            (
+                Some(hooks.spawn_subagent_writer(dispatch_num)),
+                Some(hooks.spawn_pgid_registrar()),
+            )
+        }
+        None => (None, None),
+    };
+    let (results, _pgids) = dispatch_all(
+        handoffs,
+        &config.agents.claude,
+        &config.agents.codex,
+        &config.agents.gemini,
+        &config.agents.bash,
+        None,
+        pgid_tx,
+        subagent_tx,
+    )
+    .await;
+    if let Some(hooks) = ctx.daemon_hooks.as_ref() {
+        for r in &results {
+            hooks.announce_subagent_done(r.index, r.success, r.can_fail, r.stdout.len(), &r.stderr);
+        }
+    }
+
+    // Step 4 — fail fast if any required reviewer failed. The skill's
+    // contract makes index 1 (Claude) and index 4 (Security) required;
+    // codex/gemini are can_fail. We honor the per-handoff can_fail flag the
+    // skill set rather than hard-coding indices.
+    let any_required_failed = results
+        .iter()
+        .any(|r| !r.success && !r.can_fail);
+    if any_required_failed {
+        return DispatchOutcome::Outcome(AttemptOutcome::SemanticMistake {
+            fix_loop_round: iteration,
+        });
+    }
+
+    // Step 5 — persist the outputs as a sidecar the next helper invocation
+    // can read, then continue the loop body so it re-invokes the helper.
+    let sidecar_path = ctx
+        .workdir
+        .join(format!(".tmp-helper-handoff-outputs-attempt-{iteration}.json"));
+    let sidecar_payload: Vec<HandoffOutputEntry> = results
+        .iter()
+        .map(|r| HandoffOutputEntry {
+            index: r.index,
+            exit_code: i32::from(r.success),
+            output: r.stdout.clone(),
+            stderr: r.stderr.clone(),
+        })
+        .collect();
+    let body = match serde_json::to_string_pretty(&sidecar_payload) {
+        Ok(s) => s,
+        Err(e) => {
+            return DispatchOutcome::Outcome(AttemptOutcome::HardInfra {
+                error: format!("serialize handoff outputs: {e}"),
+            });
+        }
+    };
+    if let Err(e) = std::fs::write(&sidecar_path, body) {
+        return DispatchOutcome::Outcome(AttemptOutcome::HardInfra {
+            error: format!("write handoff outputs sidecar: {e}"),
+        });
+    }
+    // Stash the sidecar path on the context so the next loop iteration's
+    // input builder picks it up.
+    ctx.workdir = ctx.workdir.clone(); // no-op; kept for symmetry. The
+    // sidecar path is recomputed by build_review_team_input on next iteration
+    // using `iteration`; we don't mutate ctx.
+    let _ = manifest_path;
+
+    DispatchOutcome::Continue
+}
+
+/// Single entry parsed out of `state_updates.handoffs`. Mirrors the
+/// `handoffs.schema.json` shape; serde rejects unknown fields so a skill
+/// emitting a typo gets a precise protocol violation rather than a silent
+/// drop.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HandoffEntry {
+    index: usize,
+    agent_type: String,
+    #[serde(default)]
+    can_fail: Option<bool>,
+    prompt_file: String,
+}
+
+/// Single entry written into the handoff-outputs sidecar the helper reads
+/// in triage mode.
+#[derive(Debug, serde::Serialize)]
+struct HandoffOutputEntry {
+    index: usize,
+    exit_code: i32,
+    output: String,
+    stderr: String,
 }
 
 /// Executes the fix-loop sub-pipeline: load manifest → triage (review only) →
@@ -727,6 +996,23 @@ fn build_review_team_input(
 ) -> Result<ReviewTeamInput, HelperError> {
     let manifest = scheduler::load_manifest(manifest_path)
         .map_err(|e| HelperError::HardInfra(format!("load manifest for review-team input: {e}")))?;
+    // Re-entry sidecar from the previous loop iteration's
+    // `dispatch_handoffs_and_resume` call, when present. We probe rather than
+    // tracking attempt-N→iteration mapping in `ctx`: the path is fully
+    // recoverable from `iteration - 1`, and absence simply means the prior
+    // iteration was a fresh dispatch (or this is the first invocation).
+    let prior_outputs = if iteration > 1 {
+        let candidate = ctx
+            .workdir
+            .join(format!(".tmp-helper-handoff-outputs-attempt-{}.json", iteration - 1));
+        if candidate.is_file() {
+            candidate.to_string_lossy().into_owned()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
     Ok(ReviewTeamInput {
         plan_context: manifest.plan.path.clone(),
         execution_outputs: format!(
@@ -739,6 +1025,7 @@ fn build_review_team_input(
         prior_review_context: json!({}),
         execution_root: ctx.workdir.clone(),
         attempt: iteration,
+        prior_handoff_outputs_path: prior_outputs,
     })
 }
 
@@ -967,6 +1254,15 @@ fn helper_error_to_outcome(err: HelperError) -> AttemptOutcome {
             HelperStatus::FixRequired => AttemptOutcome::SemanticMistake { fix_loop_round: 0 },
             HelperStatus::Blocked | HelperStatus::Abort => AttemptOutcome::SpecDrift { gap: notes },
             HelperStatus::Success => AttemptOutcome::Success,
+            // The triage helper is invoked from the fix-wave path which
+            // doesn't have a dispatcher set up; surface as a protocol
+            // violation so the operator sees the misuse rather than a
+            // confusing drop. The helper-loop driver above handles the
+            // dispatch path explicitly.
+            HelperStatus::WaitingForHandoffs => AttemptOutcome::ProtocolViolation {
+                category: "waiting_for_handoffs_unexpected".to_string(),
+                detail: "triage helper requested handoffs from a context that cannot dispatch them".to_string(),
+            },
         },
     }
 }

@@ -154,6 +154,12 @@ pub enum HelperStatus {
     Success,
     /// Helper finished but found work the caller must dispatch as a fix wave.
     FixRequired,
+    /// Helper wrote prompt files for one or more sub-agents and is asking the
+    /// caller to dispatch them. The caller reads `state_updates.handoffs[]`,
+    /// dispatches each prompt file via `handoff::dispatch_all`, then re-invokes
+    /// the helper with the captured outputs in `handoff_outputs[]`. The helper
+    /// re-enters with that input and produces the final `Success` envelope.
+    WaitingForHandoffs,
     /// Helper is blocked on a missing input or external precondition.
     Blocked,
     /// Helper terminated; the caller must escalate or stop.
@@ -498,13 +504,14 @@ fn parse_and_validate_output(
 
     match parsed.status {
         HelperStatus::Success => Ok(parsed),
-        status @ (HelperStatus::FixRequired | HelperStatus::Blocked | HelperStatus::Abort) => {
-            Err(HelperError::SemanticFailure {
-                status,
-                notes: parsed.notes,
-                state_updates: parsed.state_updates,
-            })
-        }
+        status @ (HelperStatus::FixRequired
+        | HelperStatus::Blocked
+        | HelperStatus::Abort
+        | HelperStatus::WaitingForHandoffs) => Err(HelperError::SemanticFailure {
+            status,
+            notes: parsed.notes,
+            state_updates: parsed.state_updates,
+        }),
     }
 }
 
@@ -704,6 +711,13 @@ pub struct ReviewTeamInput {
     pub execution_root: PathBuf,
     /// 1-based attempt number; used in prompt-file names to prevent clobbering.
     pub attempt: u32,
+    /// Absolute path to the JSON sidecar carrying the dispatched sub-agent
+    /// outputs the orchestrator just collected. Empty string on the first
+    /// invocation (dispatch mode); non-empty on the re-invocation that
+    /// follows a `waiting_for_handoffs` envelope, signaling the skill to
+    /// enter triage mode and parse the sidecar at the given path.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prior_handoff_outputs_path: String,
 }
 
 // ----- review-execution-output-non-interactive -----------------------------
