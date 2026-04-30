@@ -252,20 +252,9 @@ pub(crate) fn join_drainer(handle: JoinHandle<Vec<u8>>) -> String {
     }
 }
 
-/// Public entry point. Production callers pass `&ClaudeInvoker`.
-///
-/// # Errors
-///
-/// Returns any [`AppendError`] surfaced during read, sanitize, invoke, or
-/// post-append validation steps.
-pub fn append_fix_waves(
-    manifest_path: &Path,
-    findings: &[Finding],
-) -> Result<PathBuf, AppendError> {
-    append_fix_waves_with_invoker(&ClaudeInvoker, manifest_path, findings)
-}
-
-/// Test-injection variant. Splits invoker out so unit tests can supply a fake.
+/// Public entry point. Production callers pass `&ClaudeInvoker` directly via
+/// `append_fix_waves_with_invoker`; unit tests pass a fake invoker the same
+/// way.
 ///
 /// # Errors
 ///
