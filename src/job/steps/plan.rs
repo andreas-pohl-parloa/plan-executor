@@ -207,12 +207,25 @@ fn compute_worktree_path(
     parent.join(".my").join("worktrees").join(name)
 }
 
-/// Derives the branch name. Honors `plan.target_branch` when present;
-/// otherwise generates `<type>/<plan-stem>` so the branch is
-/// human-readable and matches the project's conventional commit prefix.
+/// Common base-branch names that callers sometimes drop into
+/// `plan.target_branch` because they describe the PR target rather than a
+/// dedicated feature branch. Honoring those would force the worktree onto
+/// the same branch the source repo already has checked out, which fails
+/// every time. Treat them as an unset override.
+const BASE_BRANCH_NAMES: &[&str] = &["main", "master", "develop", "trunk", "HEAD"];
+
+/// Derives the worktree branch name. Honors `plan.target_branch` when set
+/// to a non-empty, non-base-branch string; otherwise generates
+/// `<type>/<plan-stem>` so the branch is human-readable and matches the
+/// project's conventional commit prefix.
+///
+/// `target_branch` semantically describes the PR target (where the
+/// eventual PR will merge into), so a value like `main` must NOT be used
+/// as the worktree branch — the source repo already has it checked out
+/// and `git worktree add` would fail with a branch-collision error.
 fn derive_branch_name(plan_meta: &PlanMeta, plan_stem: &str) -> String {
     if let Some(b) = plan_meta.target_branch.as_deref() {
-        if !b.is_empty() {
+        if !b.is_empty() && !BASE_BRANCH_NAMES.iter().any(|name| name.eq_ignore_ascii_case(b)) {
             return b.to_string();
         }
     }
@@ -2468,5 +2481,21 @@ mod preflight_tests {
         // branch name.
         let meta = meta_with(None, Some(""), "feature");
         assert_eq!(derive_branch_name(&meta, "stem"), "feat/stem");
+    }
+
+    #[test]
+    fn base_branch_target_falls_back_to_derived() {
+        // `target_branch: main` describes the PR target, not the worktree
+        // branch. Forwarding it as the worktree branch collides with the
+        // source repo's checkout and breaks `git worktree add`. Same for
+        // master / develop / trunk / HEAD, case-insensitive.
+        for base in ["main", "master", "develop", "trunk", "HEAD", "Main", "MASTER"] {
+            let meta = meta_with(None, Some(base), "bug");
+            assert_eq!(
+                derive_branch_name(&meta, "month-fix"),
+                "fix/month-fix",
+                "base-branch `{base}` should not be used as worktree branch",
+            );
+        }
     }
 }
