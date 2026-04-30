@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -47,6 +48,25 @@ pub enum Backoff {
 // Manual Eq because f32 does not implement Eq. Acceptable: we never compare
 // Backoff for equality in production code; tests use specific factor values.
 impl Eq for Backoff {}
+
+impl Backoff {
+    /// Resolves the wait duration before the `attempt`-th retry (1-based).
+    /// `Fixed` yields the same delay every attempt; `Exponential` doubles
+    /// (or grows by `factor`) each attempt, saturated at `max_ms`.
+    pub fn delay(&self, attempt: u32) -> Duration {
+        match self {
+            Backoff::Fixed { ms } => Duration::from_millis(*ms),
+            Backoff::Exponential {
+                initial_ms,
+                max_ms,
+                factor,
+            } => {
+                let raw = (*initial_ms as f64) * (f64::from(*factor)).powi(attempt as i32 - 1);
+                Duration::from_millis((raw as u64).min(*max_ms))
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
