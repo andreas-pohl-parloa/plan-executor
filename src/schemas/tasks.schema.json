@@ -65,10 +65,38 @@
             "merge": { "type": "boolean" },
             "merge_admin": { "type": "boolean" },
             "skip_pr": { "type": "boolean" },
-            "skip_code_review": { "type": "boolean" },
+            "skip_code_review": {
+              "description": "Legacy flag retained for backwards compatibility with handover meta.json. New manifests should omit `code_review` from `pipeline.steps` instead — that's the authoritative way to disable a step today.",
+              "type": "boolean"
+            },
             "no_worktree": { "type": "boolean" },
             "draft_pr": { "type": "boolean" }
           }
+        },
+        "pipeline": {
+          "description": "Optional override for the daemon's plan pipeline. When omitted or null, the registry uses the default 7-step sequence (preflight → wave_execution → integration_testing → validation → pr_creation → pr_finalize → summary). Listing `code_review` between integration_testing and validation re-enables review once the dispatch→triage protocol is wired in. Order is preserved verbatim; unknown step names fail manifest validation in the Rust scheduler.",
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "steps": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "preflight",
+                  "wave_execution",
+                  "integration_testing",
+                  "code_review",
+                  "validation",
+                  "pr_creation",
+                  "pr_finalize",
+                  "summary"
+                ]
+              }
+            }
+          },
+          "required": ["steps"]
         }
       }
     },

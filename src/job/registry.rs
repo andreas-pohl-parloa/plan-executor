@@ -20,7 +20,42 @@ fn merge_mode_to_runtime(wire: WireMergeMode) -> RuntimeMergeMode {
     }
 }
 
+/// Default plan pipeline emitted by `compile-plan` when the manifest does
+/// not specify `plan.pipeline.steps`. `code_review` is intentionally
+/// omitted: the helper-driven dispatch→triage round-trip needed by
+/// `run-reviewer-team-non-interactive` is not yet wired into the Rust
+/// orchestrator (PR B). Manifests that want review can list `code_review`
+/// between `integration_testing` and `validation` once that protocol lands.
+pub const DEFAULT_PLAN_STEPS: &[&str] = &[
+    "preflight",
+    "wave_execution",
+    "integration_testing",
+    "validation",
+    "pr_creation",
+    "pr_finalize",
+    "summary",
+];
+
+/// Every plan step the registry can construct. `steps_for_plan_filtered`
+/// validates manifest-supplied step lists against this set so an unknown
+/// name fails fast at job submission instead of silently dropping.
+pub const KNOWN_PLAN_STEPS: &[&str] = &[
+    "preflight",
+    "wave_execution",
+    "integration_testing",
+    "code_review",
+    "validation",
+    "pr_creation",
+    "pr_finalize",
+    "summary",
+];
+
 /// Map a `JobKind` to its ordered list of steps.
+///
+/// For `JobKind::Plan` the step list defaults to [`DEFAULT_PLAN_STEPS`].
+/// Callers that have a parsed manifest in hand should prefer
+/// [`steps_for_plan_filtered`] so a manifest-supplied
+/// `plan.pipeline.steps` override is honored.
 ///
 /// For `JobKind::PrFinalize` the registry emits a fixed 5-step sequence:
 /// `pr_lookup`, `mark_ready`, `monitor`, `merge`, `report`. The merge step
@@ -38,26 +73,7 @@ fn merge_mode_to_runtime(wire: WireMergeMode) -> RuntimeMergeMode {
 #[must_use]
 pub fn steps_for(kind: &JobKind) -> Vec<Box<dyn Step>> {
     match kind {
-        JobKind::Plan { manifest_path } => vec![
-            Box::new(steps::plan::PreflightStep),
-            Box::new(steps::plan::WaveExecutionStep {
-                manifest_path: manifest_path.clone(),
-            }),
-            Box::new(steps::plan::IntegrationTestingStep),
-            Box::new(steps::plan::CodeReviewStep {
-                manifest_path: manifest_path.clone(),
-            }),
-            Box::new(steps::plan::ValidationStep {
-                manifest_path: manifest_path.clone(),
-            }),
-            Box::new(steps::plan::PrCreationStep {
-                manifest_path: manifest_path.clone(),
-            }),
-            Box::new(steps::plan::PrFinalizeStep),
-            Box::new(steps::plan::SummaryStep {
-                manifest_path: manifest_path.clone(),
-            }),
-        ],
+        JobKind::Plan { manifest_path } => steps_for_plan_filtered(manifest_path, None),
         JobKind::PrFinalize {
             owner,
             repo,
@@ -101,6 +117,54 @@ pub fn steps_for(kind: &JobKind) -> Vec<Box<dyn Step>> {
     }
 }
 
+/// Plan-pipeline step builder honoring an optional manifest-supplied step
+/// list. When `override_steps` is `None`, builds [`DEFAULT_PLAN_STEPS`].
+/// When `Some`, builds the named steps in the order given (any name not in
+/// [`KNOWN_PLAN_STEPS`] panics — the manifest schema rejects those names
+/// before the daemon would call this).
+#[must_use]
+pub fn steps_for_plan_filtered(
+    manifest_path: &std::path::Path,
+    override_steps: Option<&[String]>,
+) -> Vec<Box<dyn Step>> {
+    let owned_default: Vec<String> = DEFAULT_PLAN_STEPS.iter().map(|s| (*s).to_string()).collect();
+    let names: &[String] = match override_steps {
+        Some(s) if !s.is_empty() => s,
+        _ => owned_default.as_slice(),
+    };
+    names
+        .iter()
+        .map(|name| build_plan_step(name.as_str(), manifest_path))
+        .collect()
+}
+
+/// Constructs a single plan step by name. Panics on unknown names; callers
+/// must validate against [`KNOWN_PLAN_STEPS`] (the manifest schema does so
+/// at validate time).
+fn build_plan_step(name: &str, manifest_path: &std::path::Path) -> Box<dyn Step> {
+    match name {
+        "preflight" => Box::new(steps::plan::PreflightStep),
+        "wave_execution" => Box::new(steps::plan::WaveExecutionStep {
+            manifest_path: manifest_path.to_path_buf(),
+        }),
+        "integration_testing" => Box::new(steps::plan::IntegrationTestingStep),
+        "code_review" => Box::new(steps::plan::CodeReviewStep {
+            manifest_path: manifest_path.to_path_buf(),
+        }),
+        "validation" => Box::new(steps::plan::ValidationStep {
+            manifest_path: manifest_path.to_path_buf(),
+        }),
+        "pr_creation" => Box::new(steps::plan::PrCreationStep {
+            manifest_path: manifest_path.to_path_buf(),
+        }),
+        "pr_finalize" => Box::new(steps::plan::PrFinalizeStep),
+        "summary" => Box::new(steps::plan::SummaryStep {
+            manifest_path: manifest_path.to_path_buf(),
+        }),
+        other => panic!("unknown plan step `{other}` (manifest schema should have rejected this)"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,12 +172,11 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn steps_for_plan_returns_eight_steps_in_expected_order() {
+    fn default_plan_pipeline_omits_code_review() {
         let kind = JobKind::Plan {
             manifest_path: PathBuf::from("/tmp/x"),
         };
         let steps = steps_for(&kind);
-        assert_eq!(steps.len(), 8);
         let names: Vec<_> = steps.iter().map(|s| s.name()).collect();
         assert_eq!(
             names,
@@ -121,7 +184,6 @@ mod tests {
                 "preflight",
                 "wave_execution",
                 "integration_testing",
-                "code_review",
                 "validation",
                 "pr_creation",
                 "pr_finalize",
@@ -131,11 +193,68 @@ mod tests {
     }
 
     #[test]
+    fn steps_for_plan_filtered_respects_override() {
+        let path = PathBuf::from("/tmp/x");
+        let override_steps = vec![
+            "preflight".to_string(),
+            "wave_execution".to_string(),
+            "summary".to_string(),
+        ];
+        let steps = steps_for_plan_filtered(&path, Some(&override_steps));
+        let names: Vec<_> = steps.iter().map(|s| s.name()).collect();
+        assert_eq!(names, vec!["preflight", "wave_execution", "summary"]);
+    }
+
+    #[test]
+    fn steps_for_plan_filtered_includes_code_review_when_listed() {
+        let path = PathBuf::from("/tmp/x");
+        let override_steps = vec![
+            "wave_execution".to_string(),
+            "code_review".to_string(),
+            "validation".to_string(),
+        ];
+        let steps = steps_for_plan_filtered(&path, Some(&override_steps));
+        let names: Vec<_> = steps.iter().map(|s| s.name()).collect();
+        assert_eq!(names, vec!["wave_execution", "code_review", "validation"]);
+    }
+
+    #[test]
+    fn steps_for_plan_filtered_falls_back_to_default_when_override_is_empty() {
+        let path = PathBuf::from("/tmp/x");
+        let empty: Vec<String> = Vec::new();
+        let steps = steps_for_plan_filtered(&path, Some(&empty));
+        assert_eq!(steps.len(), DEFAULT_PLAN_STEPS.len());
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown plan step")]
+    fn steps_for_plan_filtered_panics_on_unknown_step() {
+        let path = PathBuf::from("/tmp/x");
+        let bad = vec!["does-not-exist".to_string()];
+        let _ = steps_for_plan_filtered(&path, Some(&bad));
+    }
+
+    #[test]
+    fn known_plan_steps_covers_default_and_code_review() {
+        for step in DEFAULT_PLAN_STEPS {
+            assert!(
+                KNOWN_PLAN_STEPS.contains(step),
+                "default step `{step}` missing from KNOWN_PLAN_STEPS",
+            );
+        }
+        assert!(
+            KNOWN_PLAN_STEPS.contains(&"code_review"),
+            "code_review must remain a known step name even when not default",
+        );
+    }
+
+    #[test]
     fn steps_for_plan_idempotency_flags_match_expectations() {
-        let kind = JobKind::Plan {
-            manifest_path: PathBuf::from("/tmp/x"),
-        };
-        let steps = steps_for(&kind);
+        let override_steps: Vec<String> = KNOWN_PLAN_STEPS.iter().map(|s| (*s).to_string()).collect();
+        let steps = steps_for_plan_filtered(
+            std::path::Path::new("/tmp/x"),
+            Some(&override_steps),
+        );
         let flags: Vec<(&'static str, bool)> =
             steps.iter().map(|s| (s.name(), s.idempotent())).collect();
         assert_eq!(
@@ -143,16 +262,9 @@ mod tests {
             vec![
                 ("preflight", true),
                 ("wave_execution", false),
-                // D3.3: integration_testing became idempotent — re-running
-                // `cargo test --workspace` is safe.
                 ("integration_testing", true),
-                // D3.2: code_review and validation became idempotent — the
-                // helper-driven steps re-issue the same helper invocations
-                // on retry without external compensation.
                 ("code_review", true),
                 ("validation", true),
-                // D3.3: pr_creation became idempotent — `gh pr view` short
-                // circuits to the existing PR URL when one already exists.
                 ("pr_creation", true),
                 ("pr_finalize", true),
                 ("summary", true),
@@ -163,10 +275,13 @@ mod tests {
     #[test]
     fn steps_for_plan_recovery_policies_match_documentation() {
         use crate::job::recovery::{Backoff, CorrectivePromptKey};
-        let kind = JobKind::Plan {
-            manifest_path: PathBuf::from("/tmp/x"),
-        };
-        let steps = steps_for(&kind);
+        // Exercise via the override path so this test can re-include
+        // `code_review` regardless of whether the default omits it.
+        let override_steps: Vec<String> = KNOWN_PLAN_STEPS.iter().map(|s| (*s).to_string()).collect();
+        let steps = steps_for_plan_filtered(
+            std::path::Path::new("/tmp/x"),
+            Some(&override_steps),
+        );
         let policies: Vec<RecoveryPolicy> = steps.iter().map(|s| s.recovery_policy()).collect();
         let helper_compose = |corrective: &str| RecoveryPolicy::Compose {
             policies: vec![
@@ -187,18 +302,12 @@ mod tests {
         let expected = vec![
             RecoveryPolicy::None, // preflight
             RecoveryPolicy::None, // wave_execution
-            // D3.3: integration_testing surfaces TransientInfra on
-            // retry-able test failures; one retry gives flaky / network-
-            // bound suites a single chance to recover.
             RecoveryPolicy::RetryTransient {
                 max: 1,
                 backoff: Backoff::Fixed { ms: 0 },
             },
-            helper_compose("code_review_protocol"), // code_review (D3.2)
-            helper_compose("validation_protocol"),  // validation (D3.2)
-            // D3.3: pr_creation runs `gh pr create`; exponential backoff
-            // matches the cadence already used elsewhere for `gh` API
-            // hiccups (see pr_finalize::default_backoff).
+            helper_compose("code_review_protocol"),
+            helper_compose("validation_protocol"),
             RecoveryPolicy::RetryTransient {
                 max: 3,
                 backoff: Backoff::Exponential {
@@ -207,9 +316,8 @@ mod tests {
                     factor: 2.0,
                 },
             },
-            RecoveryPolicy::None, // pr_finalize (placeholder; the dedicated
-            // JobKind::PrFinalize pipeline owns finalize)
-            RecoveryPolicy::None, // summary (D3.3 — best-effort)
+            RecoveryPolicy::None,
+            RecoveryPolicy::None,
         ];
         assert_eq!(policies, expected);
     }
