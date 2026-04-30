@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.51.1] - 2026-04-30
+
+### Bug Fixes
+
+- **preflight:** Treat base-branch names in target_branch as PR target only (#40) ([c3993db](https://github.com/andreas-pohl-parloa/plan-executor/commit/c3993dbbc67a1aa08a80a7bae2dd73818a164861))
 ## [0.51.0] - 2026-04-30
 
 ### Features
