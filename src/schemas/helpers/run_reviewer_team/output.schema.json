@@ -2,55 +2,122 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://parloa.dev/plan-executor/skills/run-reviewer-team-non-interactive/output.schema.json",
   "title": "run-reviewer-team-non-interactive output",
-  "description": "Structured output envelope returned by run-reviewer-team-non-interactive to the Rust caller.",
+  "description": "Structured output envelope returned by run-reviewer-team-non-interactive to the Rust caller. Two shapes: dispatch (status=waiting_for_handoffs, state_updates carries the handoff list) and triage (status in success/fix_required/blocked/abort, state_updates carries reviewer_runs + findings_path). The orchestrator dispatches the handoffs from dispatch mode and re-invokes the skill in triage mode with the captured outputs.",
   "type": "object",
   "additionalProperties": false,
   "required": ["status", "next_step", "notes", "state_updates"],
   "properties": {
     "status": {
       "type": "string",
-      "enum": ["success", "fix_required", "blocked", "abort"]
+      "enum": ["success", "fix_required", "blocked", "abort", "waiting_for_handoffs"]
     },
     "next_step": {
-      "type": "string",
-      "enum": ["proceed", "dispatch_fix_wave", "escalate", "terminate"]
+      "type": "string"
     },
     "notes": {
       "type": "string"
     },
     "state_updates": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["findings_path", "reviewer_runs"],
-      "properties": {
-        "findings_path": {
-          "type": "string",
-          "minLength": 1
-        },
-        "reviewer_runs": {
-          "type": "array",
-          "minItems": 4,
-          "maxItems": 4,
-          "items": {
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "status": { "const": "waiting_for_handoffs" } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "state_updates": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["reviewer", "exit_code", "findings_count"],
+            "required": ["handoffs"],
             "properties": {
-              "reviewer": {
+              "handoffs": {
+                "description": "Sub-agents the orchestrator must dispatch via handoff::dispatch_all. Mirrors the standalone handoffs.schema.json (use `plan-executor validate-handoffs` to self-check).",
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 16,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["index", "agent_type", "prompt_file"],
+                  "properties": {
+                    "index": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 16
+                    },
+                    "agent_type": {
+                      "type": "string",
+                      "enum": ["claude", "codex", "gemini", "bash"]
+                    },
+                    "can_fail": {
+                      "type": "boolean",
+                      "default": false
+                    },
+                    "prompt_file": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  }
+                }
+              },
+              "reviewer_set": {
+                "description": "Frozen four-reviewer descriptor the caller persists across attempts. Not consumed by the dispatcher today; kept for replay / audit.",
+                "type": "array"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": { "enum": ["success", "fix_required", "blocked", "abort"] }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "state_updates": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["findings_path", "reviewer_runs"],
+            "properties": {
+              "findings_path": {
                 "type": "string",
-                "enum": ["claude", "codex", "gemini", "security"]
+                "minLength": 1
               },
-              "exit_code": {
-                "type": "integer"
-              },
-              "findings_count": {
-                "type": "integer",
-                "minimum": 0
+              "reviewer_runs": {
+                "type": "array",
+                "minItems": 4,
+                "maxItems": 4,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["reviewer", "exit_code", "findings_count"],
+                  "properties": {
+                    "reviewer": {
+                      "type": "string",
+                      "enum": ["claude", "codex", "gemini", "security"]
+                    },
+                    "exit_code": {
+                      "type": "integer"
+                    },
+                    "findings_count": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  }
+                }
               }
             }
           }
         }
       }
     }
-  }
+  ]
 }

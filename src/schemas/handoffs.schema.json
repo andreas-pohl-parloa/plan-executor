@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parloa.dev/plan-executor/handoffs.schema.json",
+  "title": "Sub-agent handoff list",
+  "description": "Ordered list of sub-agents the helper is asking the orchestrator to dispatch via `handoff::dispatch_all`. Each entry maps 1:1 to a `Handoff` constructed by the Rust dispatcher — index, agent type, can-fail flag, and the absolute prompt-file path. Validates both the embedded `state_updates.handoffs` field on a `waiting_for_handoffs` envelope and the standalone payload accepted by `plan-executor validate-handoffs`.",
+  "type": "array",
+  "minItems": 1,
+  "maxItems": 16,
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["index", "agent_type", "prompt_file"],
+    "properties": {
+      "index": {
+        "description": "1-based position used for `# output sub-agent <N>:` blocks on triage re-entry. Indices must be unique within the array.",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 16
+      },
+      "agent_type": {
+        "description": "Subprocess to dispatch. Maps to the corresponding `agents.<type>` entry in `~/.plan-executor/config.json`.",
+        "type": "string",
+        "enum": ["claude", "codex", "gemini", "bash"]
+      },
+      "can_fail": {
+        "description": "When true, a non-zero exit from this sub-agent does not abort the wave; the orchestrator emits a `skipped` marker and continues.",
+        "type": "boolean",
+        "default": false
+      },
+      "prompt_file": {
+        "description": "Absolute path to the prompt file the sub-agent reads as its sole task input. The path must exist and live under the helper's `execution_root` — the dispatcher rejects symlink traversals.",
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}

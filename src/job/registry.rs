@@ -21,15 +21,14 @@ fn merge_mode_to_runtime(wire: WireMergeMode) -> RuntimeMergeMode {
 }
 
 /// Default plan pipeline emitted by `compile-plan` when the manifest does
-/// not specify `plan.pipeline.steps`. `code_review` is intentionally
-/// omitted: the helper-driven dispatch→triage round-trip needed by
-/// `run-reviewer-team-non-interactive` is not yet wired into the Rust
-/// orchestrator (PR B). Manifests that want review can list `code_review`
-/// between `integration_testing` and `validation` once that protocol lands.
+/// not specify `plan.pipeline.steps`. The full 8-step sequence is the
+/// canonical default — review and validation are essential, not optional.
+/// One-shot manifests can drop steps explicitly via `plan.pipeline.steps`.
 pub const DEFAULT_PLAN_STEPS: &[&str] = &[
     "preflight",
     "wave_execution",
     "integration_testing",
+    "code_review",
     "validation",
     "pr_creation",
     "pr_finalize",
@@ -172,7 +171,7 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn default_plan_pipeline_omits_code_review() {
+    fn default_plan_pipeline_includes_full_eight_steps() {
         let kind = JobKind::Plan {
             manifest_path: PathBuf::from("/tmp/x"),
         };
@@ -184,6 +183,7 @@ mod tests {
                 "preflight",
                 "wave_execution",
                 "integration_testing",
+                "code_review",
                 "validation",
                 "pr_creation",
                 "pr_finalize",
