@@ -1350,6 +1350,7 @@ pub(crate) async fn run_rust_scheduler_pipeline(
             step_seq: seq,
             attempt_n: 1,
             workdir: workdir.clone(),
+            daemon_hooks: None,
         };
         let step_name = step.name();
         // Yellow `[plan-executor]` prefix matches format_message_line;

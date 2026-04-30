@@ -274,6 +274,113 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
     }
 }
 
+/// Hooks the Rust-side scheduler can use to emit display lines, register
+/// sub-agent process groups for `KillJob`, and stream sub-agent JSONL output
+/// to disk + TUI broadcast. Plumbed through `StepContext::daemon_hooks` so
+/// the foreground (`cli::run_rust_scheduler_pipeline`) one-shot path keeps
+/// running with `daemon_hooks: None` while the daemon path gets the full
+/// observability surface.
+pub struct SchedulerHooks {
+    /// Job id used as the dispatch_counter map key, file-naming prefix, and
+    /// `JobDisplayLine` recipient.
+    pub job_id: String,
+    /// Daemon state — needed for `running_jobs` membership checks inside the
+    /// writer (it stops on KillJob), for `sub_agent_pgids` registration,
+    /// and for `sub_agent_dispatch_counter` increments.
+    pub state: Arc<Mutex<DaemonState>>,
+    /// Broadcast bus for `JobDisplayLine` / `SubAgentLine` events the
+    /// `output -f` follower renders live via sjv.
+    pub event_tx: broadcast::Sender<DaemonEvent>,
+}
+
+impl SchedulerHooks {
+    /// Bumps the per-job dispatch counter, persists + broadcasts a
+    /// `dispatching N sub-agent(s)` display line, and returns the new
+    /// counter value. The `output -f` CLI uses the persisted line to
+    /// advance its own `dispatch_counter` so it can resolve the matching
+    /// per-sub-agent JSONL file under `<job>/sub-agents/dispatch-<N>-...`.
+    pub async fn announce_wave_dispatch(&self, count: usize, kind: &str) -> u32 {
+        let dispatch_num = {
+            let mut st = self.state.lock().await;
+            let entry = st
+                .sub_agent_dispatch_counter
+                .entry(self.job_id.clone())
+                .or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        let line = format!(
+            "⏺ [plan-executor] dispatching {count} sub-agent(s) (kind: {kind})"
+        );
+        self.publish_display_line(line);
+        dispatch_num
+    }
+
+    /// Persists + broadcasts a `sub-agent <N> done|failed|skipped` display
+    /// line. The CLI follower uses this to know when a sub-agent's JSONL
+    /// file is complete so it can render once at the marker (replay mode)
+    /// or skip the batch render when it already streamed live.
+    pub fn announce_subagent_done(
+        &self,
+        index: usize,
+        success: bool,
+        can_fail: bool,
+        stdout_chars: usize,
+    ) {
+        let line = if success {
+            format!(
+                "⏺ [plan-executor] sub-agent {index} done ({stdout_chars} chars)"
+            )
+        } else if can_fail {
+            format!(
+                "⏺ [plan-executor] sub-agent {index} skipped (can-fail): non-zero exit"
+            )
+        } else {
+            format!("⏺ [plan-executor] sub-agent {index} failed: non-zero exit")
+        };
+        self.publish_display_line(line);
+    }
+
+    /// Spawns a fresh `spawn_subagent_writer` for one wave's `dispatch_all`
+    /// and returns the sender half. Dropping the sender (i.e. once
+    /// `dispatch_all` returns) closes the channel and the writer task
+    /// exits.
+    pub fn spawn_subagent_writer(
+        &self,
+        dispatch_num: u32,
+    ) -> tokio::sync::mpsc::UnboundedSender<crate::handoff::SubAgentLine> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        spawn_subagent_writer(
+            Arc::clone(&self.state),
+            self.job_id.clone(),
+            dispatch_num,
+            self.event_tx.clone(),
+            rx,
+        );
+        tx
+    }
+
+    /// Spawns a fresh `spawn_pgid_registrar` for one wave's `dispatch_all`
+    /// and returns the sender half. Each sub-agent's pgid arrives as soon
+    /// as it spawns so a `KillJob` can SIGKILL the process group even if
+    /// the dispatcher is still mid-await on streaming output.
+    pub fn spawn_pgid_registrar(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedSender<u32> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        spawn_pgid_registrar(Arc::clone(&self.state), self.job_id.clone(), rx);
+        tx
+    }
+
+    fn publish_display_line(&self, line: String) {
+        append_display(&self.job_id, &line);
+        let _ = self.event_tx.send(DaemonEvent::JobDisplayLine {
+            job_id: self.job_id.clone(),
+            line,
+        });
+    }
+}
+
 /// Consumes streamed sub-agent lines from `handoff::dispatch_all` and
 /// does two things per line:
 ///  1. Stamps `job_last_activity` — real per-line liveness for the
@@ -883,6 +990,13 @@ async fn run_rust_scheduler_steps(
     let mut metrics = JobMetrics::new(job_id_owned.clone());
     let mut pipeline_ok = true;
 
+    let event_tx = { state.lock().await.event_tx.clone() };
+    let hooks = Arc::new(SchedulerHooks {
+        job_id: job_id.to_string(),
+        state: Arc::clone(state),
+        event_tx,
+    });
+
     for (idx, step) in steps.iter().enumerate() {
         let seq = u32::try_from(idx + 1).unwrap_or(u32::MAX);
 
@@ -902,6 +1016,7 @@ async fn run_rust_scheduler_steps(
             step_seq: seq,
             attempt_n: 1,
             workdir: workdir.clone(),
+            daemon_hooks: Some(Arc::clone(&hooks)),
         };
 
         let line = format!("⏺ [plan-executor] step {} ({}) starting", seq, step.name());

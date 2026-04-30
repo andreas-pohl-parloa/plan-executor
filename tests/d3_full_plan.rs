@@ -271,6 +271,7 @@ fn ctx_for(workdir: &Path, step_seq: u32, attempt_n: u32) -> StepContext {
         step_seq,
         attempt_n,
         workdir: workdir.to_path_buf(),
+        daemon_hooks: None,
     }
 }
 
