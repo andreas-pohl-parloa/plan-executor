@@ -381,8 +381,12 @@ pub(crate) fn resolve_manifest_path(arg: &str) -> Result<PathBuf> {
     anyhow::bail!("Manifest not found at {}; expected tasks.json", arg)
 }
 
-/// Read `plan.path` and `plan.status` from a compiled manifest.
-pub(crate) fn read_manifest_plan_block(manifest_path: &Path) -> Result<(PathBuf, String)> {
+/// Read `plan.path`, `plan.status`, and `plan.execution_mode` from a compiled
+/// manifest. `execution_mode` defaults to `"local"` when absent so manifests
+/// compiled before the field was added still load.
+pub(crate) fn read_manifest_plan_block(
+    manifest_path: &Path,
+) -> Result<(PathBuf, String, String)> {
     let raw = std::fs::read_to_string(manifest_path)
         .with_context(|| format!("read manifest {}", manifest_path.display()))?;
     let v: serde_json::Value = serde_json::from_str(&raw)
@@ -397,7 +401,12 @@ pub(crate) fn read_manifest_plan_block(manifest_path: &Path) -> Result<(PathBuf,
         .and_then(|x| x.as_str())
         .ok_or_else(|| anyhow::anyhow!("manifest {} missing plan.status", manifest_path.display()))?
         .to_string();
-    Ok((PathBuf::from(plan_path), status))
+    let execution_mode = v
+        .pointer("/plan/execution_mode")
+        .and_then(|x| x.as_str())
+        .unwrap_or("local")
+        .to_string();
+    Ok((PathBuf::from(plan_path), status, execution_mode))
 }
 
 fn run_validate(tasks_json: &std::path::Path) {
@@ -1155,7 +1164,7 @@ fn parse_subagent_done_index(line: &str) -> Option<usize> {
 
 async fn execute_plan(manifest_arg: String, config: crate::config::Config) -> Result<()> {
     let manifest_path = resolve_manifest_path(&manifest_arg)?;
-    let (plan_path, status) = read_manifest_plan_block(&manifest_path)?;
+    let (plan_path, status, _execution_mode) = read_manifest_plan_block(&manifest_path)?;
 
     if status != "READY" {
         anyhow::bail!("Manifest plan.status is {}, expected READY", status);
@@ -1253,7 +1262,7 @@ async fn execute_foreground(manifest_arg: String, config: crate::config::Config)
     use crate::job::types::{Job, JobId, JobKind, JobState, StepInstance, StepStatus};
 
     let manifest_path = resolve_manifest_path(&manifest_arg)?;
-    let (resolved_path, status) = read_manifest_plan_block(&manifest_path)?;
+    let (resolved_path, status, execution_mode) = read_manifest_plan_block(&manifest_path)?;
 
     if status != "READY" {
         anyhow::bail!("Manifest plan.status is {}, expected READY", status);
@@ -1265,9 +1274,7 @@ async fn execute_foreground(manifest_arg: String, config: crate::config::Config)
         );
     }
 
-    if crate::plan::parse_execution_mode(&resolved_path) == crate::plan::ExecutionMode::Remote
-        && std::env::var("PLAN_EXECUTOR_LOCAL").as_deref() != Ok("1")
-    {
+    if execution_mode == "remote" && std::env::var("PLAN_EXECUTOR_LOCAL").as_deref() != Ok("1") {
         return trigger_remote(resolved_path, manifest_path, config).await;
     }
 
@@ -1399,7 +1406,14 @@ async fn execute_via_daemon(
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
-    let is_remote = crate::plan::parse_execution_mode(&plan) == crate::plan::ExecutionMode::Remote;
+    // Re-read execution_mode from the manifest. This function is only
+    // reachable from execute_plan, which already loaded the block once,
+    // but execute_via_daemon is also invoked from a TUI path that doesn't
+    // pass the parsed value through. Reading it here keeps the function
+    // self-contained.
+    let (_, _, execution_mode) = read_manifest_plan_block(&manifest_path)
+        .context("re-reading manifest to determine execution_mode")?;
+    let is_remote = execution_mode == "remote";
 
     let stream = UnixStream::connect(crate::ipc::socket_path())
         .await
@@ -2659,5 +2673,48 @@ mod tests {
     #[test]
     fn parse_subagent_done_index_ignores_unrelated() {
         assert_eq!(parse_subagent_done_index("some other line"), None);
+    }
+
+    fn write_manifest(json: serde_json::Value) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "{}", json).unwrap();
+        f
+    }
+
+    #[test]
+    fn read_manifest_plan_block_returns_explicit_remote_execution_mode() {
+        let manifest = write_manifest(serde_json::json!({
+            "version": 1,
+            "plan": {
+                "path": "/tmp/plan.md",
+                "status": "READY",
+                "execution_mode": "remote"
+            },
+            "waves": [],
+            "tasks": {}
+        }));
+        let (path, status, mode) = read_manifest_plan_block(manifest.path()).unwrap();
+        assert_eq!(path, std::path::PathBuf::from("/tmp/plan.md"));
+        assert_eq!(status, "READY");
+        assert_eq!(mode, "remote");
+    }
+
+    #[test]
+    fn read_manifest_plan_block_defaults_execution_mode_to_local_when_missing() {
+        // Pre-execution_mode manifests must still load. The reader treats a
+        // missing field as "local" so older compiled tasks.json files don't
+        // need recompilation just to be readable.
+        let manifest = write_manifest(serde_json::json!({
+            "version": 1,
+            "plan": {
+                "path": "/tmp/plan.md",
+                "status": "READY"
+            },
+            "waves": [],
+            "tasks": {}
+        }));
+        let (_, _, mode) = read_manifest_plan_block(manifest.path()).unwrap();
+        assert_eq!(mode, "local");
     }
 }

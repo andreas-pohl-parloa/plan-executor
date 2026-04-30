@@ -630,7 +630,7 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, manifest_path: &
             return;
         }
     };
-    let (plan, status) = match crate::cli::read_manifest_plan_block(&manifest) {
+    let (plan, status, execution_mode) = match crate::cli::read_manifest_plan_block(&manifest) {
         Ok(t) => t,
         Err(e) => {
             tracing::error!("trigger_execution: {e}");
@@ -649,7 +649,7 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, manifest_path: &
     let plan_path = plan.to_string_lossy().to_string();
 
     // Route remote plans to GitHub PR trigger instead of local execution.
-    if crate::plan::parse_execution_mode(&plan) == crate::plan::ExecutionMode::Remote {
+    if execution_mode == "remote" {
         let config = { state.lock().await.config.clone() };
         if let Some(remote_repo) = config.remote_repo.as_deref() {
             let plan_filename = plan.file_name()
