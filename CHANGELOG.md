@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.51.0] - 2026-04-30
+
+### Features
+
+- **cli:** Drop legacy validate surface — `--schema` is now required (#39) ([a49d2d1](https://github.com/andreas-pohl-parloa/plan-executor/commit/a49d2d107b2b5d4320a9e8d5dc33a45ff06278ed))
 ## [0.50.0] - 2026-04-30
 
 ### Features
