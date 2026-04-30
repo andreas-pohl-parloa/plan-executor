@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.41.11] - 2026-04-30
+
+### Bug Fixes
+
+- **scheduler:** Resolve prompts against manifest dir, persist terminal job.json, refresh jobs CLI (#23) ([65f76bb](https://github.com/andreas-pohl-parloa/plan-executor/commit/65f76bbebd13be8d2c77cc5bccd61f23ee542115))
 ## [0.41.10] - 2026-04-30
 
 ### Refactoring
