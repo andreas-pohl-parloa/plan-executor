@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.52.3] - 2026-04-30
+
+### Bug Fixes
+
+- **pr_creation:** Commit + push worktree before opening the PR (#44) ([4e8374a](https://github.com/andreas-pohl-parloa/plan-executor/commit/4e8374a4a74f4d4447ef1fed4ac8bb5908c4b011))
 ## [0.52.2] - 2026-04-30
 
 ### Bug Fixes
