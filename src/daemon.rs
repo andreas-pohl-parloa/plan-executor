@@ -1178,15 +1178,16 @@ async fn run_rust_scheduler_steps(
 /// retry, broadcasts a `step N (name) attempt X/Y after <reason>: <detail>`
 /// display line so `output -f` and `jobs` see the loop is in motion.
 ///
-/// Honors:
-/// - `RetryTransient { max, backoff }` for `AttemptOutcome::TransientInfra`,
-///   sleeping for `backoff.delay(attempt)` between attempts.
-/// - `RetryProtocol { max, .. }` for `AttemptOutcome::ProtocolViolation`.
-///   Re-invokes the step without injecting corrective context (sampling
-///   roulette) — the corrective-prompt catalog is a future addition.
+/// Honors any combination of [`RetryTransient`] and [`RetryProtocol`]
+/// reachable from `policy`, including nested inside [`RecoveryPolicy::Compose`]
+/// (the canonical shape `helper_compose_policy` builds for `code_review` /
+/// `validation`). Per-kind budgets are tracked independently so a Compose
+/// of `[RetryTransient { max: 3 }, RetryProtocol { max: 1 }]` can absorb up
+/// to three transient blips AND one protocol violation in the same step run.
 ///
 /// Other outcomes (`Success`, `Pending`, `HardInfra`, `SemanticMistake`,
-/// `SpecDrift`) short-circuit with no retry.
+/// `SpecDrift`) short-circuit with no retry. `Rollback` and `OperatorDecision`
+/// children are recognized but treated as no-op for retry budgeting today.
 async fn run_step_with_retries(
     step: &dyn crate::job::step::Step,
     policy: &crate::job::recovery::RecoveryPolicy,
@@ -1196,16 +1197,18 @@ async fn run_step_with_retries(
     seq: u32,
     state: &Arc<Mutex<DaemonState>>,
 ) -> crate::job::types::AttemptOutcome {
-    use crate::job::recovery::RecoveryPolicy;
     use crate::job::types::AttemptOutcome;
 
-    let max_retries = match policy {
-        RecoveryPolicy::RetryTransient { max, .. } => *max,
-        RecoveryPolicy::RetryProtocol { max, .. } => *max,
-        _ => 0,
-    };
+    // Resolve the active retry budgets from `policy` once. Compose unwrapping
+    // collects the *first* RetryTransient / RetryProtocol it finds (matching
+    // the Rust scheduler's "linear policy chain" interpretation; nested
+    // Composes are flattened).
+    let (transient_budget, protocol_budget) = collect_retry_budgets(policy);
 
+    let mut transient_used: u32 = 0;
+    let mut protocol_used: u32 = 0;
     let mut attempt: u32 = 1;
+
     loop {
         ctx.attempt_n = attempt;
         tracing::info!(
@@ -1217,31 +1220,38 @@ async fn run_step_with_retries(
         let outcome = step.run(ctx).await;
         metrics.record_attempt(&outcome, Some(policy));
 
-        let retryable = match (&outcome, policy) {
-            (AttemptOutcome::TransientInfra { .. }, RecoveryPolicy::RetryTransient { .. }) => true,
-            (AttemptOutcome::ProtocolViolation { .. }, RecoveryPolicy::RetryProtocol { .. }) => true,
-            _ => false,
+        let retry_decision = match &outcome {
+            AttemptOutcome::TransientInfra { .. } => transient_budget
+                .as_ref()
+                .filter(|b| transient_used < u32::from(b.max))
+                .map(|b| ("transient_infra", b.backoff.delay(attempt))),
+            AttemptOutcome::ProtocolViolation { .. } => protocol_budget
+                .as_ref()
+                .filter(|b| protocol_used < u32::from(b.max))
+                .map(|_| ("protocol_violation", std::time::Duration::ZERO)),
+            _ => None,
         };
-        if !retryable || u32::from(max_retries) == 0 || attempt > u32::from(max_retries) {
-            return outcome;
-        }
 
-        let (reason_kind, detail) = match &outcome {
-            AttemptOutcome::TransientInfra { error } => ("transient_infra", error.clone()),
-            AttemptOutcome::ProtocolViolation { category, detail } => (
-                "protocol_violation",
-                format!("[{category}] {detail}"),
-            ),
-            _ => unreachable!("retryable matched non-retryable outcome"),
+        let Some((reason_kind, delay)) = retry_decision else {
+            return outcome;
         };
-        let total = u32::from(max_retries) + 1;
+
+        let detail = match &outcome {
+            AttemptOutcome::TransientInfra { error } => error.clone(),
+            AttemptOutcome::ProtocolViolation { category, detail } => {
+                format!("[{category}] {detail}")
+            }
+            _ => unreachable!("retry_decision matched non-retryable outcome"),
+        };
         let next_attempt = attempt + 1;
+        let total_budget = u32::from(transient_budget.as_ref().map(|b| b.max).unwrap_or(0))
+            + u32::from(protocol_budget.as_ref().map(|b| b.max).unwrap_or(0));
         let line = format!(
             "⏺ [plan-executor] step {} ({}) attempt {}/{} after {}: {}",
             seq,
             step.name(),
             next_attempt,
-            total,
+            total_budget + 1,
             reason_kind,
             truncate_ellipsis(&detail, 160),
         );
@@ -1259,14 +1269,70 @@ async fn run_step_with_retries(
             });
         }
 
-        if let RecoveryPolicy::RetryTransient { backoff, .. } = policy {
-            let delay = backoff.delay(attempt);
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
-            }
+        match reason_kind {
+            "transient_infra" => transient_used += 1,
+            "protocol_violation" => protocol_used += 1,
+            _ => unreachable!(),
+        }
+
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
         }
         attempt = next_attempt;
     }
+}
+
+/// Linearizes the retry budgets reachable from `policy`. Returns the first
+/// `RetryTransient` and the first `RetryProtocol` encountered in a
+/// depth-first walk, ignoring `None` / `Rollback` / `OperatorDecision`
+/// children (those are no-op for retry budgeting today).
+fn collect_retry_budgets(
+    policy: &crate::job::recovery::RecoveryPolicy,
+) -> (Option<RetryTransientBudget>, Option<RetryProtocolBudget>) {
+    use crate::job::recovery::RecoveryPolicy;
+    let mut transient = None;
+    let mut protocol = None;
+    fn walk(
+        p: &RecoveryPolicy,
+        transient: &mut Option<RetryTransientBudget>,
+        protocol: &mut Option<RetryProtocolBudget>,
+    ) {
+        match p {
+            RecoveryPolicy::RetryTransient { max, backoff } => {
+                if transient.is_none() {
+                    *transient = Some(RetryTransientBudget {
+                        max: *max,
+                        backoff: backoff.clone(),
+                    });
+                }
+            }
+            RecoveryPolicy::RetryProtocol { max, .. } => {
+                if protocol.is_none() {
+                    *protocol = Some(RetryProtocolBudget { max: *max });
+                }
+            }
+            RecoveryPolicy::Compose { policies } => {
+                for child in policies {
+                    walk(child, transient, protocol);
+                }
+            }
+            RecoveryPolicy::Rollback { then, .. } => {
+                walk(then, transient, protocol);
+            }
+            RecoveryPolicy::None | RecoveryPolicy::OperatorDecision { .. } => {}
+        }
+    }
+    walk(policy, &mut transient, &mut protocol);
+    (transient, protocol)
+}
+
+struct RetryTransientBudget {
+    max: u8,
+    backoff: crate::job::recovery::Backoff,
+}
+
+struct RetryProtocolBudget {
+    max: u8,
 }
 
 fn truncate_ellipsis(s: &str, max: usize) -> String {
@@ -1395,6 +1461,73 @@ async fn handle_tui_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collect_retry_budgets_unwraps_compose_pair() {
+        use crate::job::recovery::{Backoff, CorrectivePromptKey, RecoveryPolicy};
+        // Mirrors the canonical helper_compose_policy shape used by
+        // CodeReviewStep / ValidationStep: Compose([RetryTransient,
+        // RetryProtocol]). Both budgets must be lifted out so retries fire
+        // for either outcome kind.
+        let policy = RecoveryPolicy::Compose {
+            policies: vec![
+                RecoveryPolicy::RetryTransient {
+                    max: 3,
+                    backoff: Backoff::Fixed { ms: 100 },
+                },
+                RecoveryPolicy::RetryProtocol {
+                    max: 1,
+                    corrective: CorrectivePromptKey("k".to_string()),
+                },
+            ],
+        };
+        let (t, p) = collect_retry_budgets(&policy);
+        assert_eq!(t.as_ref().expect("transient").max, 3);
+        assert_eq!(p.as_ref().expect("protocol").max, 1);
+    }
+
+    #[test]
+    fn collect_retry_budgets_handles_bare_retry_transient() {
+        use crate::job::recovery::{Backoff, RecoveryPolicy};
+        let policy = RecoveryPolicy::RetryTransient {
+            max: 2,
+            backoff: Backoff::Fixed { ms: 0 },
+        };
+        let (t, p) = collect_retry_budgets(&policy);
+        assert_eq!(t.expect("transient").max, 2);
+        assert!(p.is_none());
+    }
+
+    #[test]
+    fn collect_retry_budgets_returns_none_for_recovery_none() {
+        use crate::job::recovery::RecoveryPolicy;
+        let (t, p) = collect_retry_budgets(&RecoveryPolicy::None);
+        assert!(t.is_none());
+        assert!(p.is_none());
+    }
+
+    #[test]
+    fn collect_retry_budgets_walks_nested_compose() {
+        use crate::job::recovery::{Backoff, CorrectivePromptKey, RecoveryPolicy};
+        let policy = RecoveryPolicy::Compose {
+            policies: vec![
+                RecoveryPolicy::None,
+                RecoveryPolicy::Compose {
+                    policies: vec![RecoveryPolicy::RetryTransient {
+                        max: 5,
+                        backoff: Backoff::Fixed { ms: 0 },
+                    }],
+                },
+                RecoveryPolicy::RetryProtocol {
+                    max: 2,
+                    corrective: CorrectivePromptKey("k".to_string()),
+                },
+            ],
+        };
+        let (t, p) = collect_retry_budgets(&policy);
+        assert_eq!(t.expect("transient").max, 5);
+        assert_eq!(p.expect("protocol").max, 2);
+    }
 
     #[test]
     fn compute_watchdog_timings_uses_monotonic_start() {
