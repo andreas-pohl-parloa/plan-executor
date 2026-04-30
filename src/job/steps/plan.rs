@@ -2079,6 +2079,19 @@ fn run_pr_creation(ctx: &StepContext, manifest_path: &Path) -> AttemptOutcome {
 
     let title = pr_title(&plan_meta);
     let body = pr_body(&plan_meta);
+
+    // Wave sub-agents edit files but do not commit. Stage + commit any
+    // outstanding worktree changes here, using the PR title as the
+    // commit message, then push the branch. Without this `gh pr create`
+    // returns "No commits between main and <branch>" and the pipeline
+    // dies one step short of an opened PR.
+    if let Err(outcome) = commit_worktree_changes(&ctx.workdir, &title) {
+        return outcome;
+    }
+    if let Err(outcome) = push_branch(&ctx.workdir, &branch) {
+        return outcome;
+    }
+
     let mut args: Vec<String> = vec![
         "pr".to_string(),
         "create".to_string(),
@@ -2135,6 +2148,117 @@ fn run_pr_creation(ctx: &StepContext, manifest_path: &Path) -> AttemptOutcome {
             }
         }
     }
+}
+
+/// Stages every working-tree change and commits with `message`. No-op
+/// when `git status --porcelain` is clean (i.e. wave sub-agents already
+/// committed, or a previous run reached this point and committed
+/// already). Returns an [`AttemptOutcome`] tagged for the caller to
+/// surface verbatim.
+///
+/// The commit is signed off only when the host's `commit.gpgsign` is
+/// already configured; we do not pass `--no-gpg-sign` because the
+/// daemon should never silently bypass operator signing policy.
+fn commit_worktree_changes(workdir: &Path, message: &str) -> Result<(), AttemptOutcome> {
+    let dirty = match git_workdir_is_dirty(workdir) {
+        Ok(d) => d,
+        Err(e) => {
+            return Err(AttemptOutcome::HardInfra {
+                error: format!("git status check failed: {e}"),
+            })
+        }
+    };
+    if !dirty {
+        tracing::info!("pr_creation: worktree clean, skipping commit");
+        return Ok(());
+    }
+    let add = Command::new("git")
+        .args(["-C"])
+        .arg(workdir)
+        .args(["add", "-A"])
+        .output()
+        .map_err(|e| AttemptOutcome::HardInfra {
+            error: format!("spawn `git add` failed: {e}"),
+        })?;
+    if !add.status.success() {
+        return Err(AttemptOutcome::HardInfra {
+            error: format!(
+                "git add -A failed (status {:?}): {}",
+                add.status.code(),
+                String::from_utf8_lossy(&add.stderr).trim()
+            ),
+        });
+    }
+    let commit = Command::new("git")
+        .args(["-C"])
+        .arg(workdir)
+        .args(["commit", "-m", message])
+        .output()
+        .map_err(|e| AttemptOutcome::HardInfra {
+            error: format!("spawn `git commit` failed: {e}"),
+        })?;
+    if !commit.status.success() {
+        return Err(AttemptOutcome::HardInfra {
+            error: format!(
+                "git commit failed (status {:?}): {}",
+                commit.status.code(),
+                String::from_utf8_lossy(&commit.stderr).trim()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Pushes `branch` to `origin`, setting upstream so subsequent runs
+/// don't have to re-pass `-u`. Idempotent when the upstream already
+/// tracks the branch — the second invocation is a fast-forward push
+/// or no-op.
+fn push_branch(workdir: &Path, branch: &str) -> Result<(), AttemptOutcome> {
+    let push = Command::new("git")
+        .args(["-C"])
+        .arg(workdir)
+        .args(["push", "-u", "origin", branch])
+        .output()
+        .map_err(|e| AttemptOutcome::HardInfra {
+            error: format!("spawn `git push` failed: {e}"),
+        })?;
+    if !push.status.success() {
+        let stderr = String::from_utf8_lossy(&push.stderr).into_owned();
+        // Network blips, auth retries, or the rare "everything up-to-date"
+        // edge case (which exits non-zero on some git builds) should be
+        // re-tried once at the next attempt rather than failing the
+        // pipeline outright.
+        let is_transient = is_transient_gh_error(&stderr);
+        let error = format!(
+            "git push -u origin {branch} failed (status {:?}): {}",
+            push.status.code(),
+            stderr.trim()
+        );
+        return Err(if is_transient {
+            AttemptOutcome::TransientInfra { error }
+        } else {
+            AttemptOutcome::HardInfra { error }
+        });
+    }
+    Ok(())
+}
+
+/// `git status --porcelain` shorthand: returns true when there's any
+/// uncommitted change in the worktree (staged, unstaged, or untracked).
+fn git_workdir_is_dirty(workdir: &Path) -> std::io::Result<bool> {
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(workdir)
+        .args(["status", "--porcelain"])
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "git status --porcelain exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(!output.stdout.is_empty())
 }
 
 /// Builds the conventional-commits PR title from the plan metadata, falling
