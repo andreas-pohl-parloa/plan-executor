@@ -63,38 +63,27 @@ pub enum Commands {
     RemoteSetup,
     /// Validate a JSON document against one of the bundled schemas.
     ///
-    /// Without `--schema`, the path is interpreted as a `tasks.json`
-    /// manifest and both schema and semantic rules are checked
-    /// (back-compat: matches the old `plan-executor validate <tasks-json>`
-    /// surface). With `--schema=<id>`, the input is validated against the
-    /// named schema only — useful for skills that need to self-check their
-    /// output envelope before printing it. Exits `0` with `VALID:` on
-    /// stdout when the input matches; exits `1` with one or more `ERROR:`
-    /// lines on stderr when it doesn't. Pass `--list-schemas` to print
-    /// every recognized id and exit. The path argument may be `-` to read
-    /// from stdin (only honored when `--schema` is set; the legacy tasks
-    /// path requires an on-disk manifest because the semantic checks
-    /// resolve sibling files).
+    /// `--schema=<id>` is required; pick from `plan-executor validate
+    /// --list-schemas`. The path argument may be `-` to read the document
+    /// from stdin. When `--schema=tasks`, semantic checks (DAG acyclicity,
+    /// prompt-file existence, etc.) run in addition to the JSON-Schema
+    /// pass; for those checks the path must point at an on-disk manifest
+    /// because sibling files are resolved relative to its directory. All
+    /// other schemas accept stdin freely. Exits `0` with `VALID:` on
+    /// stdout on success, `1` with one or more `ERROR:` lines on stderr
+    /// otherwise.
     Validate {
         /// Path to the JSON document to validate. Use `-` for stdin
-        /// (only allowed in combination with `--schema`).
+        /// (rejected when `--schema=tasks`).
         path: Option<PathBuf>,
         /// Schema id, e.g. `tasks`, `handoffs`, or
-        /// `helper-output:run-reviewer-team`. When omitted the input is
-        /// validated as a tasks manifest with semantic checks.
+        /// `helper-output:run-reviewer-team`. Required unless
+        /// `--list-schemas` is set.
         #[arg(long)]
         schema: Option<String>,
         /// Print every bundled schema id and exit.
         #[arg(long, conflicts_with_all = ["path", "schema"])]
         list_schemas: bool,
-    },
-    /// Deprecated alias for `validate --schema=handoffs <path>`. Kept so
-    /// existing skill prompts continue to work.
-    #[command(hide = true)]
-    ValidateHandoffs {
-        /// Path to a JSON file containing the handoffs array. Use `-` to
-        /// read from stdin.
-        handoffs_json: PathBuf,
     },
     /// Append fix waves to an existing tasks.json from reviewer findings.
     CompileFixWaves {
@@ -424,15 +413,14 @@ pub(crate) fn read_manifest_plan_block(
     Ok((PathBuf::from(plan_path), status, execution_mode))
 }
 
-/// Dispatches `plan-executor validate` based on the parsed flags.
+/// Dispatches `plan-executor validate`.
 ///
-/// Three modes:
-/// - `--list-schemas` prints every bundled id and exits 0.
-/// - `--schema=<id>` validates `path` (or stdin if `path == "-"`) against
-///   the named schema only. No semantic checks.
-/// - Neither flag set: legacy mode, treats `path` as a tasks.json manifest
-///   and applies both schema + semantic rules. Stdin is rejected here
-///   because the semantic pass needs a manifest dir.
+/// `--list-schemas` prints every bundled id and exits 0. Otherwise both
+/// `--schema=<id>` and a path are required. `--schema=tasks` runs the
+/// JSON-Schema pass plus the manifest semantic checks (DAG acyclicity,
+/// prompt-file existence, etc.) — that combination requires an on-disk
+/// path so sibling files resolve relative to the manifest dir. Every
+/// other schema runs the JSON-Schema pass only and accepts stdin (`-`).
 fn run_validate(
     path: Option<&Path>,
     schema_id: Option<&str>,
@@ -445,29 +433,37 @@ fn run_validate(
         return;
     }
 
-    let path = match path {
-        Some(p) => p,
+    let schema_id = match schema_id {
+        Some(id) => id,
         None => {
             eprintln!(
-                "ERROR: missing path argument (or pass --list-schemas to enumerate ids)"
+                "ERROR: --schema=<id> is required (run `plan-executor validate --list-schemas` to enumerate ids)"
             );
             std::process::exit(1);
         }
     };
+    let path = match path {
+        Some(p) => p,
+        None => {
+            eprintln!("ERROR: missing path argument (use `-` to read stdin)");
+            std::process::exit(1);
+        }
+    };
 
-    match schema_id {
-        Some(id) => run_validate_against_schema(path, id),
-        None => run_validate_tasks_manifest(path),
+    if schema_id == "tasks" {
+        run_validate_tasks_manifest(path);
+    } else {
+        run_validate_against_schema(path, schema_id);
     }
 }
 
-/// Legacy mode: `path` is a tasks.json manifest. Stdin is not accepted
-/// because the semantic pass resolves sibling files relative to the
-/// manifest directory.
+/// `--schema=tasks` path: JSON-Schema + semantic checks. Stdin is
+/// rejected because the semantic pass resolves sibling files relative to
+/// the manifest directory.
 fn run_validate_tasks_manifest(tasks_json: &Path) {
     if tasks_json == Path::new("-") {
         eprintln!(
-            "ERROR: --schema is required when reading from stdin; the tasks manifest semantic pass needs a manifest directory"
+            "ERROR: `--schema=tasks` requires an on-disk manifest (the semantic pass needs a manifest directory); use `--schema=<other>` if you want to schema-check stdin"
         );
         std::process::exit(1);
     }
@@ -497,7 +493,7 @@ fn run_validate_tasks_manifest(tasks_json: &Path) {
         .unwrap_or_default();
 
     if schema_errors.is_empty() && semantic_errors.is_empty() {
-        println!("VALID: {}", tasks_json.display());
+        println!("VALID: {} (schema: tasks)", tasks_json.display());
         return;
     }
 
@@ -1042,10 +1038,6 @@ pub fn run() {
             run_validate(path.as_deref(), schema.as_deref(), *list_schemas);
             return;
         }
-        Commands::ValidateHandoffs { handoffs_json } => {
-            run_validate_against_schema(handoffs_json, "handoffs");
-            return;
-        }
         Commands::CompileFixWaves {
             plan,
             execution_root,
@@ -1121,7 +1113,6 @@ pub fn run() {
         | Commands::Pause { .. }
         | Commands::Unpause { .. }
         | Commands::Validate { .. }
-        | Commands::ValidateHandoffs { .. }
         | Commands::CompileFixWaves { .. }
         | Commands::Run { .. } => unreachable!(),
     };
