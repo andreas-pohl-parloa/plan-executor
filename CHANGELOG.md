@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.44.1] - 2026-04-30
+
+### Bug Fixes
+
+- **helper:** Pick envelope by status-key, skip descriptive prose blocks (#30) ([f9739fd](https://github.com/andreas-pohl-parloa/plan-executor/commit/f9739fdd853653de3a1a84e3c69020d0a77645fb))
 ## [0.44.0] - 2026-04-30
 
 ### Features
