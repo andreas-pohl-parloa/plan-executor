@@ -1038,6 +1038,22 @@ fn build_validator_input(
     let manifest = scheduler::load_manifest(manifest_path)
         .map_err(|e| HelperError::HardInfra(format!("load manifest for validator input: {e}")))?;
     let state_file_path = ctx.workdir.join(".tmp-execute-plan-state.json");
+    // Re-entry sidecar from the previous loop iteration's
+    // `dispatch_handoffs_and_resume` call, when present. Same probe pattern
+    // as `build_review_team_input` so the validator skill enters triage
+    // mode automatically on the second invocation.
+    let prior_outputs = if iteration > 1 {
+        let candidate = ctx
+            .workdir
+            .join(format!(".tmp-helper-handoff-outputs-attempt-{}.json", iteration - 1));
+        if candidate.is_file() {
+            candidate.to_string_lossy().into_owned()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
     Ok(ValidatorInput {
         plan_path: PathBuf::from(&manifest.plan.path),
         execution_root: ctx.workdir.clone(),
@@ -1052,6 +1068,7 @@ fn build_validator_input(
         current_validation_attempt: iteration,
         prior_validation_notes: json!({}),
         prior_helper_outcomes: json!({}),
+        prior_handoff_outputs_path: prior_outputs,
     })
 }
 
@@ -1101,6 +1118,11 @@ fn build_findings_for_fix_wave(
 ) -> Result<PathBuf, AttemptOutcome> {
     match kind {
         HelperLoopKind::CodeReview => {
+            // The fix-wave triage helper is invoked synchronously after a
+            // SemanticFailure; if the helper requests `waiting_for_handoffs`
+            // it has its own dispatch round-trip handled by run_helper_fix_loop.
+            // We don't pre-populate `prior_handoff_outputs_path` here (the
+            // first call into the triage skill is always dispatch mode).
             let triage_input = ReviewTriageInput {
                 plan_path: plan_path.to_path_buf(),
                 execution_root: ctx.workdir.clone(),
@@ -1113,6 +1135,7 @@ fn build_findings_for_fix_wave(
                 review_state: json!({}),
                 review_state_path: None,
                 prior_review_notes: json!({}),
+                prior_handoff_outputs_path: String::new(),
             };
             let envelope = serde_json::to_value(&triage_input).map_err(|e| {
                 AttemptOutcome::ProtocolViolation {

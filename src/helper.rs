@@ -747,6 +747,12 @@ pub struct ReviewTriageInput {
     pub review_state_path: Option<PathBuf>,
     /// Prior review findings, triage notes, and fix history.
     pub prior_review_notes: serde_json::Value,
+    /// Absolute path to the JSON sidecar carrying the dispatched sub-agent
+    /// outputs the orchestrator just collected. Empty string on the first
+    /// invocation; non-empty on the re-invocation that follows a
+    /// `waiting_for_handoffs` envelope (triage mode).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prior_handoff_outputs_path: String,
 }
 
 // ----- validate-execution-plan-non-interactive -----------------------------
@@ -780,6 +786,12 @@ pub struct ValidatorInput {
     pub prior_validation_notes: serde_json::Value,
     /// Prior helper outcomes needed to continue the same validation loop deterministically.
     pub prior_helper_outcomes: serde_json::Value,
+    /// Absolute path to the JSON sidecar carrying the dispatched sub-agent
+    /// outputs the orchestrator just collected. Empty string on the first
+    /// invocation; non-empty on the re-invocation that follows a
+    /// `waiting_for_handoffs` envelope (triage mode).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prior_handoff_outputs_path: String,
 }
 
 /// One row of the validator helper's `state_updates.gaps[*]` payload. The
