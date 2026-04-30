@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.42.0] - 2026-04-30
+
+### Features
+
+- **jobs:** Add PROGRESS column + sub-process tree to jobs list (#25) ([f5a4964](https://github.com/andreas-pohl-parloa/plan-executor/commit/f5a4964dd26a91796e68415aeb0aaba2d4ad4424))
 ## [0.41.12] - 2026-04-30
 
 ### Bug Fixes
