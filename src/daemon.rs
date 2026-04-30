@@ -979,11 +979,16 @@ async fn run_rust_scheduler_steps(
 
     // Finalize and persist metrics on every terminal state (success or
     // failure). Errors here are logged but do not change the return value;
-    // the metrics file is best-effort observability data.
+    // the metrics file is best-effort observability data. While we have the
+    // job dir open, also flip `job.json`'s top-level state to the matching
+    // terminal variant so `output -f` and `jobs` reflect the real outcome
+    // instead of an indefinite "running".
     metrics.finalize();
     match JobStore::new().and_then(|s| s.open(&job_id_owned)) {
-        Ok(dir) => match dir.write_metrics(&metrics) {
-            Ok(()) => {
+        Ok(dir) => {
+            if let Err(e) = dir.write_metrics(&metrics) {
+                tracing::warn!(job = %job_id, error = %e, "failed to write metrics.json");
+            } else {
                 tracing::debug!(
                     job = %job_id,
                     attempts = metrics.attempts_total,
@@ -991,10 +996,25 @@ async fn run_rust_scheduler_steps(
                     "wrote job metrics.json",
                 );
             }
-            Err(e) => {
-                tracing::warn!(job = %job_id, error = %e, "failed to write metrics.json");
+            match dir.read_job() {
+                Ok(mut job) => {
+                    job.state = if pipeline_ok {
+                        crate::job::types::JobState::Succeeded
+                    } else {
+                        crate::job::types::JobState::Failed {
+                            reason: "pipeline aborted".to_string(),
+                            recoverable: false,
+                        }
+                    };
+                    if let Err(e) = dir.write_job_metadata(&job) {
+                        tracing::warn!(job = %job_id, error = %e, "failed to write terminal job.json");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(job = %job_id, error = %e, "failed to read job.json for terminal update");
+                }
             }
-        },
+        }
         Err(e) => {
             tracing::warn!(job = %job_id, error = %e, "failed to open job dir for metrics");
         }

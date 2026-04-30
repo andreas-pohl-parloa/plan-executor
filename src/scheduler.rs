@@ -317,10 +317,11 @@ struct WaveOutcome {
 /// Never returns a `Result` — protocol violations are surfaced by writing the
 /// summary JSON to the step's attempt scratch dir and returning the matching
 /// [`AttemptOutcome`] variant.
-#[tracing::instrument(skip(ctx, manifest), fields(waves = manifest.waves.len()))]
+#[tracing::instrument(skip(ctx, manifest, manifest_dir), fields(waves = manifest.waves.len()))]
 pub async fn run_wave_execution(
     ctx: &mut StepContext,
     manifest: &Manifest,
+    manifest_dir: &Path,
 ) -> AttemptOutcome {
     let order = match manifest.topological_wave_order() {
         Ok(o) => o,
@@ -341,7 +342,7 @@ pub async fn run_wave_execution(
         }
     };
 
-    let manifest_dir = manifest_dir_for(ctx);
+    let manifest_dir = manifest_dir.to_path_buf();
     let mut wave_outcomes: Vec<WaveOutcome> = Vec::with_capacity(order.len());
 
     for wave_id in order {
@@ -488,20 +489,6 @@ fn parse_agent_type(s: &str) -> Option<AgentType> {
         "bash" => Some(AgentType::Bash),
         _ => None,
     }
-}
-
-/// Resolves the directory that holds the manifest's `tasks/` subtree.
-///
-/// The compiled manifest lives next to its task prompts; the daemon stages it
-/// at `<workdir>/tasks.json` (or via the env var the CLI uses for one-shot
-/// dispatch). Falls back to [`StepContext::workdir`] when no override is set.
-fn manifest_dir_for(ctx: &StepContext) -> PathBuf {
-    if let Ok(p) = std::env::var("PLAN_EXECUTOR_MANIFEST_DIR") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    ctx.workdir.clone()
 }
 
 /// Writes a JSON summary of the wave traversal to the per-attempt scratch
