@@ -289,6 +289,14 @@ pub struct SchedulerHooks {
     /// Broadcast bus for `JobDisplayLine` / `SubAgentLine` events the
     /// `output -f` follower renders live via sjv.
     pub event_tx: broadcast::Sender<DaemonEvent>,
+    /// Per-job dispatch counter for **helper subprocess** invocations
+    /// (validate / review / pr-finalize / run-reviewer-team). Lives
+    /// alongside the wave-dispatch counter on `DaemonState` because
+    /// helpers run from sync code — `helper.rs::run_claude_subprocess`
+    /// can't `.await` on the tokio Mutex. Starts at 1000 so the
+    /// resulting `dispatch-<N>-...` filenames stay visually distinct
+    /// from wave dispatches (1, 2, 3, ...).
+    pub helper_dispatch_counter: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl SchedulerHooks {
@@ -366,6 +374,21 @@ impl SchedulerHooks {
             "⏺ [plan-executor] retrying sub-agent(s) {pretty} (kind: {kind}, attempt {attempt})"
         );
         self.publish_display_line(line);
+    }
+
+    /// Sync version of [`Self::announce_wave_dispatch`] for helper
+    /// subprocesses. Bumps a separate per-hooks atomic counter (so it
+    /// doesn't compete with wave dispatches for the async tokio Mutex)
+    /// and prints the same display line. The returned `dispatch_num` is
+    /// used to name the per-helper JSONL file under `<job>/sub-agents/`.
+    pub fn announce_helper_dispatch(&self, count: usize, kind: &str) -> u32 {
+        use std::sync::atomic::Ordering;
+        let dispatch_num = self.helper_dispatch_counter.fetch_add(1, Ordering::Relaxed);
+        let line = format!(
+            "⏺ [plan-executor] dispatching {count} sub-agent(s) (kind: {kind})"
+        );
+        self.publish_display_line(line);
+        dispatch_num
     }
 
     /// Spawns a fresh `spawn_subagent_writer` for one wave's `dispatch_all`
@@ -1034,7 +1057,17 @@ async fn run_rust_scheduler_steps(
         job_id: job_id.to_string(),
         state: Arc::clone(state),
         event_tx,
+        helper_dispatch_counter: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1000)),
     });
+
+    // `current_workdir` lives across the whole pipeline so a step that
+    // mutates `ctx.workdir` (preflight redirects to the per-plan
+    // worktree) propagates that change to every subsequent step. Before
+    // this hoist, each step received a fresh `StepContext` with the
+    // original `workdir`, so validation / review / pr_finalize ran
+    // against the source repo instead of the worktree where the work
+    // actually happened.
+    let mut current_workdir = workdir.clone();
 
     for (idx, step) in steps.iter().enumerate() {
         let seq = u32::try_from(idx + 1).unwrap_or(u32::MAX);
@@ -1054,7 +1087,7 @@ async fn run_rust_scheduler_steps(
             job_dir: job_dir.clone(),
             step_seq: seq,
             attempt_n: 1,
-            workdir: workdir.clone(),
+            workdir: current_workdir.clone(),
             daemon_hooks: Some(Arc::clone(&hooks)),
         };
 
@@ -1087,6 +1120,11 @@ async fn run_rust_scheduler_steps(
             state,
         )
         .await;
+
+        // Carry any workdir mutation made by this step (e.g. preflight
+        // redirecting into the freshly-created per-plan worktree)
+        // forward to the next step's `StepContext`.
+        current_workdir = ctx.workdir.clone();
 
         let (ok, summary) = match &outcome {
             AttemptOutcome::Success => (true, "success".to_string()),

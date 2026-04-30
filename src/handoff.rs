@@ -252,7 +252,7 @@ fn is_terminal_result_line(line: &str) -> bool {
     false
 }
 
-fn extract_result_text(lines: &[String]) -> Option<String> {
+pub(crate) fn extract_result_text(lines: &[String]) -> Option<String> {
     for line in lines.iter().rev() {
         let parsed: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
