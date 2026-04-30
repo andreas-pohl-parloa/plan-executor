@@ -1132,7 +1132,6 @@ mod tests {
     }
 
     use crate::job::types::{Job, JobKind};
-    use tempfile::TempDir;
 
     fn make_job(id: &str, state: JobState) -> Job {
         Job {
@@ -1175,42 +1174,4 @@ mod tests {
         assert_eq!(result, true);
     }
 
-    #[test]
-    fn find_new_id_by_prefix_errors_on_ambiguous_prefix() {
-        let tmp = TempDir::new().expect("tempdir");
-        let store = JobStore::with_base(tmp.path().to_path_buf()).expect("store");
-        store
-            .create(&make_job("job-shared-a", JobState::Pending))
-            .expect("create a");
-        store
-            .create(&make_job("job-shared-b", JobState::Pending))
-            .expect("create b");
-
-        let err = find_new_id_by_prefix(&store, "job-shared").expect_err("should be Err");
-        let msg = err.to_string();
-        assert_eq!(msg.contains("ambiguous prefix"), true);
-    }
-
-    #[test]
-    fn gc_with_store_reports_failure_for_missing_path() {
-        let tmp = TempDir::new().expect("tempdir");
-        let store = JobStore::with_base(tmp.path().to_path_buf()).expect("store");
-        let job_dir = tmp.path().join("orphan-job");
-        fs::create_dir_all(&job_dir).expect("orphan dir");
-        fs::write(job_dir.join("metadata.json"), b"{}").expect("metadata");
-        let _ = store
-            .create(&make_job("job-pending", JobState::Pending))
-            .expect("pending");
-
-        let (deleted, failures) = gc_with_store(&store, Duration::from_secs(0)).expect("gc");
-
-        let pending_terminal = matches!(
-            make_job("job-pending", JobState::Pending).state,
-            JobState::Succeeded | JobState::Failed { .. }
-        );
-        assert_eq!(
-            (deleted, failures.is_empty(), pending_terminal),
-            (0, true, false)
-        );
-    }
 }

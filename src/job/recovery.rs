@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -64,88 +63,10 @@ pub enum CheckpointTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct CorrectivePromptKey(pub String);
 
-impl Backoff {
-    pub fn delay(&self, attempt: u32) -> Duration {
-        match self {
-            Backoff::Fixed { ms } => Duration::from_millis(*ms),
-            Backoff::Exponential {
-                initial_ms,
-                max_ms,
-                factor,
-            } => {
-                let raw = (*initial_ms as f64) * (*factor as f64).powi(attempt as i32 - 1);
-                Duration::from_millis((raw as u64).min(*max_ms))
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
-
-    #[test]
-    fn backoff_fixed_returns_constant_delay() {
-        let b = Backoff::Fixed { ms: 100 };
-        assert_eq!(b.delay(1), Duration::from_millis(100));
-    }
-
-    #[test]
-    fn backoff_fixed_ignores_attempt_count() {
-        let b = Backoff::Fixed { ms: 100 };
-        assert_eq!(b.delay(5), Duration::from_millis(100));
-    }
-
-    #[test]
-    fn backoff_exponential_attempt_one_returns_initial() {
-        let b = Backoff::Exponential {
-            initial_ms: 100,
-            max_ms: 10_000,
-            factor: 2.0,
-        };
-        assert_eq!(b.delay(1), Duration::from_millis(100));
-    }
-
-    #[test]
-    fn backoff_exponential_attempt_two_doubles() {
-        let b = Backoff::Exponential {
-            initial_ms: 100,
-            max_ms: 10_000,
-            factor: 2.0,
-        };
-        assert_eq!(b.delay(2), Duration::from_millis(200));
-    }
-
-    #[test]
-    fn backoff_exponential_attempt_three_quadruples() {
-        let b = Backoff::Exponential {
-            initial_ms: 100,
-            max_ms: 10_000,
-            factor: 2.0,
-        };
-        assert_eq!(b.delay(3), Duration::from_millis(400));
-    }
-
-    #[test]
-    fn backoff_exponential_attempt_four() {
-        let b = Backoff::Exponential {
-            initial_ms: 100,
-            max_ms: 10_000,
-            factor: 2.0,
-        };
-        assert_eq!(b.delay(4), Duration::from_millis(800));
-    }
-
-    #[test]
-    fn backoff_exponential_saturates_at_max() {
-        let b = Backoff::Exponential {
-            initial_ms: 100,
-            max_ms: 500,
-            factor: 2.0,
-        };
-        assert_eq!(b.delay(10), Duration::from_millis(500));
-    }
 
     #[test]
     fn recovery_policy_none_serde_roundtrip() {

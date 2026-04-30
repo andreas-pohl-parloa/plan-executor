@@ -37,10 +37,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use plan_executor::helper::{
-    invoke_helper, invoke_helper_with, invoke_pr_finalize, invoke_review_team,
-    invoke_review_triage, invoke_validator, HelperError, HelperInvocation, HelperSkill,
-    HelperStatus, PrFinalizeInput, PrFinalizeMergeMode, PrFinalizeOutput, ReviewTeamInput,
-    ReviewTeamOutput, ReviewTriageInput, ReviewTriageOutput, ValidatorInput, ValidatorOutput,
+    invoke_helper, invoke_helper_with, invoke_pr_finalize, HelperError, HelperInvocation,
+    HelperSkill, HelperStatus, PrFinalizeInput, PrFinalizeMergeMode, PrFinalizeOutput,
 };
 use plan_executor::job::step::StepContext;
 use tempfile::TempDir;
@@ -232,6 +230,11 @@ fn tight_timeout_options() -> HelperInvocation {
 // the tests close to the production schemas.
 // =====================================================================
 
+/// Minimal `RunReviewerTeam` envelope sufficient for tests that only assert
+/// on `invoke_helper`'s error-mapping behavior (timeout, status mapping,
+/// protocol violation). Carries the schema-required fields with placeholder
+/// values; tests that need the typed `state_updates` payload should build
+/// their own envelope inline.
 fn run_reviewer_team_envelope(status: &str) -> String {
     serde_json::json!({
         "status": status,
@@ -245,31 +248,6 @@ fn run_reviewer_team_envelope(status: &str) -> String {
                 {"reviewer": "gemini",   "exit_code": 0, "findings_count": 0},
                 {"reviewer": "security", "exit_code": 0, "findings_count": 0}
             ]
-        }
-    })
-    .to_string()
-}
-
-fn review_execution_envelope(status: &str) -> String {
-    serde_json::json!({
-        "status": status,
-        "next_step": "proceed_to_validation",
-        "notes": "ok",
-        "state_updates": {
-            "triaged_findings_path": "/tmp/triaged.md"
-        }
-    })
-    .to_string()
-}
-
-fn validator_envelope(status: &str) -> String {
-    serde_json::json!({
-        "status": status,
-        "next_step": "proceed_to_pr",
-        "notes": "ok",
-        "state_updates": {
-            "validation_report_path": "/tmp/report.md",
-            "gaps": []
         }
     })
     .to_string()
@@ -289,53 +267,6 @@ fn pr_finalize_envelope(status: &str) -> String {
     .to_string()
 }
 
-fn sample_review_team_input(workdir: &Path) -> ReviewTeamInput {
-    ReviewTeamInput {
-        plan_context: "see PLAN.md".to_string(),
-        execution_outputs: "wave 100 produced 3 files".to_string(),
-        changed_files: vec![PathBuf::from("src/lib.rs")],
-        language: "rust".to_string(),
-        recipe_list: vec!["rust-services:production-code-recipe".to_string()],
-        prior_review_context: serde_json::json!({}),
-        execution_root: workdir.to_path_buf(),
-        attempt: 1,
-    }
-}
-
-fn sample_review_triage_input(workdir: &Path) -> ReviewTriageInput {
-    ReviewTriageInput {
-        plan_path: workdir.join("PLAN.md"),
-        execution_root: workdir.to_path_buf(),
-        changed_files: vec![PathBuf::from("src/lib.rs")],
-        language: "rust".to_string(),
-        recipe_list: vec!["rust-services:production-code-recipe".to_string()],
-        skip_code_review: false,
-        state_file_path: workdir.join(".tmp-execute-plan-state.json"),
-        execution_state: serde_json::json!({}),
-        review_state: serde_json::json!({}),
-        review_state_path: None,
-        prior_review_notes: serde_json::json!({}),
-    }
-}
-
-fn sample_validator_input(workdir: &Path) -> ValidatorInput {
-    ValidatorInput {
-        plan_path: workdir.join("PLAN.md"),
-        execution_root: workdir.to_path_buf(),
-        changed_files: vec![PathBuf::from("src/lib.rs")],
-        language: "rust".to_string(),
-        recipe_list: vec!["rust-services:production-code-recipe".to_string()],
-        skip_code_review: false,
-        state_file_path: workdir.join(".tmp-execute-plan-state.json"),
-        execution_state: serde_json::json!({}),
-        validation_state: serde_json::json!({}),
-        validation_state_path: None,
-        current_validation_attempt: 1,
-        prior_validation_notes: serde_json::json!({}),
-        prior_helper_outcomes: serde_json::json!({}),
-    }
-}
-
 fn sample_pr_finalize_input() -> PrFinalizeInput {
     PrFinalizeInput {
         owner: "octo".to_string(),
@@ -346,70 +277,7 @@ fn sample_pr_finalize_input() -> PrFinalizeInput {
 }
 
 // =====================================================================
-// Scenario P1.a: invoke_review_team happy path returns typed output.
-// =====================================================================
-
-#[test]
-fn invoke_review_team_returns_typed_output_on_success() {
-    let h = HelperHarness::new().with_response(&run_reviewer_team_envelope("success"));
-    let ctx = step_ctx(h.workdir());
-
-    let result = invoke_review_team_with_timeout(sample_review_team_input(h.workdir()), &ctx);
-
-    // The wrapper output structs are #[non_exhaustive]; build the expected
-    // value via serde from the same shape the helper emitted on stdout.
-    let expected: ReviewTeamOutput = serde_json::from_value(serde_json::json!({
-        "findings_path": "/tmp/findings.md",
-        "reviewer_runs": [
-            {"reviewer": "claude",   "exit_code": 0, "findings_count": 0},
-            {"reviewer": "codex",    "exit_code": 0, "findings_count": 0},
-            {"reviewer": "gemini",   "exit_code": 0, "findings_count": 0},
-            {"reviewer": "security", "exit_code": 0, "findings_count": 0}
-        ]
-    }))
-    .expect("decode expected ReviewTeamOutput");
-    assert_eq!(result.expect("invoke_review_team Ok"), expected);
-}
-
-// =====================================================================
-// Scenario P1.b: invoke_review_triage happy path returns typed output.
-// =====================================================================
-
-#[test]
-fn invoke_review_triage_returns_typed_output_on_success() {
-    let h = HelperHarness::new().with_response(&review_execution_envelope("success"));
-    let ctx = step_ctx(h.workdir());
-
-    let result = invoke_review_triage_with_timeout(sample_review_triage_input(h.workdir()), &ctx);
-
-    let expected: ReviewTriageOutput = serde_json::from_value(serde_json::json!({
-        "triaged_findings_path": "/tmp/triaged.md"
-    }))
-    .expect("decode expected ReviewTriageOutput");
-    assert_eq!(result.expect("invoke_review_triage Ok"), expected);
-}
-
-// =====================================================================
-// Scenario P1.c: invoke_validator happy path returns typed output.
-// =====================================================================
-
-#[test]
-fn invoke_validator_returns_typed_output_on_success() {
-    let h = HelperHarness::new().with_response(&validator_envelope("success"));
-    let ctx = step_ctx(h.workdir());
-
-    let result = invoke_validator_with_timeout(sample_validator_input(h.workdir()), &ctx);
-
-    let expected: ValidatorOutput = serde_json::from_value(serde_json::json!({
-        "validation_report_path": "/tmp/report.md",
-        "gaps": []
-    }))
-    .expect("decode expected ValidatorOutput");
-    assert_eq!(result.expect("invoke_validator Ok"), expected);
-}
-
-// =====================================================================
-// Scenario P1.d: invoke_pr_finalize happy path returns typed output.
+// Scenario P1: invoke_pr_finalize happy path returns typed output.
 // =====================================================================
 
 #[test]
@@ -694,42 +562,6 @@ fn invoke_helper_writes_input_sidecar_under_workdir() {
 // bounded to ≤ 1 s on success and ≤ 1 s + spawn overhead on errors.
 // ---------------------------------------------------------------------
 
-fn invoke_review_team_with_timeout(
-    input: ReviewTeamInput,
-    ctx: &StepContext,
-) -> Result<ReviewTeamOutput, HelperError> {
-    let json = serde_json::to_value(&input).expect("serialize ReviewTeamInput");
-    let raw = invoke_helper_with(HelperSkill::RunReviewerTeam, json, ctx, &fast_options())?;
-    serde_json::from_value(raw.state_updates).map_err(|e| HelperError::ProtocolViolation {
-        category: "state_updates_shape".to_string(),
-        detail: format!("decode state_updates failed: {e}"),
-    })
-}
-
-fn invoke_review_triage_with_timeout(
-    input: ReviewTriageInput,
-    ctx: &StepContext,
-) -> Result<ReviewTriageOutput, HelperError> {
-    let json = serde_json::to_value(&input).expect("serialize ReviewTriageInput");
-    let raw = invoke_helper_with(HelperSkill::ReviewExecutionOutput, json, ctx, &fast_options())?;
-    serde_json::from_value(raw.state_updates).map_err(|e| HelperError::ProtocolViolation {
-        category: "state_updates_shape".to_string(),
-        detail: format!("decode state_updates failed: {e}"),
-    })
-}
-
-fn invoke_validator_with_timeout(
-    input: ValidatorInput,
-    ctx: &StepContext,
-) -> Result<ValidatorOutput, HelperError> {
-    let json = serde_json::to_value(&input).expect("serialize ValidatorInput");
-    let raw = invoke_helper_with(HelperSkill::ValidateExecutionPlan, json, ctx, &fast_options())?;
-    serde_json::from_value(raw.state_updates).map_err(|e| HelperError::ProtocolViolation {
-        category: "state_updates_shape".to_string(),
-        detail: format!("decode state_updates failed: {e}"),
-    })
-}
-
 fn invoke_pr_finalize_with_timeout(
     input: PrFinalizeInput,
     ctx: &StepContext,
@@ -751,12 +583,9 @@ fn protocol_violation_category(err: &HelperError) -> String {
     }
 }
 
-// Suppress unused-import warning on platforms where the four wrapper
-// shims are the only consumers of these typed entry points.
+// Suppress unused-import warning when the only typed wrapper shim left
+// (pr_finalize) happens to be unused on a given test cfg.
 #[allow(dead_code)]
 fn _api_surface_smoke() {
-    let _ = invoke_review_team;
-    let _ = invoke_review_triage;
-    let _ = invoke_validator;
     let _ = invoke_pr_finalize;
 }

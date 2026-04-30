@@ -31,7 +31,6 @@ use std::process::Command;
 use chrono::{Duration as ChronoDuration, Utc};
 use plan_executor::job::metrics::{AttemptOutcomeKind, JobMetrics, RecoveryKind};
 use plan_executor::job::recovery::{Backoff, RecoveryPolicy};
-use plan_executor::job::storage::JobStore;
 use plan_executor::job::types::{AttemptOutcome, Job, JobId, JobKind, JobState};
 use serde_json::Value;
 use tempfile::TempDir;
@@ -81,11 +80,24 @@ fn fake_metrics(
     }
 }
 
-fn write_fixture(base: &Path, job: &Job, metrics: &JobMetrics) -> JobStore {
-    let store = JobStore::with_base(base.to_path_buf()).expect("store");
-    let dir = store.create(job).expect("create job");
-    dir.write_metrics(metrics).expect("write metrics");
-    store
+/// Writes a `job.json` + `metrics.json` pair into `<base>/<job-id>/` without
+/// going through `JobStore`. The `plan-executor jobs metrics` CLI reads
+/// these by file shape only, so the on-disk layout (`base/<id>/{job,metrics}.json`)
+/// is what matters — bypassing `JobStore::create` keeps the test free of
+/// `JobStore`-internal plumbing while still exercising the same wire format.
+fn write_fixture(base: &Path, job: &Job, metrics: &JobMetrics) {
+    let dir = base.join(&job.id.0);
+    fs::create_dir_all(&dir).expect("job dir");
+    fs::write(
+        dir.join("job.json"),
+        serde_json::to_string_pretty(job).expect("serialize job"),
+    )
+    .expect("write job.json");
+    fs::write(
+        dir.join("metrics.json"),
+        serde_json::to_string_pretty(metrics).expect("serialize metrics"),
+    )
+    .expect("write metrics.json");
 }
 
 fn run_metrics_json(home: &Path, args: &[&str]) -> (bool, String, String) {
@@ -136,22 +148,23 @@ fn iso_offset_days(days: i64) -> String {
 // Per-job metrics writer tests (3)
 // ============================================================
 
+/// Round-trip a `JobMetrics` instance through JSON file IO using the same
+/// serde shape `JobDir::write_metrics` / `read_metrics` use, then return the
+/// reparsed value. Bypasses `JobStore` so the test stays focused on
+/// `JobMetrics` semantics.
+fn round_trip_metrics(metrics: &JobMetrics) -> JobMetrics {
+    let tmp = TempDir::new().expect("tempdir");
+    let path = tmp.path().join("metrics.json");
+    fs::write(&path, serde_json::to_string_pretty(metrics).expect("serialize")).expect("write");
+    let raw = fs::read_to_string(&path).expect("read");
+    serde_json::from_str(&raw).expect("parse")
+}
+
 #[test]
 fn write_metrics_for_empty_job_persists_zero_counters() {
-    let tmp = TempDir::new().expect("tempdir");
-    let store = JobStore::with_base(tmp.path().to_path_buf()).expect("store");
-    let job = make_job(
-        "job-empty",
-        plan_kind(),
-        "2026-04-28T10:00:00Z",
-        JobState::Succeeded,
-    );
-    let dir = store.create(&job).expect("create");
-    let mut metrics = JobMetrics::new(job.id.clone());
+    let mut metrics = JobMetrics::new(JobId("job-empty".to_string()));
     metrics.finalize();
-
-    dir.write_metrics(&metrics).expect("write");
-    let read_back: JobMetrics = dir.read_metrics().expect("read").expect("Some");
+    let read_back = round_trip_metrics(&metrics);
 
     let observed = (
         read_back.attempts_total,
@@ -165,22 +178,11 @@ fn write_metrics_for_empty_job_persists_zero_counters() {
 
 #[test]
 fn write_metrics_for_single_success_records_one_outcome() {
-    let tmp = TempDir::new().expect("tempdir");
-    let store = JobStore::with_base(tmp.path().to_path_buf()).expect("store");
-    let job = make_job(
-        "job-single",
-        plan_kind(),
-        "2026-04-28T10:00:00Z",
-        JobState::Succeeded,
-    );
-    let dir = store.create(&job).expect("create");
-    let mut metrics = JobMetrics::new(job.id.clone());
+    let mut metrics = JobMetrics::new(JobId("job-single".to_string()));
     metrics.record_step();
     metrics.record_attempt(&AttemptOutcome::Success, None);
     metrics.finalize();
-
-    dir.write_metrics(&metrics).expect("write");
-    let read_back: JobMetrics = dir.read_metrics().expect("read").expect("Some");
+    let read_back = round_trip_metrics(&metrics);
 
     let mut expected_outcomes = HashMap::new();
     expected_outcomes.insert(AttemptOutcomeKind::Success, 1u32);
@@ -194,20 +196,11 @@ fn write_metrics_for_single_success_records_one_outcome() {
 
 #[test]
 fn write_metrics_for_multi_attempt_records_mixed_outcomes_and_recoveries() {
-    let tmp = TempDir::new().expect("tempdir");
-    let store = JobStore::with_base(tmp.path().to_path_buf()).expect("store");
-    let job = make_job(
-        "job-multi",
-        plan_kind(),
-        "2026-04-28T10:00:00Z",
-        JobState::Succeeded,
-    );
-    let dir = store.create(&job).expect("create");
     let policy = RecoveryPolicy::RetryTransient {
         max: 3,
         backoff: Backoff::Fixed { ms: 10 },
     };
-    let mut metrics = JobMetrics::new(job.id.clone());
+    let mut metrics = JobMetrics::new(JobId("job-multi".to_string()));
     metrics.record_step();
     let transient = AttemptOutcome::TransientInfra {
         error: "rate".to_string(),
@@ -216,9 +209,7 @@ fn write_metrics_for_multi_attempt_records_mixed_outcomes_and_recoveries() {
     metrics.record_attempt(&transient, Some(&policy));
     metrics.record_attempt(&AttemptOutcome::Success, None);
     metrics.finalize();
-    dir.write_metrics(&metrics).expect("write");
-
-    let read_back: JobMetrics = dir.read_metrics().expect("read").expect("Some");
+    let read_back = round_trip_metrics(&metrics);
 
     let mut expected_outcomes = HashMap::new();
     expected_outcomes.insert(AttemptOutcomeKind::TransientInfra, 2u32);

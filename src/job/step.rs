@@ -25,11 +25,6 @@ pub trait Step: Send + Sync {
     /// Recovery policy applied when this step's attempt outcome warrants it.
     fn recovery_policy(&self) -> RecoveryPolicy;
 
-    /// Whether the orchestrator should checkpoint state before running.
-    fn checkpoint_before(&self) -> bool {
-        true
-    }
-
     /// Run the step against the given context, returning the attempt outcome.
     async fn run(&self, ctx: &mut StepContext) -> AttemptOutcome;
 }

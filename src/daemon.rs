@@ -16,7 +16,6 @@ use crate::jobs::{JobMetadata, JobStatus};
 pub struct DaemonState {
     #[allow(dead_code)]
     pub config: Config,
-    pub agents: crate::config::AgentConfig,
     pub running_jobs: HashMap<String, JobMetadata>, // job_id -> metadata
     pub history: Vec<JobMetadata>,
     /// Per-job raw output buffers (last N lines)
@@ -199,7 +198,6 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
         .collect();
     let state = Arc::new(Mutex::new(DaemonState {
         config: config.clone(),
-        agents: config.agents.clone(),
         running_jobs: HashMap::new(),
         history: history_on_start,
         job_output: HashMap::new(),
@@ -326,17 +324,30 @@ impl SchedulerHooks {
         success: bool,
         can_fail: bool,
         stdout_chars: usize,
+        stderr: &str,
     ) {
         let line = if success {
             format!(
                 "⏺ [plan-executor] sub-agent {index} done ({stdout_chars} chars)"
             )
-        } else if can_fail {
-            format!(
-                "⏺ [plan-executor] sub-agent {index} skipped (can-fail): non-zero exit"
-            )
         } else {
-            format!("⏺ [plan-executor] sub-agent {index} failed: non-zero exit")
+            // Surface the first non-empty stderr line so failure context isn't
+            // hidden in disk artifacts. Fall back to a generic message when
+            // nothing was captured (e.g. spawn-failure path that only sets a
+            // synthetic stderr).
+            let detail = stderr
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .unwrap_or("non-zero exit");
+            if can_fail {
+                format!(
+                    "⏺ [plan-executor] sub-agent {index} skipped (can-fail): {detail}"
+                )
+            } else {
+                format!("⏺ [plan-executor] sub-agent {index} failed: {detail}")
+            }
         };
         self.publish_display_line(line);
     }

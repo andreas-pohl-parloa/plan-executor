@@ -13,7 +13,6 @@ mod proctree;
 mod remote;
 mod schema;
 mod scheduler;
-mod supervisor;
 mod validate;
 
 pub use config::Config;

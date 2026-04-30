@@ -80,15 +80,6 @@ impl JobMetadata {
         self.job_dir().join("metadata.json")
     }
 
-    /// Rendered display lines (sjv + [plan-executor] messages) for `output` CLI.
-    pub fn display_path(&self) -> PathBuf {
-        self.job_dir().join("display.log")
-    }
-
-    pub fn output_path(&self) -> PathBuf {
-        self.job_dir().join("output.jsonl")
-    }
-
     /// Persists metadata to disk.
     pub fn save(&self) -> Result<()> {
         let dir = self.job_dir();

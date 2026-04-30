@@ -402,7 +402,13 @@ pub async fn run_wave_execution(
 
         if let Some(hooks) = ctx.daemon_hooks.as_ref() {
             for r in &results {
-                hooks.announce_subagent_done(r.index, r.success, r.can_fail, r.stdout.len());
+                hooks.announce_subagent_done(
+                    r.index,
+                    r.success,
+                    r.can_fail,
+                    r.stdout.len(),
+                    &r.stderr,
+                );
             }
         }
 

@@ -169,20 +169,6 @@ pub fn create_repo(repo: &str) -> Result<()> {
     Ok(())
 }
 
-/// Creates the `execution` GitHub Actions environment on the repo.
-/// Idempotent — succeeds if the environment already exists.
-pub fn ensure_environment(repo: &str) -> Result<()> {
-    // GitHub REST API: PUT /repos/{owner}/{repo}/environments/{name}
-    // This creates or updates the environment.
-    run_gh(&[
-        "api",
-        &format!("repos/{}/environments/execution", repo),
-        "-X",
-        "PUT",
-    ])?;
-    Ok(())
-}
-
 /// The embedded workflow YAML for the execution repo.
 const EXECUTE_PLAN_WORKFLOW: &str = include_str!("../docs/remote-execution/execute-plan.yml");
 
@@ -499,103 +485,6 @@ pub fn trigger_remote_execution(
     ])?;
 
     Ok(pr_url.trim().to_string())
-}
-
-/// Queries recent remote execution PRs from the execution repo.
-///
-/// # Errors
-///
-/// Returns an error if the `gh` command or JSON parsing fails.
-pub fn list_remote_executions(remote_repo: &str) -> Result<Vec<RemoteJob>> {
-    let output = run_gh(&[
-        "pr",
-        "list",
-        "--repo",
-        remote_repo,
-        "--state",
-        "all",
-        "--limit",
-        "20",
-        "--json",
-        "number,title,state,labels,createdAt,closedAt",
-    ])?;
-    let prs: Vec<serde_json::Value> = serde_json::from_str(&output)?;
-    let now = chrono::Utc::now();
-    let mut jobs = Vec::new();
-    for pr in prs {
-        let number = pr["number"].as_u64().unwrap_or(0);
-        let title = pr["title"].as_str().unwrap_or("");
-        let state = pr["state"].as_str().unwrap_or("UNKNOWN");
-        let labels: Vec<&str> = pr["labels"]
-            .as_array()
-            .map(|arr| arr.iter().filter_map(|l| l["name"].as_str()).collect())
-            .unwrap_or_default();
-
-        // Parse title: "exec: plan-foo.md @ owner/repo"
-        let (plan_name, target) = if let Some(rest) = title.strip_prefix("exec: ") {
-            if let Some((plan, tgt)) = rest.split_once(" @ ") {
-                (plan.to_string(), tgt.to_string())
-            } else {
-                (rest.to_string(), "?".to_string())
-            }
-        } else {
-            (title.to_string(), "?".to_string())
-        };
-
-        let status = match state {
-            "OPEN" => "running".to_string(),
-            "CLOSED" | "MERGED" => {
-                if labels.contains(&"succeeded") {
-                    "succeeded".to_string()
-                } else if labels.contains(&"failed") {
-                    "failed".to_string()
-                } else {
-                    "closed".to_string()
-                }
-            }
-            other => other.to_lowercase(),
-        };
-
-        // Duration: for open PRs it's wall-clock age from createdAt;
-        // for closed/merged PRs it's closedAt - createdAt. `gh` emits
-        // RFC-3339 timestamps.
-        let created_at = pr["createdAt"]
-            .as_str()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
-        let closed_at = pr["closedAt"]
-            .as_str()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
-        let duration_seconds = created_at.map(|start| {
-            let end = closed_at
-                .map(|c| c.with_timezone(&chrono::Utc))
-                .unwrap_or(now);
-            (end - start.with_timezone(&chrono::Utc))
-                .num_seconds()
-                .max(0) as u64
-        });
-
-        jobs.push(RemoteJob {
-            number,
-            plan_name,
-            status,
-            target,
-            duration_seconds,
-        });
-    }
-    Ok(jobs)
-}
-
-/// A remote execution job entry parsed from a GitHub PR.
-#[derive(Debug)]
-pub struct RemoteJob {
-    pub number: u64,
-    pub plan_name: String,
-    pub status: String,
-    pub target: String,
-    /// Wall-clock duration in seconds. `None` if the PR lacks a valid
-    /// `createdAt` timestamp. For open PRs this is age since creation;
-    /// for closed/merged PRs it's the time between creation and close.
-    pub duration_seconds: Option<u64>,
 }
 
 /// Queries the state and labels of a PR by number. Returns `(state, labels)`.

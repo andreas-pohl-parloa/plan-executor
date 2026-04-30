@@ -206,33 +206,9 @@ pub fn watchdog_verdict(
     }
 }
 
-/// Expands a leading `~/` to the home directory.
-pub fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        dirs::home_dir()
-            .expect("home dir must exist")
-            .join(rest)
-    } else {
-        PathBuf::from(path)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_expand_tilde_replaces_home() {
-        let result = expand_tilde("~/foo/bar");
-        let home = dirs::home_dir().unwrap();
-        assert_eq!(result, home.join("foo/bar"));
-    }
-
-    #[test]
-    fn test_expand_tilde_no_tilde() {
-        let result = expand_tilde("/absolute/path");
-        assert_eq!(result, std::path::PathBuf::from("/absolute/path"));
-    }
 
     #[test]
     fn test_config_default() {
