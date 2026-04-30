@@ -61,20 +61,36 @@ pub enum Commands {
     },
     /// Interactive wizard to configure remote execution secrets
     RemoteSetup,
-    /// Validate a compiled tasks.json manifest against the schema and semantic rules.
-    Validate {
-        /// Path to tasks.json
-        tasks_json: PathBuf,
-    },
-    /// Validate a JSON document against the sub-agent handoffs schema.
+    /// Validate a JSON document against one of the bundled schemas.
     ///
-    /// Skills that emit `state_updates.handoffs[]` from a
-    /// `waiting_for_handoffs` envelope can self-check their output by piping
-    /// the array (or a JSON file containing one) through this command before
-    /// printing it. Exits 0 with `VALID:` on stdout when the input matches;
-    /// exits 1 with one or more `ERROR:` lines on stderr when it doesn't.
-    /// Mirrors the schema embedded in `run-reviewer-team-non-interactive`'s
-    /// output schema.
+    /// Without `--schema`, the path is interpreted as a `tasks.json`
+    /// manifest and both schema and semantic rules are checked
+    /// (back-compat: matches the old `plan-executor validate <tasks-json>`
+    /// surface). With `--schema=<id>`, the input is validated against the
+    /// named schema only — useful for skills that need to self-check their
+    /// output envelope before printing it. Exits `0` with `VALID:` on
+    /// stdout when the input matches; exits `1` with one or more `ERROR:`
+    /// lines on stderr when it doesn't. Pass `--list-schemas` to print
+    /// every recognized id and exit. The path argument may be `-` to read
+    /// from stdin (only honored when `--schema` is set; the legacy tasks
+    /// path requires an on-disk manifest because the semantic checks
+    /// resolve sibling files).
+    Validate {
+        /// Path to the JSON document to validate. Use `-` for stdin
+        /// (only allowed in combination with `--schema`).
+        path: Option<PathBuf>,
+        /// Schema id, e.g. `tasks`, `handoffs`, or
+        /// `helper-output:run-reviewer-team`. When omitted the input is
+        /// validated as a tasks manifest with semantic checks.
+        #[arg(long)]
+        schema: Option<String>,
+        /// Print every bundled schema id and exit.
+        #[arg(long, conflicts_with_all = ["path", "schema"])]
+        list_schemas: bool,
+    },
+    /// Deprecated alias for `validate --schema=handoffs <path>`. Kept so
+    /// existing skill prompts continue to work.
+    #[command(hide = true)]
     ValidateHandoffs {
         /// Path to a JSON file containing the handoffs array. Use `-` to
         /// read from stdin.
@@ -408,7 +424,53 @@ pub(crate) fn read_manifest_plan_block(
     Ok((PathBuf::from(plan_path), status, execution_mode))
 }
 
-fn run_validate(tasks_json: &std::path::Path) {
+/// Dispatches `plan-executor validate` based on the parsed flags.
+///
+/// Three modes:
+/// - `--list-schemas` prints every bundled id and exits 0.
+/// - `--schema=<id>` validates `path` (or stdin if `path == "-"`) against
+///   the named schema only. No semantic checks.
+/// - Neither flag set: legacy mode, treats `path` as a tasks.json manifest
+///   and applies both schema + semantic rules. Stdin is rejected here
+///   because the semantic pass needs a manifest dir.
+fn run_validate(
+    path: Option<&Path>,
+    schema_id: Option<&str>,
+    list_schemas: bool,
+) {
+    if list_schemas {
+        for id in crate::schema_registry::ALL_IDS {
+            println!("{}", id.as_str());
+        }
+        return;
+    }
+
+    let path = match path {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "ERROR: missing path argument (or pass --list-schemas to enumerate ids)"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    match schema_id {
+        Some(id) => run_validate_against_schema(path, id),
+        None => run_validate_tasks_manifest(path),
+    }
+}
+
+/// Legacy mode: `path` is a tasks.json manifest. Stdin is not accepted
+/// because the semantic pass resolves sibling files relative to the
+/// manifest directory.
+fn run_validate_tasks_manifest(tasks_json: &Path) {
+    if tasks_json == Path::new("-") {
+        eprintln!(
+            "ERROR: --schema is required when reading from stdin; the tasks manifest semantic pass needs a manifest directory"
+        );
+        std::process::exit(1);
+    }
     let raw = match std::fs::read_to_string(tasks_json) {
         Ok(s) => s,
         Err(e) => {
@@ -448,39 +510,36 @@ fn run_validate(tasks_json: &std::path::Path) {
     std::process::exit(1);
 }
 
-/// Embedded copy of `src/schemas/handoffs.schema.json`. Compiled once per
-/// process via [`compiled_handoffs_validator`]; the path-based `$id` in the
-/// schema is informational and not resolved at runtime.
-const HANDOFFS_SCHEMA: &str = include_str!("schemas/handoffs.schema.json");
+/// Generic mode: validate `path` (or stdin when `path == "-"`) against the
+/// schema named by `schema_id`. Mirrors the exit-code contract of the
+/// legacy mode so pipeline scripts can treat both interchangeably.
+fn run_validate_against_schema(path: &Path, schema_id: &str) {
+    let id = match crate::schema_registry::SchemaId::parse(schema_id) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            std::process::exit(1);
+        }
+    };
 
-/// Validates `handoffs_json` against the bundled handoffs schema and exits
-/// `0` (with `VALID: <path>`) on success or `1` (with one or more
-/// `ERROR:` lines on stderr) on failure. Reads from stdin when `path` is
-/// `-`. Mirrors the `plan-executor validate` exit-code convention so
-/// pipeline scripts can chain both.
-fn run_validate_handoffs(handoffs_json: &Path) {
-    let raw = if handoffs_json == Path::new("-") {
+    let (raw, label) = if path == Path::new("-") {
         use std::io::Read as _;
         let mut buf = String::new();
         if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
             eprintln!("ERROR: cannot read stdin: {e}");
             std::process::exit(1);
         }
-        buf
+        (buf, "<stdin>".to_string())
     } else {
-        match std::fs::read_to_string(handoffs_json) {
-            Ok(s) => s,
+        match std::fs::read_to_string(path) {
+            Ok(s) => (s, path.display().to_string()),
             Err(e) => {
-                eprintln!("ERROR: cannot read {}: {e}", handoffs_json.display());
+                eprintln!("ERROR: cannot read {}: {e}", path.display());
                 std::process::exit(1);
             }
         }
     };
-    let label = if handoffs_json == Path::new("-") {
-        "<stdin>".to_string()
-    } else {
-        handoffs_json.display().to_string()
-    };
+
     let value: serde_json::Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(e) => {
@@ -489,10 +548,10 @@ fn run_validate_handoffs(handoffs_json: &Path) {
         }
     };
 
-    let validator = match compiled_handoffs_validator() {
+    let validator = match crate::schema_registry::compiled(id) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("ERROR: embedded handoffs schema failed to compile: {e}");
+            eprintln!("ERROR: {e}");
             std::process::exit(1);
         }
     };
@@ -501,27 +560,13 @@ fn run_validate_handoffs(handoffs_json: &Path) {
         .map(|err| format!("at {}: {err}", err.instance_path()))
         .collect();
     if errors.is_empty() {
-        println!("VALID: {label}");
+        println!("VALID: {label} (schema: {})", id.as_str());
         return;
     }
     for e in &errors {
         eprintln!("ERROR: {e}");
     }
     std::process::exit(1);
-}
-
-fn compiled_handoffs_validator() -> Result<&'static jsonschema::Validator, String> {
-    use std::sync::OnceLock;
-    static HANDOFFS: OnceLock<jsonschema::Validator> = OnceLock::new();
-    if let Some(v) = HANDOFFS.get() {
-        return Ok(v);
-    }
-    let schema_json: serde_json::Value = serde_json::from_str(HANDOFFS_SCHEMA)
-        .map_err(|e| format!("schema is not valid JSON: {e}"))?;
-    let validator = jsonschema::validator_for(&schema_json)
-        .map_err(|e| format!("schema does not compile: {e}"))?;
-    let _ = HANDOFFS.set(validator);
-    Ok(HANDOFFS.get().expect("just inserted"))
 }
 
 fn run_compile_fix_waves(plan: &Path, execution_root: &Path, findings_json: &Path) {
@@ -989,12 +1034,16 @@ pub fn run() {
             daemon_job_request("unpause", job_id);
             return;
         }
-        Commands::Validate { tasks_json } => {
-            run_validate(tasks_json);
+        Commands::Validate {
+            path,
+            schema,
+            list_schemas,
+        } => {
+            run_validate(path.as_deref(), schema.as_deref(), *list_schemas);
             return;
         }
         Commands::ValidateHandoffs { handoffs_json } => {
-            run_validate_handoffs(handoffs_json);
+            run_validate_against_schema(handoffs_json, "handoffs");
             return;
         }
         Commands::CompileFixWaves {

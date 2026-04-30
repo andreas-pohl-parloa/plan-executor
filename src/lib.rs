@@ -21,5 +21,6 @@ pub mod plan;
 pub mod proctree;
 pub mod remote;
 pub mod schema;
+pub mod schema_registry;
 pub mod scheduler;
 pub mod validate;
