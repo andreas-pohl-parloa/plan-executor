@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.44.0] - 2026-04-30
+
+### Features
+
+- **jobs:** Show wave X/Y in PROGRESS when step is wave_execution (#29) ([93cb54e](https://github.com/andreas-pohl-parloa/plan-executor/commit/93cb54e6871fc824251f91575f348a74e1e3ee57))
 ## [0.43.2] - 2026-04-30
 
 ### Miscellaneous
