@@ -369,48 +369,21 @@ pub async fn run_wave_execution(
             "dispatching wave",
         );
 
-        // Wire daemon hooks (when present) so the daemon's `output -f`
-        // follower sees per-sub-agent JSONL streamed live, KillJob can
-        // SIGKILL the sub-agent process groups, and replay can render
-        // the persisted JSONL through sjv. Foreground runs leave hooks
-        // unset and pass `None` straight through, preserving the prior
-        // one-shot dispatch behavior.
-        let (subagent_tx, pgid_tx) = match ctx.daemon_hooks.as_ref() {
-            Some(hooks) => {
-                let dispatch_num = hooks
-                    .announce_wave_dispatch(dispatched, &wave.kind)
-                    .await;
-                (
-                    Some(hooks.spawn_subagent_writer(dispatch_num)),
-                    Some(hooks.spawn_pgid_registrar()),
-                )
-            }
-            None => (None, None),
-        };
-
-        let (results, _pgids) = handoff::dispatch_all(
+        // Dispatch the wave with up to SUBAGENT_TRANSIENT_RETRIES retries
+        // for required sub-agents whose stderr looks transient (timeout,
+        // rate-limit, network blip, spawn failure). Each retry only
+        // re-runs the failed required handoffs; successful results and
+        // can-fail skips from the first pass are preserved. Foreground
+        // runs leave daemon_hooks unset, so the underlying dispatch_all
+        // call still receives `None` channels and behaves as before.
+        let mut results = dispatch_wave_with_retries(
             handoffs,
-            &config.agents.claude,
-            &config.agents.codex,
-            &config.agents.gemini,
-            &config.agents.bash,
-            None,
-            pgid_tx,
-            subagent_tx,
+            &wave.kind,
+            &config,
+            ctx.daemon_hooks.as_ref(),
         )
         .await;
-
-        if let Some(hooks) = ctx.daemon_hooks.as_ref() {
-            for r in &results {
-                hooks.announce_subagent_done(
-                    r.index,
-                    r.success,
-                    r.can_fail,
-                    r.stdout.len(),
-                    &r.stderr,
-                );
-            }
-        }
+        results.sort_by_key(|r| r.index);
 
         let mut succeeded = 0_usize;
         let mut failed_required: Vec<usize> = Vec::new();
@@ -448,6 +421,184 @@ pub async fn run_wave_execution(
 
     let _ = write_step_summary(ctx, &wave_outcomes, true);
     AttemptOutcome::Success
+}
+
+/// Maximum retry attempts for a required sub-agent whose first dispatch
+/// failed with a transient-looking stderr signal. Set conservatively — most
+/// transient failures clear within one retry; more attempts amplify cost
+/// without meaningful uplift in success rate.
+const SUBAGENT_TRANSIENT_RETRIES: u32 = 2;
+
+/// Per-attempt fixed backoff between sub-agent retries. Long enough to let
+/// transient signals clear (rate-limit windows, brief network outages), short
+/// enough to not stretch a healthy run. The cumulative wait at the cap is
+/// `SUBAGENT_TRANSIENT_RETRIES * SUBAGENT_RETRY_BACKOFF_SECS = 30s`.
+const SUBAGENT_RETRY_BACKOFF_SECS: u64 = 15;
+
+/// Dispatches `handoffs` once, then re-dispatches required sub-agents whose
+/// first run looks transient (timeout / rate-limit / network blip / spawn
+/// failure) up to [`SUBAGENT_TRANSIENT_RETRIES`] times. Returns a unified
+/// `Vec<HandoffResult>` covering every original handoff.
+///
+/// Successful results and can-fail skips from the first dispatch are
+/// preserved verbatim — only `success: false && !can_fail` results that
+/// match the transient heuristic are retried, and only those handoffs are
+/// re-dispatched. Non-transient failures (semantic / hard-infra) fall
+/// through unchanged so wave-level failure semantics are unaffected.
+async fn dispatch_wave_with_retries(
+    handoffs: Vec<handoff::Handoff>,
+    wave_kind: &str,
+    config: &Config,
+    hooks: Option<&std::sync::Arc<crate::daemon::SchedulerHooks>>,
+) -> Vec<handoff::HandoffResult> {
+    let dispatched = handoffs.len();
+    let original: Vec<handoff::Handoff> = handoffs.clone();
+
+    // First pass — full dispatch with daemon-hooked observability when
+    // present.
+    let (mut results, _pgids) = run_dispatch_pass(handoffs, config, hooks, dispatched, wave_kind).await;
+    if let Some(hooks) = hooks {
+        for r in &results {
+            hooks.announce_subagent_done(
+                r.index,
+                r.success,
+                r.can_fail,
+                r.stdout.len(),
+                &r.stderr,
+            );
+        }
+    }
+
+    let mut attempt: u32 = 1;
+    while attempt <= SUBAGENT_TRANSIENT_RETRIES {
+        let retry_indices: Vec<usize> = results
+            .iter()
+            .filter(|r| !r.success && !r.can_fail && looks_transient(&r.stderr, &r.stdout))
+            .map(|r| r.index)
+            .collect();
+        if retry_indices.is_empty() {
+            break;
+        }
+        attempt += 1;
+        let retry_handoffs: Vec<handoff::Handoff> = original
+            .iter()
+            .filter(|h| retry_indices.contains(&h.index))
+            .cloned()
+            .collect();
+        if let Some(hooks) = hooks {
+            hooks.announce_wave_retry(retry_indices.clone(), wave_kind, attempt - 1).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(SUBAGENT_RETRY_BACKOFF_SECS)).await;
+        let (retry_results, _) = run_dispatch_pass(
+            retry_handoffs,
+            config,
+            hooks,
+            retry_indices.len(),
+            wave_kind,
+        )
+        .await;
+        if let Some(hooks) = hooks {
+            for r in &retry_results {
+                hooks.announce_subagent_done(
+                    r.index,
+                    r.success,
+                    r.can_fail,
+                    r.stdout.len(),
+                    &r.stderr,
+                );
+            }
+        }
+        // Replace each retried slot's result with the new outcome.
+        for r in retry_results {
+            if let Some(slot) = results.iter_mut().find(|x| x.index == r.index) {
+                *slot = r;
+            }
+        }
+    }
+    results
+}
+
+/// Inner dispatch helper shared by the first pass and retry passes. Wires
+/// the daemon hooks (when present) and forwards to `handoff::dispatch_all`.
+async fn run_dispatch_pass(
+    handoffs: Vec<handoff::Handoff>,
+    config: &Config,
+    hooks: Option<&std::sync::Arc<crate::daemon::SchedulerHooks>>,
+    count: usize,
+    wave_kind: &str,
+) -> (Vec<handoff::HandoffResult>, Vec<u32>) {
+    let (subagent_tx, pgid_tx) = match hooks {
+        Some(hooks) => {
+            let dispatch_num = hooks.announce_wave_dispatch(count, wave_kind).await;
+            (
+                Some(hooks.spawn_subagent_writer(dispatch_num)),
+                Some(hooks.spawn_pgid_registrar()),
+            )
+        }
+        None => (None, None),
+    };
+    handoff::dispatch_all(
+        handoffs,
+        &config.agents.claude,
+        &config.agents.codex,
+        &config.agents.gemini,
+        &config.agents.bash,
+        None,
+        pgid_tx,
+        subagent_tx,
+    )
+    .await
+}
+
+/// Heuristic: does this failed handoff's captured stdout/stderr look like a
+/// transient signal worth retrying? Matches against a curated set of phrases
+/// covering the most common ephemeral failure modes:
+///
+/// - HTTP 429 / 5xx surfaced by Anthropic / OpenAI / Google APIs
+/// - rate-limit, throttle, quota exceeded
+/// - network errors (connection reset, refused, broken pipe, DNS)
+/// - subprocess timeouts (the helper subprocess timeout language used by
+///   `helper.rs` and the kill-on-timeout path in `handoff.rs`)
+/// - spawn failures (binary missing on PATH, fork error)
+///
+/// Lower-cases the input once and runs substring matches in a single pass.
+/// Conservative by design: false negatives just leave the failure as-is
+/// (current behavior); false positives waste a retry slot but are bounded
+/// by [`SUBAGENT_TRANSIENT_RETRIES`].
+fn looks_transient(stderr: &str, stdout: &str) -> bool {
+    let blob = format!("{stderr}\n{stdout}").to_lowercase();
+    const SIGNALS: &[&str] = &[
+        // HTTP / API
+        " 429",
+        "rate limit",
+        "rate_limit",
+        "rate-limited",
+        "rate limited",
+        "throttle",
+        "quota",
+        "overloaded",
+        "service unavailable",
+        " 502",
+        " 503",
+        " 504",
+        // Network
+        "connection reset",
+        "connection refused",
+        "broken pipe",
+        "network unreachable",
+        "temporary failure in name resolution",
+        "could not resolve host",
+        "tls handshake",
+        // Timeouts
+        "timed out",
+        "timeout",
+        "deadline exceeded",
+        // Spawn
+        "no such file or directory",
+        "failed to spawn",
+        "fork failed",
+    ];
+    SIGNALS.iter().any(|needle| blob.contains(needle))
 }
 
 /// Builds the [`Handoff`] vector for a single wave from its [`TaskSpec`]s.
@@ -744,6 +895,56 @@ mod tests {
         assert!(matches!(handoffs[1].agent_type, AgentType::Codex));
         assert!(!handoffs[0].can_fail);
         assert!(handoffs[1].can_fail);
+    }
+
+    #[test]
+    fn looks_transient_matches_rate_limit_429() {
+        assert!(looks_transient("Anthropic 429: rate limit exceeded\n", ""));
+        assert!(looks_transient("HTTP 429 Too Many Requests", ""));
+    }
+
+    #[test]
+    fn looks_transient_matches_5xx_codes() {
+        assert!(looks_transient("upstream returned 503", ""));
+        assert!(looks_transient("got 504 gateway timeout", ""));
+        assert!(looks_transient("API 502 bad gateway", ""));
+    }
+
+    #[test]
+    fn looks_transient_matches_network_errors() {
+        assert!(looks_transient("connection reset by peer", ""));
+        assert!(looks_transient("connection refused (errno 61)", ""));
+        assert!(looks_transient("could not resolve host: api.anthropic.com", ""));
+    }
+
+    #[test]
+    fn looks_transient_matches_timeouts() {
+        assert!(looks_transient("request timed out after 60s", ""));
+        assert!(looks_transient("DEADLINE EXCEEDED", ""));
+        assert!(looks_transient("operation timeout", ""));
+    }
+
+    #[test]
+    fn looks_transient_matches_spawn_errors() {
+        assert!(looks_transient("execvp: no such file or directory", ""));
+        assert!(looks_transient("failed to spawn subprocess", ""));
+    }
+
+    #[test]
+    fn looks_transient_returns_false_for_semantic_failures() {
+        // Semantic failures (e.g. non-zero exit from claude reporting a
+        // failed assertion or schema-violation) should NOT be retried.
+        assert!(!looks_transient("assertion failed: expected 1, got 0", ""));
+        assert!(!looks_transient("plan validation failed: missing goal", ""));
+        assert!(!looks_transient("", "wave 1 task 2 emitted invalid output"));
+    }
+
+    #[test]
+    fn looks_transient_inspects_both_streams() {
+        // The signal can land in stdout (e.g. claude prints rate-limit
+        // banner before exiting) or stderr — check both.
+        assert!(looks_transient("", "Rate limit reached for tier 1"));
+        assert!(looks_transient("Connection refused", ""));
     }
 
     #[test]

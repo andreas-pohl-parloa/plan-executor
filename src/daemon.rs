@@ -352,6 +352,22 @@ impl SchedulerHooks {
         self.publish_display_line(line);
     }
 
+    /// Persists + broadcasts a wave-retry banner naming which sub-agent
+    /// indices are being re-dispatched after a transient failure. Distinct
+    /// from `announce_wave_dispatch` so `output -f` and `jobs` can show
+    /// retries inline instead of conflating them with a fresh wave.
+    pub async fn announce_wave_retry(&self, indices: Vec<usize>, kind: &str, attempt: u32) {
+        let pretty = indices
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let line = format!(
+            "⏺ [plan-executor] retrying sub-agent(s) {pretty} (kind: {kind}, attempt {attempt})"
+        );
+        self.publish_display_line(line);
+    }
+
     /// Spawns a fresh `spawn_subagent_writer` for one wave's `dispatch_all`
     /// and returns the sender half. Dropping the sender (i.e. once
     /// `dispatch_all` returns) closes the channel and the writer task
@@ -1048,11 +1064,17 @@ async fn run_rust_scheduler_steps(
         // Step boundary — count once per step before running attempts.
         metrics.record_step();
 
-        tracing::info!(step = step.name(), seq, "running step");
-        let outcome = step.run(&mut ctx).await;
-
         let policy = step.recovery_policy();
-        metrics.record_attempt(&outcome, Some(&policy));
+        let outcome = run_step_with_retries(
+            step.as_ref(),
+            &policy,
+            &mut ctx,
+            &mut metrics,
+            job_id,
+            seq,
+            state,
+        )
+        .await;
 
         let (ok, summary) = match &outcome {
             AttemptOutcome::Success => (true, "success".to_string()),
@@ -1149,6 +1171,113 @@ async fn run_rust_scheduler_steps(
     pipeline_ok
 }
 
+/// Runs a single step with the retry semantics encoded in `policy`.
+///
+/// Each attempt is recorded into `metrics` so the persisted aggregates
+/// reflect the true attempt count even when later attempts succeed. On
+/// retry, broadcasts a `step N (name) attempt X/Y after <reason>: <detail>`
+/// display line so `output -f` and `jobs` see the loop is in motion.
+///
+/// Honors:
+/// - `RetryTransient { max, backoff }` for `AttemptOutcome::TransientInfra`,
+///   sleeping for `backoff.delay(attempt)` between attempts.
+/// - `RetryProtocol { max, .. }` for `AttemptOutcome::ProtocolViolation`.
+///   Re-invokes the step without injecting corrective context (sampling
+///   roulette) — the corrective-prompt catalog is a future addition.
+///
+/// Other outcomes (`Success`, `Pending`, `HardInfra`, `SemanticMistake`,
+/// `SpecDrift`) short-circuit with no retry.
+async fn run_step_with_retries(
+    step: &dyn crate::job::step::Step,
+    policy: &crate::job::recovery::RecoveryPolicy,
+    ctx: &mut crate::job::step::StepContext,
+    metrics: &mut crate::job::metrics::JobMetrics,
+    job_id: &str,
+    seq: u32,
+    state: &Arc<Mutex<DaemonState>>,
+) -> crate::job::types::AttemptOutcome {
+    use crate::job::recovery::RecoveryPolicy;
+    use crate::job::types::AttemptOutcome;
+
+    let max_retries = match policy {
+        RecoveryPolicy::RetryTransient { max, .. } => *max,
+        RecoveryPolicy::RetryProtocol { max, .. } => *max,
+        _ => 0,
+    };
+
+    let mut attempt: u32 = 1;
+    loop {
+        ctx.attempt_n = attempt;
+        tracing::info!(
+            step = step.name(),
+            seq,
+            attempt,
+            "running step"
+        );
+        let outcome = step.run(ctx).await;
+        metrics.record_attempt(&outcome, Some(policy));
+
+        let retryable = match (&outcome, policy) {
+            (AttemptOutcome::TransientInfra { .. }, RecoveryPolicy::RetryTransient { .. }) => true,
+            (AttemptOutcome::ProtocolViolation { .. }, RecoveryPolicy::RetryProtocol { .. }) => true,
+            _ => false,
+        };
+        if !retryable || u32::from(max_retries) == 0 || attempt > u32::from(max_retries) {
+            return outcome;
+        }
+
+        let (reason_kind, detail) = match &outcome {
+            AttemptOutcome::TransientInfra { error } => ("transient_infra", error.clone()),
+            AttemptOutcome::ProtocolViolation { category, detail } => (
+                "protocol_violation",
+                format!("[{category}] {detail}"),
+            ),
+            _ => unreachable!("retryable matched non-retryable outcome"),
+        };
+        let total = u32::from(max_retries) + 1;
+        let next_attempt = attempt + 1;
+        let line = format!(
+            "⏺ [plan-executor] step {} ({}) attempt {}/{} after {}: {}",
+            seq,
+            step.name(),
+            next_attempt,
+            total,
+            reason_kind,
+            truncate_ellipsis(&detail, 160),
+        );
+        append_display(job_id, &line);
+        {
+            let mut st = state.lock().await;
+            st.job_last_activity.insert(job_id.to_string(), Instant::now());
+            st.job_display_output
+                .entry(job_id.to_string())
+                .or_default()
+                .push_back(line.clone());
+            let _ = st.event_tx.send(DaemonEvent::JobDisplayLine {
+                job_id: job_id.to_string(),
+                line,
+            });
+        }
+
+        if let RecoveryPolicy::RetryTransient { backoff, .. } = policy {
+            let delay = backoff.delay(attempt);
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+        }
+        attempt = next_attempt;
+    }
+}
+
+fn truncate_ellipsis(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
 
 fn find_repo_root(path: &Path) -> Option<PathBuf> {
     let mut dir = if path.is_file() {
