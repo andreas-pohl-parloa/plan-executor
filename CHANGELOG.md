@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.49.0] - 2026-04-30
+
+### Features
+
+- Honor manifest flags — worktree creation, merge mode, code_review skip (#36) ([af40717](https://github.com/andreas-pohl-parloa/plan-executor/commit/af407176a4d9063b03778c9b2273277672a8a4ba))
 ## [0.48.0] - 2026-04-30
 
 ### Features
