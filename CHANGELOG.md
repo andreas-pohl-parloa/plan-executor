@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.50.0] - 2026-04-30
+
+### Features
+
+- **cli:** Generic schema registry + validate --schema=<id> (#38) ([7d42c17](https://github.com/andreas-pohl-parloa/plan-executor/commit/7d42c179c7be4a04e29fd5263900345ec6dc6373))
 ## [0.49.1] - 2026-04-30
 
 ### Bug Fixes
