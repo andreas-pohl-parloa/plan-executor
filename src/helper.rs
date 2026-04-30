@@ -508,41 +508,88 @@ fn parse_and_validate_output(
     }
 }
 
-/// Extracts the first balanced top-level JSON object from `stdout`.
+/// Extracts the helper response envelope from `stdout`.
 ///
-/// Helpers may print log lines around the envelope; we accept the first
-/// `{ ... }` block whose braces balance and treat the rest as preamble /
-/// trailer. Returns `None` if no balanced object is found.
+/// Helpers may print prose, descriptive object literals, or markdown around
+/// the envelope. We scan every balanced `{ ... }` block in `stdout` and
+/// return the first one that:
+///
+/// 1. Parses as JSON (tolerates `{ ... }` around the envelope but rejects
+///    e.g. JS-object-literal descriptions where keys aren't quoted).
+/// 2. Carries a top-level `"status"` key — the helper protocol mandates it
+///    on every envelope, so an object without `"status"` is by definition
+///    not the envelope.
+///
+/// When no candidate matches both, falls back to the first balanced block
+/// (so existing callers with prose-free output still work). The downstream
+/// schema validator catches genuine shape errors with a precise category.
 fn extract_json_envelope(stdout: &str) -> Option<&str> {
-    let bytes = stdout.as_bytes();
-    let start = bytes.iter().position(|b| *b == b'{')?;
-    let mut depth: usize = 0;
-    let mut in_string = false;
-    let mut escape = false;
-    for (idx, b) in bytes.iter().enumerate().skip(start) {
-        if in_string {
-            if escape {
-                escape = false;
-            } else if *b == b'\\' {
-                escape = true;
-            } else if *b == b'"' {
-                in_string = false;
-            }
-            continue;
+    let mut first_balanced: Option<&str> = None;
+    for candidate in balanced_object_blocks(stdout) {
+        if first_balanced.is_none() {
+            first_balanced = Some(candidate);
         }
-        match *b {
-            b'"' => in_string = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&stdout[start..=idx]);
-                }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
+            if value.get("status").is_some() {
+                return Some(candidate);
             }
-            _ => {}
         }
     }
-    None
+    first_balanced
+}
+
+/// Yields every balanced `{ ... }` substring in `stdout` in order, treating
+/// quoted strings opaquely so braces inside string literals don't count.
+/// Used by [`extract_json_envelope`] to enumerate candidate envelopes.
+fn balanced_object_blocks(stdout: &str) -> impl Iterator<Item = &str> {
+    let bytes = stdout.as_bytes();
+    let mut cursor: usize = 0;
+    std::iter::from_fn(move || {
+        while cursor < bytes.len() {
+            let start = bytes
+                .iter()
+                .enumerate()
+                .skip(cursor)
+                .find(|(_, b)| **b == b'{')
+                .map(|(i, _)| i)?;
+            let mut depth: usize = 0;
+            let mut in_string = false;
+            let mut escape = false;
+            let mut end_inclusive: Option<usize> = None;
+            for (idx, b) in bytes.iter().enumerate().skip(start) {
+                if in_string {
+                    if escape {
+                        escape = false;
+                    } else if *b == b'\\' {
+                        escape = true;
+                    } else if *b == b'"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                match *b {
+                    b'"' => in_string = true,
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end_inclusive = Some(idx);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match end_inclusive {
+                Some(end) => {
+                    cursor = end + 1;
+                    return Some(&stdout[start..=end]);
+                }
+                None => return None,
+            }
+        }
+        None
+    })
 }
 
 /// Categorizes a schema-violation instance path into a stable short tag the
@@ -814,4 +861,68 @@ pub fn invoke_pr_finalize(
     let json = serialize_wrapper_input(&input)?;
     let raw = invoke_helper(HelperSkill::PrFinalize, json, ctx)?;
     decode_state_updates(raw)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_simple_envelope_when_no_prose() {
+        let stdout = r#"{"status":"success","next_step":"done","notes":"ok"}"#;
+        let env = extract_json_envelope(stdout).expect("envelope");
+        assert!(serde_json::from_str::<serde_json::Value>(env).is_ok());
+        assert!(env.contains("\"status\""));
+    }
+
+    #[test]
+    fn skips_descriptive_object_literal_before_real_envelope() {
+        // Reproduces the run-reviewer-team-non-interactive failure where Claude
+        // printed a JS-object-literal description of reviewer_set[0] before
+        // the actual JSON envelope. The descriptor parses neither as JSON nor
+        // contains a `status` key; the second balanced block is the real
+        // envelope and must win.
+        let stdout = r#"
+{ index: 1, name: claude, handoff_type: claude, required: true,
+  skill: rust-services:production-code-recipe + rust-services:test-code-recipe }
+
+{"status":"waiting_for_handoffs","next_step":"dispatch","notes":"ok",
+ "state_updates":{"reviewer_set":[]}}
+"#;
+        let env = extract_json_envelope(stdout).expect("envelope");
+        let parsed: serde_json::Value = serde_json::from_str(env).expect("parse");
+        assert_eq!(parsed.get("status").and_then(|v| v.as_str()), Some("waiting_for_handoffs"));
+    }
+
+    #[test]
+    fn falls_back_to_first_block_when_no_status_field_anywhere() {
+        // Pre-existing callers may parse blocks that schema-validate without
+        // a top-level `status` (defensive); we still hand back the first
+        // balanced block so the schema validator emits its own precise
+        // error rather than a confusing "no envelope found".
+        let stdout = r#"{"foo": 1}"#;
+        let env = extract_json_envelope(stdout).expect("envelope");
+        assert_eq!(env, r#"{"foo": 1}"#);
+    }
+
+    #[test]
+    fn returns_none_when_no_balanced_object() {
+        assert!(extract_json_envelope("just prose, no braces").is_none());
+        assert!(extract_json_envelope("{ unbalanced").is_none());
+    }
+
+    #[test]
+    fn ignores_braces_inside_string_literals() {
+        // The `}` inside the string value must not close the outer object.
+        let stdout = r#"{"status":"success","notes":"closing brace } here"}"#;
+        let env = extract_json_envelope(stdout).expect("envelope");
+        assert_eq!(env, stdout);
+    }
+
+    #[test]
+    fn balanced_object_blocks_yields_each_top_level_object() {
+        let stdout = "{a} {b} text {c}";
+        let blocks: Vec<&str> = balanced_object_blocks(stdout).collect();
+        assert_eq!(blocks, vec!["{a}", "{b}", "{c}"]);
+    }
 }
