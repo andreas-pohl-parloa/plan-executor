@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.52.0] - 2026-04-30
+
+### Features
+
+- **preflight:** Worktree under <repo>/.plan-executor + auto-cleanup on success (#41) ([40c00b2](https://github.com/andreas-pohl-parloa/plan-executor/commit/40c00b25bdc545bccd52d8f33accafc2a78f2c7e))
 ## [0.51.1] - 2026-04-30
 
 ### Bug Fixes
