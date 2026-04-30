@@ -284,6 +284,14 @@ fn processes_in_pgid(pgid: u32) -> Vec<(u32, String)> {
         .collect()
 }
 
+/// `pub`-callable wrapper that auto-resolves the terminal width before
+/// delegating to `render_job_process_tree`. Used by `jobs list` to print a
+/// sub-process tree under each running job without exposing the column
+/// math to the caller.
+pub fn render_job_process_tree_compat(procs: &crate::ipc::JobProcesses) {
+    render_job_process_tree(procs, terminal_width());
+}
+
 /// Prints a dimmed sub-tree of process groups and PIDs under a running
 /// job. Emits nothing if the job has no tracked pgids or no live processes.
 fn render_job_process_tree(procs: &crate::ipc::JobProcesses, term_w: usize) {
