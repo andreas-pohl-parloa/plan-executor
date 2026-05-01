@@ -1341,14 +1341,28 @@ async fn trigger_remote(
         crate::remote::trigger_remote_execution(remote_repo, &plan, &manifest_path, &meta)?;
     let pr_num = crate::remote::pr_number_from_url(&pr_url);
 
-    // Store PR number for daemon-side polling.
-    if let Some(n) = pr_num {
-        let _ = crate::plan::set_plan_header(&plan, "remote-pr", &n.to_string());
+    // Advance the manifest status machine. The remote runner has the
+    // job; mirror the local PreflightStep flip so any local reader
+    // (`output -f`, the TUI, future re-execute attempts) sees the
+    // truth on disk. Best-effort: if the manifest can't be written
+    // here, the remote run still completes; the daemon's poll loop
+    // will retry the terminal flip when the PR closes.
+    if let Err(e) = crate::job::steps::plan::set_manifest_status(&manifest_path, "EXECUTING") {
+        tracing::warn!(
+            manifest = %manifest_path.display(),
+            error = %e,
+            "remote execution: flip plan.status to EXECUTING failed",
+        );
     }
 
     // Create a job entry and persist it
     if let Some(n) = pr_num {
-        let job = crate::jobs::JobMetadata::new_remote(plan.clone(), remote_repo.to_string(), n);
+        let job = crate::jobs::JobMetadata::new_remote(
+            plan.clone(),
+            manifest_path.clone(),
+            remote_repo.to_string(),
+            n,
+        );
         let short_id = job.id[..job.id.len().min(8)].to_string();
         let _ = job.save();
 
@@ -1356,6 +1370,7 @@ async fn trigger_remote(
         if crate::ipc::socket_path().exists() {
             let _ = notify_daemon_track_remote(
                 plan.to_string_lossy().to_string(),
+                manifest_path.to_string_lossy().to_string(),
                 remote_repo.to_string(),
                 n,
             );
@@ -2290,6 +2305,7 @@ fn print_gpg_upload_fallback(armored_public: &str) {
 
 fn notify_daemon_track_remote(
     plan_path: String,
+    manifest_path: String,
     remote_repo: String,
     pr_number: u64,
 ) -> Result<()> {
@@ -2298,6 +2314,7 @@ fn notify_daemon_track_remote(
     let mut s = UnixStream::connect(crate::ipc::socket_path())?;
     let req = serde_json::to_string(&crate::ipc::TuiRequest::TrackRemote {
         plan_path,
+        manifest_path,
         remote_repo,
         pr_number,
     })?;

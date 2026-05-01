@@ -17,7 +17,6 @@ pub mod helper;
 pub mod ipc;
 pub mod job;
 pub mod jobs;
-pub mod plan;
 pub mod proctree;
 pub mod remote;
 pub mod schema;

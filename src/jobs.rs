@@ -41,6 +41,12 @@ pub struct JobMetadata {
     /// Remote execution PR number
     #[serde(default)]
     pub remote_pr: Option<u64>,
+    /// Compiled manifest path. Required for remote runs so the daemon's
+    /// poll loop can flip `plan.status` (EXECUTING / COMPLETED / FAILED)
+    /// in the manifest when the GHA PR closes. Optional for local runs
+    /// because the in-process scheduler already carries the path.
+    #[serde(default)]
+    pub manifest_path: Option<PathBuf>,
 }
 
 impl JobMetadata {
@@ -60,14 +66,21 @@ impl JobMetadata {
             session_id: None,
             remote_repo: None,
             remote_pr: None,
+            manifest_path: None,
         }
     }
 
-    pub fn new_remote(plan_path: PathBuf, remote_repo: String, pr_number: u64) -> Self {
+    pub fn new_remote(
+        plan_path: PathBuf,
+        manifest_path: PathBuf,
+        remote_repo: String,
+        pr_number: u64,
+    ) -> Self {
         let mut job = Self::new(plan_path);
         job.status = JobStatus::RemoteRunning;
         job.remote_repo = Some(remote_repo);
         job.remote_pr = Some(pr_number);
+        job.manifest_path = Some(manifest_path);
         job
     }
 

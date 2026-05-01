@@ -2395,8 +2395,16 @@ fn git_workdir_is_dirty(workdir: &Path) -> std::io::Result<bool> {
     Ok(!output.stdout.is_empty())
 }
 
+/// Maximum length for the goal portion of a generated PR title.
+/// Conventional commits target a ≤72-char subject; reserving room for
+/// the `feat(JIRA-1234): ` prefix lands the goal at ~50 chars.
+const PR_TITLE_GOAL_MAX_LEN: usize = 50;
+
 /// Builds the conventional-commits PR title from the plan metadata, falling
 /// back to a generic prefix when the manifest does not provide a `type`.
+/// The plan's `goal` is often a full sentence — too long for a PR title —
+/// so it is truncated at a word boundary with an ellipsis when it would
+/// exceed [`PR_TITLE_GOAL_MAX_LEN`].
 fn pr_title(plan: &PlanMeta) -> String {
     let prefix = match plan.plan_type.as_str() {
         "bug" => "fix".to_string(),
@@ -2410,7 +2418,33 @@ fn pr_title(plan: &PlanMeta) -> String {
     } else {
         format!("({scope})")
     };
-    format!("{prefix}{scope_segment}: {}", plan.goal)
+    let goal = truncate_at_word_boundary(&plan.goal, PR_TITLE_GOAL_MAX_LEN);
+    format!("{prefix}{scope_segment}: {goal}")
+}
+
+/// Returns `s` shortened to at most `max` characters, breaking on the last
+/// whitespace within the budget and appending an ellipsis (`…`). When
+/// `s` already fits, it is returned untouched. Operates on chars (not
+/// bytes) so multi-byte UTF-8 input is handled correctly. When no
+/// whitespace fits in the budget, falls back to a hard cut at `max - 1`
+/// chars + `…` so the output is always within the budget.
+fn truncate_at_word_boundary(s: &str, max: usize) -> String {
+    let trimmed = s.trim();
+    if trimmed.chars().count() <= max {
+        return trimmed.to_string();
+    }
+    // `max - 1` to leave room for the ellipsis character.
+    let budget = max.saturating_sub(1);
+    let head: String = trimmed.chars().take(budget).collect();
+    let cut = head.rfind(char::is_whitespace).unwrap_or(0);
+    if cut == 0 {
+        // No whitespace inside the budget — hard cut.
+        format!("{head}…")
+    } else {
+        let mut out = head[..cut].trim_end().to_string();
+        out.push('…');
+        out
+    }
 }
 
 /// Builds the PR body. Plain text — the orchestrator skill writes the
@@ -3251,6 +3285,49 @@ mod preflight_tests {
         let outcome = run_summary(&ctx, &manifest);
         assert!(matches!(outcome, AttemptOutcome::Success), "outcome: {outcome:?}");
         assert_eq!(read_status(&manifest), "COMPLETED");
+    }
+
+    #[test]
+    fn pr_title_truncates_long_goals_at_word_boundary() {
+        let mut meta = meta_with(Some("CCP-123"), None, "feature");
+        meta.goal = "wire the manifest plan.status machine through every step of the daemon pipeline".into();
+        let title = pr_title(&meta);
+        assert!(title.starts_with("feat(CCP-123): "), "title: {title}");
+        // Goal portion stays within the budget + ends on an ellipsis,
+        // never mid-word.
+        let goal_part = title.strip_prefix("feat(CCP-123): ").unwrap();
+        assert!(goal_part.chars().count() <= PR_TITLE_GOAL_MAX_LEN, "goal_part: {goal_part}");
+        assert!(goal_part.ends_with('…'), "should be ellipsised: {goal_part}");
+        // Last char before the ellipsis should be a complete word.
+        let body = goal_part.trim_end_matches('…');
+        assert!(
+            !body.ends_with(char::is_whitespace),
+            "body: `{body}` should not end with whitespace",
+        );
+    }
+
+    #[test]
+    fn pr_title_keeps_short_goals_intact() {
+        let mut meta = meta_with(None, None, "bug");
+        meta.goal = "fix race in scheduler".into();
+        assert_eq!(pr_title(&meta), "fix: fix race in scheduler");
+    }
+
+    #[test]
+    fn truncate_at_word_boundary_is_a_noop_when_input_fits() {
+        assert_eq!(truncate_at_word_boundary("hello world", 50), "hello world");
+    }
+
+    #[test]
+    fn truncate_at_word_boundary_breaks_on_whitespace() {
+        // 50-char budget: "the quick brown fox jumps over the lazy dog and the".
+        // First 50 chars contain "the lazy dog and the" — last whitespace is
+        // before "the" (the trailing one), so the cut keeps the prior words.
+        let s = "the quick brown fox jumps over the lazy dog and the cat";
+        let out = truncate_at_word_boundary(s, 50);
+        assert!(out.chars().count() <= 50, "out: `{out}` ({} chars)", out.chars().count());
+        assert!(out.ends_with('…'));
+        assert!(!out.contains("  "), "no double-space: `{out}`");
     }
 
     #[test]

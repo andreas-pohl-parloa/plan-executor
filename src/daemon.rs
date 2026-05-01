@@ -44,8 +44,11 @@ pub struct DaemonState {
     pub sub_agent_dispatch_counter: HashMap<String, u32>,
     /// Jobs currently paused at a handoff — sub-agents held until ResumeJob
     pub paused_jobs: std::collections::HashSet<String>,
-    /// Remote executions being monitored: plan_path → (remote_repo, pr_number)
-    pub remote_executions: HashMap<String, (String, u64)>,
+    /// Remote executions being monitored: plan_path → (remote_repo,
+    /// pr_number, manifest_path). The manifest path is required so the
+    /// poll loop can flip `plan.status` in `tasks.json` on terminal
+    /// PR transitions.
+    pub remote_executions: HashMap<String, (String, u64, PathBuf)>,
     /// broadcast channel for DaemonEvent to all TUI clients
     pub event_tx: broadcast::Sender<DaemonEvent>,
 }
@@ -214,23 +217,32 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
     }));
     tracing::info!("job history loaded");
 
-    // Restore remote executions from persisted job metadata
+    // Restore remote executions from persisted job metadata. Older
+    // metadata files predate `manifest_path`; those entries can't be
+    // re-tracked because the poll loop has nowhere to flip
+    // `plan.status` — log + skip rather than break-restart.
     {
         let st = state.lock().await;
-        let remotes: Vec<(String, String, u64)> = st.history.iter()
+        let remotes: Vec<(String, String, u64, PathBuf)> = st.history.iter()
             .filter(|j| j.status == JobStatus::RemoteRunning)
             .filter_map(|j| {
                 let repo = j.remote_repo.as_ref()?;
                 let pr = j.remote_pr?;
-                Some((j.plan_path.to_string_lossy().to_string(), repo.clone(), pr))
+                let manifest = j.manifest_path.as_ref()?;
+                Some((
+                    j.plan_path.to_string_lossy().to_string(),
+                    repo.clone(),
+                    pr,
+                    manifest.clone(),
+                ))
             })
             .collect();
         drop(st);
         if !remotes.is_empty() {
             let mut st = state.lock().await;
-            for (path, repo, pr) in remotes {
+            for (path, repo, pr, manifest) in remotes {
                 tracing::info!(plan = %path, pr = pr, "restoring remote execution monitor");
-                st.remote_executions.insert(path, (repo, pr));
+                st.remote_executions.insert(path, (repo, pr, manifest));
             }
         }
     }
@@ -727,16 +739,19 @@ async fn watchdog_check(state: &Arc<Mutex<DaemonState>>) {
 
 /// Polls all tracked remote executions to check if their PRs have closed.
 async fn poll_remote_executions(state: &Arc<Mutex<DaemonState>>) {
-    let executions: Vec<(String, String, u64)> = {
+    let executions: Vec<(String, String, u64, PathBuf)> = {
         let st = state.lock().await;
-        st.remote_executions.iter()
-            .map(|(plan, (repo, pr))| (plan.clone(), repo.clone(), *pr))
+        st.remote_executions
+            .iter()
+            .map(|(plan, (repo, pr, manifest))| {
+                (plan.clone(), repo.clone(), *pr, manifest.clone())
+            })
             .collect()
     };
 
     if executions.is_empty() { return; }
 
-    for (plan_path, remote_repo, pr_number) in executions {
+    for (plan_path, remote_repo, pr_number, manifest_path) in executions {
         let result = tokio::task::spawn_blocking({
             let repo = remote_repo.clone();
             move || crate::remote::get_pr_status(&repo, pr_number)
@@ -754,7 +769,16 @@ async fn poll_remote_executions(state: &Arc<Mutex<DaemonState>>) {
                 tracing::info!(plan = %plan_path, pr = pr_number, status = new_status, "remote execution finished");
                 let status_label = if success { "succeeded" } else { "failed" };
                 notify_plan(&format!("Remote execution {}", status_label), &plan, "");
-                let _ = crate::plan::set_plan_header(&plan, "status", new_status);
+                if let Err(e) = crate::job::steps::plan::set_manifest_status(
+                    &manifest_path,
+                    new_status,
+                ) {
+                    tracing::warn!(
+                        manifest = %manifest_path.display(),
+                        error = %e,
+                        "remote poll: flip plan.status to {new_status} failed",
+                    );
+                }
 
                 // Update the persisted job metadata
                 let all_jobs = JobMetadata::load_all();
@@ -828,18 +852,35 @@ pub async fn trigger_execution(state: &Arc<Mutex<DaemonState>>, manifest_path: &
                         Ok(url) => {
                             tracing::info!(url = %url, "remote execution triggered");
                             notify_plan("Remote execution started", &plan, "");
+                            // Advance the manifest status machine to
+                            // EXECUTING now that the remote runner has
+                            // accepted the job. Mirrors the local
+                            // PreflightStep flip; the matching
+                            // COMPLETED / FAILED transitions land in
+                            // `poll_remote_executions` when the PR closes.
+                            if let Err(e) =
+                                crate::job::steps::plan::set_manifest_status(&manifest, "EXECUTING")
+                            {
+                                tracing::warn!(
+                                    manifest = %manifest.display(),
+                                    error = %e,
+                                    "remote execution: flip plan.status to EXECUTING failed",
+                                );
+                            }
                             if let Some(pr_num) = crate::remote::pr_number_from_url(&url) {
-                                let _ = crate::plan::set_plan_header(&plan, "remote-pr", &pr_num.to_string());
                                 // Create and persist a job entry so `jobs` shows it.
                                 let job = JobMetadata::new_remote(
-                                    plan.clone(), remote_repo.to_string(), pr_num,
+                                    plan.clone(),
+                                    manifest.clone(),
+                                    remote_repo.to_string(),
+                                    pr_num,
                                 );
                                 let _ = job.save();
                                 let mut st = state.lock().await;
                                 st.history.insert(0, job);
                                 st.remote_executions.insert(
                                     plan_path.to_string(),
-                                    (remote_repo.to_string(), pr_num),
+                                    (remote_repo.to_string(), pr_num, manifest.clone()),
                                 );
                             }
                         }
@@ -1520,9 +1561,18 @@ async fn handle_tui_request(
                 let _ = write_half.write_all(format!("{}\n", json).as_bytes()).await;
             }
         }
-        TuiRequest::TrackRemote { plan_path, remote_repo, pr_number } => {
+        TuiRequest::TrackRemote {
+            plan_path,
+            manifest_path,
+            remote_repo,
+            pr_number,
+        } => {
+            let manifest = PathBuf::from(manifest_path);
             let mut st = state.lock().await;
-            st.remote_executions.insert(plan_path.clone(), (remote_repo, pr_number));
+            st.remote_executions.insert(
+                plan_path.clone(),
+                (remote_repo, pr_number, manifest),
+            );
             tracing::info!(plan = %plan_path, pr = pr_number, "tracking remote execution");
         }
         TuiRequest::Subscribe => {
