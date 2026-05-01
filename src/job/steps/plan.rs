@@ -44,7 +44,15 @@ use crate::scheduler::{self, Manifest, SchedulerError};
 /// re-execution → re-invoke helper). Beyond this cap the step gives up and
 /// surfaces a `SemanticMistake` outcome so the registry-level retry/abort
 /// machinery can take over.
-const MAX_FIX_LOOP_ITERATIONS: u32 = 3;
+///
+/// Sized for converging-tail behavior: an early-round finding count of
+/// 4–8 typically drops to 1–2 by round 3 and cleans up within rounds 4–5
+/// (e.g. trailing `cargo fmt` / clippy nits the fix-agents take an extra
+/// pass to absorb). Bumping the cap from 3 to 5 trades a few extra
+/// reviewer minutes against the high cost of a `SemanticMistake` abort
+/// when a single trivial finding remains. The wall-clock guard
+/// (`MAX_FIX_LOOP_BUDGET`) still bounds total time.
+const MAX_FIX_LOOP_ITERATIONS: u32 = 5;
 
 /// Wall-clock budget for a single `run_helper_fix_loop` invocation.
 ///
