@@ -2635,27 +2635,110 @@ fn run_summary(ctx: &StepContext, manifest_path: &Path) -> AttemptOutcome {
     };
 
     let pr_url = read_pr_url(ctx);
-    let outcome = write_local_summary(ctx, manifest_path, &plan_meta, pr_url.as_deref());
+    let counts = gather_execution_counts(&ctx.job_dir, manifest_path);
+    let body = match write_local_summary(
+        ctx,
+        manifest_path,
+        &plan_meta,
+        pr_url.as_deref(),
+        &counts,
+    ) {
+        Ok(body) => body,
+        Err(outcome) => return outcome,
+    };
 
-    if matches!(outcome, AttemptOutcome::Success) {
-        if !plan_meta.flags.no_worktree {
-            cleanup_worktree_after_summary(ctx, manifest_path, &plan_meta);
-        }
-        // Final transition of the manifest status machine. The
-        // pipeline reaches summary only when every prior step
-        // returned Success, so `COMPLETED` is the correct terminal
-        // value here. A persistence failure must surface as
-        // HardInfra: the user-visible signal of "this run is done"
-        // lives in `plan.status`, and silently leaving it at
-        // `EXECUTING` would invite a re-execution attempt that
-        // re-does work already shipped.
-        if let Err(e) = set_manifest_status(manifest_path, "COMPLETED") {
-            return AttemptOutcome::HardInfra {
-                error: format!("summary: flip plan.status to COMPLETED: {e}"),
-            };
+    // Print the counts block to stderr / stdout so foreground (CLI,
+    // GHA runner) and the daemon's `output -f` follower both surface
+    // the same numbers. The daemon's hooks publish onto the broadcast
+    // bus when present; foreground prints the same lines via stderr.
+    publish_summary_lines(ctx, &counts);
+
+    if !plan_meta.flags.no_worktree {
+        cleanup_worktree_after_summary(ctx, manifest_path, &plan_meta);
+    }
+
+    // Best-effort PR comment. Silently skipped when there's no PR URL
+    // (skip_pr=true) or `gh` returns a non-zero exit; a comment failure
+    // must not turn a successful run into a failed one.
+    if let Some(url) = pr_url.as_deref() {
+        if let Err(e) = post_pr_summary_comment(url, &body) {
+            tracing::warn!(pr = %url, error = %e, "summary: gh pr comment failed");
         }
     }
-    outcome
+
+    // Final transition of the manifest status machine. The pipeline
+    // reaches summary only when every prior step returned Success, so
+    // `COMPLETED` is the correct terminal value here. A persistence
+    // failure must surface as HardInfra: the user-visible signal of
+    // "this run is done" lives in `plan.status`, and silently leaving
+    // it at `EXECUTING` would invite a re-execution attempt that
+    // re-does work already shipped.
+    if let Err(e) = set_manifest_status(manifest_path, "COMPLETED") {
+        return AttemptOutcome::HardInfra {
+            error: format!("summary: flip plan.status to COMPLETED: {e}"),
+        };
+    }
+
+    AttemptOutcome::Success
+}
+
+/// Posts the rendered summary `body` as a comment on the GitHub PR at
+/// `url`. Uses `gh pr comment <url> -F -` and pipes the body via stdin
+/// so multiline / markdown content survives unmangled. Returns the
+/// underlying error message on failure so the caller can log it.
+fn post_pr_summary_comment(url: &str, body: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("gh")
+        .arg("pr")
+        .arg("comment")
+        .arg(url)
+        .arg("-F")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn gh: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(body.as_bytes())
+            .map_err(|e| format!("write stdin: {e}"))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("wait gh: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "gh pr comment exited {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    ))
+}
+
+/// Pushes the rendered counts block into the daemon's display channel
+/// (when running under the daemon) and to stderr (always) so the
+/// numbers appear in `output -f`, the foreground CLI tail, and the
+/// GHA runner's job log without callers having to dig through the
+/// summary file.
+fn publish_summary_lines(ctx: &StepContext, counts: &ExecutionCounts) {
+    let lines = [
+        format!(
+            "[plan-executor] summary: tasks={} waves={} steps={}",
+            counts.tasks_total, counts.waves_total, counts.steps_total
+        ),
+        format!(
+            "[plan-executor] summary: attempts={} retries={} protocol_violations={}",
+            counts.attempts_total, counts.retries_total, counts.protocol_violations
+        ),
+    ];
+    for line in &lines {
+        eprintln!("{line}");
+        if let Some(hooks) = ctx.daemon_hooks.as_ref() {
+            hooks.announce_summary_line(line.clone());
+        }
+    }
 }
 
 /// Removes the per-plan worktree once summary completes successfully.
@@ -2956,27 +3039,101 @@ fn parse_pr_url(url: &str) -> Option<(String, String, u32)> {
     Some((owner, repo, pr))
 }
 
+/// Aggregated counts surfaced in the execution summary. Sourced from the
+/// compiled manifest (`tasks_total`, `waves_total`) and the daemon's
+/// per-step `metrics.json` snapshot (`attempts_total`,
+/// `protocol_violations`). `retries_total` is derived from
+/// `attempts_total - step_count`: every attempt past the first per step
+/// is a retry, regardless of which `RecoveryPolicy` triggered it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExecutionCounts {
+    pub tasks_total: usize,
+    pub waves_total: usize,
+    pub steps_total: u32,
+    pub attempts_total: u32,
+    pub retries_total: u32,
+    pub protocol_violations: u32,
+}
+
+/// Builds an [`ExecutionCounts`] snapshot by reading the manifest for
+/// task / wave counts and `<job_dir>/metrics.json` for attempt / retry
+/// / protocol-violation counts. Best-effort: missing metrics or a
+/// truncated file collapse to zero rather than failing the summary.
+pub(crate) fn gather_execution_counts(job_dir: &Path, manifest_path: &Path) -> ExecutionCounts {
+    let (tasks_total, waves_total) = match scheduler::load_manifest(manifest_path) {
+        Ok(m) => (m.tasks.len(), m.waves.len()),
+        Err(_) => (0, 0),
+    };
+
+    let mut counts = ExecutionCounts {
+        tasks_total,
+        waves_total,
+        ..ExecutionCounts::default()
+    };
+
+    let metrics_path = job_dir.join("metrics.json");
+    let Ok(raw) = std::fs::read_to_string(&metrics_path) else {
+        return counts;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return counts;
+    };
+    let as_u32 = |v: &serde_json::Value| -> u32 {
+        v.as_u64().unwrap_or(0).try_into().unwrap_or(u32::MAX)
+    };
+    counts.steps_total = value.get("step_count").map(as_u32).unwrap_or(0);
+    counts.attempts_total = value.get("attempts_total").map(as_u32).unwrap_or(0);
+    counts.retries_total = counts.attempts_total.saturating_sub(counts.steps_total);
+    counts.protocol_violations = value
+        .get("outcomes_by_kind")
+        .and_then(|o| o.get("protocol_violation"))
+        .map(as_u32)
+        .unwrap_or(0);
+    counts
+}
+
+/// Markdown section title used in both the summary file and the PR
+/// comment so a reader can grep for it across either surface.
+const EXECUTION_COUNTS_HEADER: &str = "## Execution counts";
+
+/// Renders the [`ExecutionCounts`] block as the markdown that appears
+/// in both `<job_dir>/.tmp-execution-summary.md` and the PR comment.
+/// Lives in one place so the two surfaces stay byte-identical.
+pub(crate) fn render_execution_counts(counts: &ExecutionCounts) -> String {
+    let mut body = String::with_capacity(256);
+    body.push_str(EXECUTION_COUNTS_HEADER);
+    body.push_str("\n\n");
+    body.push_str(&format!("- tasks: {}\n", counts.tasks_total));
+    body.push_str(&format!("- waves: {}\n", counts.waves_total));
+    body.push_str(&format!("- steps: {}\n", counts.steps_total));
+    body.push_str(&format!("- attempts: {}\n", counts.attempts_total));
+    body.push_str(&format!("- retries: {}\n", counts.retries_total));
+    body.push_str(&format!(
+        "- protocol_violations: {}\n",
+        counts.protocol_violations
+    ));
+    body
+}
+
 /// Writes a best-effort markdown summary to
-/// `<job_dir>/.tmp-execution-summary.md`. Returns
-/// [`AttemptOutcome::HardInfra`] only when the file cannot be written.
+/// `<job_dir>/.tmp-execution-summary.md`. Returns the rendered body on
+/// success so callers (e.g. `run_summary`) can re-use it as the PR
+/// comment payload, and [`AttemptOutcome::HardInfra`] when the file
+/// cannot be written.
 fn write_local_summary(
     ctx: &StepContext,
     manifest_path: &Path,
     plan_meta: &PlanMeta,
     pr_url: Option<&str>,
-) -> AttemptOutcome {
-    let wave_count = match scheduler::load_manifest(manifest_path) {
-        Ok(m) => m.waves.len(),
-        Err(_) => 0,
-    };
-    let mut body = String::with_capacity(512);
+    counts: &ExecutionCounts,
+) -> Result<String, AttemptOutcome> {
+    let mut body = String::with_capacity(768);
     body.push_str("# plan-executor summary\n\n");
     body.push_str(&format!("- goal: {}\n", plan_meta.goal));
     body.push_str(&format!("- type: {}\n", plan_meta.plan_type));
     if let Some(jira) = &plan_meta.jira {
         body.push_str(&format!("- jira: {jira}\n"));
     }
-    body.push_str(&format!("- waves: {wave_count}\n"));
     body.push_str(&format!("- skip_pr: {}\n", plan_meta.flags.skip_pr));
     if let Some(url) = pr_url {
         body.push_str(&format!("- pr_url: {url}\n"));
@@ -2985,21 +3142,23 @@ fn write_local_summary(
     }
     body.push_str(&format!("- manifest: {}\n", manifest_path.display()));
     body.push_str(&format!("- job_dir: {}\n", ctx.job_dir.display()));
+    body.push('\n');
+    body.push_str(&render_execution_counts(counts));
 
     let path = ctx.job_dir.join(SUMMARY_FILE);
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            return AttemptOutcome::HardInfra {
+            return Err(AttemptOutcome::HardInfra {
                 error: format!("create job dir {}: {e}", parent.display()),
-            };
+            });
         }
     }
-    if let Err(e) = std::fs::write(&path, body) {
-        return AttemptOutcome::HardInfra {
+    if let Err(e) = std::fs::write(&path, &body) {
+        return Err(AttemptOutcome::HardInfra {
             error: format!("write summary file {}: {e}", path.display()),
-        };
+        });
     }
-    AttemptOutcome::Success
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -3316,6 +3475,68 @@ mod preflight_tests {
     #[test]
     fn truncate_at_word_boundary_is_a_noop_when_input_fits() {
         assert_eq!(truncate_at_word_boundary("hello world", 50), "hello world");
+    }
+
+    #[test]
+    fn render_execution_counts_emits_every_field() {
+        let counts = ExecutionCounts {
+            tasks_total: 7,
+            waves_total: 3,
+            steps_total: 8,
+            attempts_total: 11,
+            retries_total: 3,
+            protocol_violations: 2,
+        };
+        let body = render_execution_counts(&counts);
+        assert!(body.starts_with(EXECUTION_COUNTS_HEADER), "body: {body:?}");
+        for line in [
+            "- tasks: 7",
+            "- waves: 3",
+            "- steps: 8",
+            "- attempts: 11",
+            "- retries: 3",
+            "- protocol_violations: 2",
+        ] {
+            assert!(body.contains(line), "expected {line:?} in body:\n{body}");
+        }
+    }
+
+    #[test]
+    fn gather_execution_counts_returns_zeros_when_metrics_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = write_manifest(dir.path(), "stem", "EXECUTING");
+        let counts = gather_execution_counts(dir.path(), &manifest);
+        // Manifest carries 0 tasks / 0 waves; metrics absent → zeros
+        // for the rest. The function must not panic on a missing
+        // metrics.json — it's a normal state during early steps.
+        assert_eq!(counts.tasks_total, 0);
+        assert_eq!(counts.waves_total, 0);
+        assert_eq!(counts.steps_total, 0);
+        assert_eq!(counts.attempts_total, 0);
+        assert_eq!(counts.retries_total, 0);
+        assert_eq!(counts.protocol_violations, 0);
+    }
+
+    #[test]
+    fn gather_execution_counts_reads_metrics_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = write_manifest(dir.path(), "stem", "EXECUTING");
+        let metrics = serde_json::json!({
+            "job_id": "x",
+            "step_count": 8,
+            "attempts_total": 11,
+            "recoveries_by_kind": { "retry_transient": 1, "retry_protocol": 2 },
+            "outcomes_by_kind": { "success": 8, "protocol_violation": 2, "transient_infra": 1 },
+            "started_at": "1970-01-01T00:00:00Z"
+        });
+        std::fs::write(dir.path().join("metrics.json"), metrics.to_string()).expect("write");
+
+        let counts = gather_execution_counts(dir.path(), &manifest);
+        assert_eq!(counts.steps_total, 8);
+        assert_eq!(counts.attempts_total, 11);
+        // retries = attempts - steps = 11 - 8 = 3
+        assert_eq!(counts.retries_total, 3);
+        assert_eq!(counts.protocol_violations, 2);
     }
 
     #[test]

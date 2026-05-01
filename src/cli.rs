@@ -783,8 +783,13 @@ async fn run_pr_finalize(
     // resolve owner/repo via the args we already validated above, not via
     // a git remote inside workdir.
     let workdir = std::env::current_dir().context("resolving current working directory")?;
-    let success =
-        run_rust_scheduler_pipeline(runtime_steps, dir.path().to_path_buf(), workdir).await;
+    let success = run_rust_scheduler_pipeline(
+        runtime_steps,
+        job.id.0.clone(),
+        dir.path().to_path_buf(),
+        workdir,
+    )
+    .await;
     if !success {
         anyhow::bail!("pr-finalize pipeline failed (see job dir for per-step logs)");
     }
@@ -1460,63 +1465,105 @@ async fn execute_foreground(manifest_arg: String, config: crate::config::Config)
 
     let _ = resolved_path; // kept in scope to mirror prior contract
 
-    let success =
-        run_rust_scheduler_pipeline(runtime_steps, job_dir.path().to_path_buf(), execution_root)
-            .await;
+    let success = run_rust_scheduler_pipeline(
+        runtime_steps,
+        job.id.0.clone(),
+        job_dir.path().to_path_buf(),
+        execution_root,
+    )
+    .await;
     if !success {
+        // Mirror the daemon path's terminal status flip so a foreground
+        // / GHA-runner failure can't leave the manifest stuck at
+        // EXECUTING. SummaryStep handles the COMPLETED case on the
+        // success path.
+        if let Err(e) =
+            crate::job::steps::plan::set_manifest_status(&manifest_path, "FAILED")
+        {
+            tracing::warn!(
+                manifest = %manifest_path.display(),
+                error = %e,
+                "foreground execute: flip plan.status to FAILED failed",
+            );
+        }
         std::process::exit(1);
     }
     Ok(())
 }
 
-/// Sequentially runs every step in `steps` and reports whether all of them
-/// reached [`AttemptOutcome::Success`]. Each step gets a fresh
-/// [`StepContext`] anchored at `job_dir` and `workdir`. Recovery / retry
-/// per step is the registry's responsibility in later phases; D4-step-1 is
-/// a "happy-path wiring" change — any non-success outcome aborts the run.
+/// Foreground / GHA-runner entry into the shared
+/// [`crate::job::runtime::run_pipeline`] engine. Routes display lines
+/// to stderr (the daemon path uses the broadcast bus instead) but
+/// otherwise shares every behavior with the daemon: `JobMetrics`
+/// tracking, recovery / retry per step, per-step `metrics.json`
+/// persistence, terminal `metrics.json` persistence. Bails on the
+/// first non-success / non-pending outcome.
 pub(crate) async fn run_rust_scheduler_pipeline(
     steps: Vec<Box<dyn crate::job::step::Step>>,
+    job_id: String,
     job_dir: PathBuf,
     workdir: PathBuf,
 ) -> bool {
-    use crate::job::step::StepContext;
-    use crate::job::types::AttemptOutcome;
+    use crate::job::runtime;
+    let observer: std::sync::Arc<dyn runtime::PipelineObserver> =
+        std::sync::Arc::new(ForegroundObserver { job_id });
+    let run = runtime::run_pipeline(steps, job_dir, workdir, observer).await;
+    run.success
+}
 
-    for (idx, step) in steps.iter().enumerate() {
-        let seq = u32::try_from(idx + 1).unwrap_or(u32::MAX);
-        let mut ctx = StepContext {
-            job_dir: job_dir.clone(),
-            step_seq: seq,
-            attempt_n: 1,
-            workdir: workdir.clone(),
-            daemon_hooks: None,
-        };
-        let step_name = step.name();
-        // Yellow `[plan-executor]` prefix matches format_message_line;
-        // status keyword colored to match severity.
+/// Foreground / GHA-runner [`runtime::PipelineObserver`]. Pure
+/// `eprintln` for display; never killed externally; no daemon hooks.
+struct ForegroundObserver {
+    job_id: String,
+}
+
+#[async_trait::async_trait]
+impl crate::job::runtime::PipelineObserver for ForegroundObserver {
+    fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    fn on_step_start(&self, seq: u32, name: &str) {
         let prefix = "\x1b[33m[plan-executor]\x1b[0m";
-        eprintln!("{prefix} step {seq:03} {step_name}: running");
-        let outcome = step.run(&mut ctx).await;
+        eprintln!("{prefix} step {seq:03} {name}: running");
+    }
+
+    fn on_step_end(
+        &self,
+        seq: u32,
+        name: &str,
+        outcome: &crate::job::types::AttemptOutcome,
+        summary: &str,
+    ) {
+        let prefix = "\x1b[33m[plan-executor]\x1b[0m";
+        use crate::job::types::AttemptOutcome;
         match outcome {
             AttemptOutcome::Success => {
-                eprintln!("{prefix} step {seq:03} {step_name}: \x1b[32msuccess\x1b[0m");
+                eprintln!("{prefix} step {seq:03} {name}: \x1b[32msuccess\x1b[0m");
             }
             AttemptOutcome::Pending => {
-                // `Pending` is currently emitted by the placeholder
-                // `PreflightStep` and `PrFinalizeStep` shells. Treat as
-                // a no-op pass so the rest of the pipeline can run.
-                eprintln!("{prefix} step {seq:03} {step_name}: pending (placeholder)");
+                eprintln!("{prefix} step {seq:03} {name}: {summary}");
             }
-            other => {
-                eprintln!(
-                    "{prefix} step {seq:03} {step_name}: \x1b[31mFAILED\x1b[0m — {other:?}\n{prefix} aborting pipeline. attempt log: {}/steps/{seq:03}-{step_name}/attempts/1/",
-                    job_dir.display()
-                );
-                return false;
+            _ => {
+                eprintln!("{prefix} step {seq:03} {name}: \x1b[31mFAILED\x1b[0m — {summary}");
             }
         }
     }
-    true
+
+    fn on_step_retry(
+        &self,
+        seq: u32,
+        name: &str,
+        next_attempt: u32,
+        total_budget: u32,
+        reason: &str,
+        detail: &str,
+    ) {
+        let prefix = "\x1b[33m[plan-executor]\x1b[0m";
+        eprintln!(
+            "{prefix} step {seq:03} {name}: retry {next_attempt}/{total_budget} after {reason}: {detail}"
+        );
+    }
 }
 
 /// Walk up from a path to find the closest directory containing `.git`.
