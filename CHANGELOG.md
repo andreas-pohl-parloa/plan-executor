@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.54.0] - 2026-05-01
+
+### Features
+
+- **pr_finalize:** Spawn pr-monitor.sh directly; retire claude middle-man (#50) ([978e780](https://github.com/andreas-pohl-parloa/plan-executor/commit/978e7805e6add6a1629647e89e5a5a8a87780671))
 ## [0.53.0] - 2026-05-01
 
 ### Features
