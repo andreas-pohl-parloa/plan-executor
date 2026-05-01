@@ -31,8 +31,8 @@ use serde_json::json;
 
 use crate::finding::{Finding, Severity};
 use crate::helper::{
-    invoke_helper, invoke_pr_finalize, HelperError, HelperOutput, HelperSkill, HelperStatus,
-    PrFinalizeInput, PrFinalizeMergeMode, ReviewTeamInput, ValidatorInput,
+    invoke_helper, HelperError, HelperOutput, HelperSkill, HelperStatus, ReviewTeamInput,
+    ValidatorInput,
 };
 use crate::job::recovery::{Backoff, CorrectivePromptKey, RecoveryPolicy};
 use crate::job::step::{Step, StepContext};
@@ -1689,34 +1689,6 @@ fn ensure_path_under_workdir(
     Ok(canonical_path)
 }
 
-/// Converts a [`HelperError`] into the matching [`AttemptOutcome`] variant.
-fn helper_error_to_outcome(err: HelperError) -> AttemptOutcome {
-    match err {
-        HelperError::HardInfra(msg) => AttemptOutcome::HardInfra { error: msg },
-        HelperError::TransientInfra(msg) => AttemptOutcome::TransientInfra { error: msg },
-        HelperError::ProtocolViolation { category, detail } => {
-            AttemptOutcome::ProtocolViolation { category, detail }
-        }
-        HelperError::SemanticFailure {
-            status,
-            notes,
-            state_updates: _,
-        } => match status {
-            HelperStatus::FixRequired => AttemptOutcome::SemanticMistake { fix_loop_round: 0 },
-            HelperStatus::Blocked | HelperStatus::Abort => AttemptOutcome::SpecDrift { gap: notes },
-            HelperStatus::Success => AttemptOutcome::Success,
-            // The triage helper is invoked from the fix-wave path which
-            // doesn't have a dispatcher set up; surface as a protocol
-            // violation so the operator sees the misuse rather than a
-            // confusing drop. The helper-loop driver above handles the
-            // dispatch path explicitly.
-            HelperStatus::WaitingForHandoffs => AttemptOutcome::ProtocolViolation {
-                category: "waiting_for_handoffs_unexpected".to_string(),
-                detail: "triage helper requested handoffs from a context that cannot dispatch them".to_string(),
-            },
-        },
-    }
-}
 
 /// Serializes `findings` to a fresh JSON file under
 /// `<workdir>/.plan-executor/fix-loop/<seq>-<attempt>-<iter>-<kind>.findings.json`.
@@ -2652,11 +2624,20 @@ fn read_pr_url(ctx: &StepContext) -> Option<String> {
 /// Calls [`invoke_pr_finalize`] for `url`. Maps helper failures onto the
 /// matching [`AttemptOutcome`] using [`helper_error_to_outcome`].
 ///
-/// Honors the manifest's `plan.flags.merge` / `plan.flags.merge_admin`:
-/// when `merge_admin` is set the helper merges with `gh pr merge --merge
-/// --admin` (bypassing branch protections); when only `merge` is set the
-/// helper merges with `gh pr merge --merge`; otherwise the helper monitors
-/// the PR but does not merge.
+/// Spawns the plan-executor-plugin's `pr-monitor.sh` directly — no
+/// Claude middle-man. The previous wrapper invoked the
+/// `plan-executor:pr-finalize` SKILL via `claude -p`, which read a
+/// JSON sidecar, ran `pr-monitor.sh` as a Bash tool, and formatted a
+/// JSON envelope back. None of that needs an LLM: the script does the
+/// real work, and `pr-monitor.sh` itself spawns Claude Fixer-Mode
+/// subprocesses when it finds Bugbot / CI issues to fix. Calling the
+/// script directly drops one whole subprocess layer and makes the
+/// path deterministic.
+///
+/// Honors `plan.flags.merge` / `plan.flags.merge_admin`: after the
+/// script exits clean, this function calls `gh pr merge --merge`
+/// (admin override when `merge_admin`) directly. Without either flag
+/// the PR is left open for human review.
 fn delegate_to_pr_finalize(
     ctx: &StepContext,
     url: &str,
@@ -2671,23 +2652,172 @@ fn delegate_to_pr_finalize(
             };
         }
     };
-    let merge_mode = if flags.merge_admin {
-        PrFinalizeMergeMode::MergeAdmin
-    } else if flags.merge {
-        PrFinalizeMergeMode::Merge
-    } else {
-        PrFinalizeMergeMode::None
+
+    let script = match locate_pr_monitor_script() {
+        Ok(p) => p,
+        Err(e) => {
+            return AttemptOutcome::HardInfra {
+                error: format!(
+                    "pr-monitor.sh not found in plugin cache: {e}; reinstall \
+                     plan-executor-plugin or run `/reload-plugins`"
+                ),
+            };
+        }
     };
-    let input = PrFinalizeInput {
-        owner,
-        repo,
-        pr,
-        merge_mode,
-    };
-    match invoke_pr_finalize(input, ctx) {
-        Ok(_) => AttemptOutcome::Success,
-        Err(e) => helper_error_to_outcome(e),
+
+    // Pre-create summary + log paths under the job dir so the final
+    // artifacts live alongside the rest of the run for inspection
+    // instead of in /tmp where they get rotated away.
+    let monitor_dir = ctx.job_dir.join("pr-finalize");
+    if let Err(e) = std::fs::create_dir_all(&monitor_dir) {
+        return AttemptOutcome::HardInfra {
+            error: format!("create pr-finalize dir {}: {e}", monitor_dir.display()),
+        };
     }
+    let summary_file = monitor_dir.join("summary.md");
+    let log_file = monitor_dir.join("monitor.log");
+
+    let head_sha = match resolve_head_sha(&ctx.workdir) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let push_time = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+
+    let status = std::process::Command::new("bash")
+        .arg(&script)
+        .arg("--owner").arg(&owner)
+        .arg("--repo").arg(&repo)
+        .arg("--pr").arg(pr.to_string())
+        .arg("--head-sha").arg(&head_sha)
+        .arg("--push-time").arg(&push_time)
+        .arg("--workdir").arg(&ctx.workdir)
+        .arg("--summary-file").arg(&summary_file)
+        .arg("--log-file").arg(&log_file)
+        .current_dir(&ctx.workdir)
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            let summary = std::fs::read_to_string(&summary_file).unwrap_or_default();
+            return AttemptOutcome::HardInfra {
+                error: format!(
+                    "pr-monitor.sh exited {:?} for PR {owner}/{repo}#{pr}; \
+                     summary file:\n{summary}",
+                    s.code()
+                ),
+            };
+        }
+        Err(e) => {
+            return AttemptOutcome::HardInfra {
+                error: format!("spawn pr-monitor.sh failed: {e}"),
+            };
+        }
+    }
+
+    // Honor merge intent. `pr-monitor.sh` explicitly does not merge
+    // (its own `--merge` / `--merge-admin` flags are accepted-and-
+    // ignored per the script's own header), so this is the orchestrator's
+    // job.
+    if flags.merge_admin || flags.merge {
+        let admin = flags.merge_admin;
+        if let Err(e) = run_gh_merge(&owner, &repo, pr, admin) {
+            return AttemptOutcome::HardInfra {
+                error: format!("gh pr merge for {owner}/{repo}#{pr} failed: {e}"),
+            };
+        }
+    }
+
+    AttemptOutcome::Success
+}
+
+/// Locates `pr-monitor.sh` inside the plan-executor plugin cache.
+/// The path looks like
+/// `<HOME>/.claude/plugins/cache/plan-executor/plan-executor/<commit-sha>/skills/pr-finalize/pr-monitor.sh`.
+/// The `<commit-sha>` segment changes whenever the plugin reloads, so
+/// glob the parent and pick the most recently modified candidate —
+/// that's the live one after any `/reload-plugins`.
+fn locate_pr_monitor_script() -> Result<PathBuf, String> {
+    let home =
+        std::env::var_os("HOME").ok_or_else(|| "HOME not set".to_string())?;
+    let cache_root = PathBuf::from(home)
+        .join(".claude/plugins/cache/plan-executor/plan-executor");
+    let entries = std::fs::read_dir(&cache_root)
+        .map_err(|e| format!("read_dir {}: {e}", cache_root.display()))?;
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let candidate = entry
+            .path()
+            .join("skills/pr-finalize/pr-monitor.sh");
+        if !candidate.is_file() {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+            best = Some((mtime, candidate));
+        }
+    }
+    best.map(|(_, p)| p).ok_or_else(|| {
+        format!("no pr-monitor.sh under {}", cache_root.display())
+    })
+}
+
+/// Resolves the worktree's current HEAD sha for the `--head-sha`
+/// argument. `pr-monitor.sh` uses the SHA to anchor "no new push since"
+/// timing — it's required, not optional.
+fn resolve_head_sha(workdir: &Path) -> Result<String, AttemptOutcome> {
+    let out = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(workdir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|e| AttemptOutcome::HardInfra {
+            error: format!("spawn `git rev-parse HEAD`: {e}"),
+        })?;
+    if !out.status.success() {
+        return Err(AttemptOutcome::HardInfra {
+            error: format!(
+                "git rev-parse HEAD failed (status {:?}): {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        });
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.len() != 40 {
+        return Err(AttemptOutcome::HardInfra {
+            error: format!("git rev-parse HEAD returned unexpected output: `{sha}`"),
+        });
+    }
+    Ok(sha)
+}
+
+/// Runs `gh pr merge --merge [--admin] <PR> --repo <owner>/<repo>`.
+fn run_gh_merge(owner: &str, repo: &str, pr: u32, admin: bool) -> Result<(), String> {
+    let pr_str = pr.to_string();
+    let repo_arg = format!("{owner}/{repo}");
+    let mut args: Vec<&str> = vec!["pr", "merge", "--merge", &pr_str, "--repo", &repo_arg];
+    if admin {
+        args.push("--admin");
+    }
+    let out = std::process::Command::new("gh")
+        .args(&args)
+        .output()
+        .map_err(|e| format!("spawn gh: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "gh pr merge exited {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    ))
 }
 
 /// Parses `https://github.com/<owner>/<repo>/pull/<n>` into its three

@@ -5,7 +5,10 @@
 //! exit code, and pre-write sleep are steered through `FAKE_CLAUDE_*` env
 //! vars. PATH is prepended for the duration of each test via a `RAII`
 //! [`HelperHarness`] guard mirroring the pattern established in
-//! `tests/pr_finalize.rs`.
+//! `tests/pr_finalize.rs`. Now that pr-finalize runs `pr-monitor.sh`
+//! directly (no Claude middle-man) the typed pr-finalize wrapper has
+//! been retired; the sidecar / wrapper happy-path coverage targets
+//! `RunReviewerTeam` instead.
 //!
 //! ### Test design
 //!
@@ -37,8 +40,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use plan_executor::helper::{
-    invoke_helper, invoke_helper_with, invoke_pr_finalize, HelperError, HelperInvocation,
-    HelperSkill, HelperStatus, PrFinalizeInput, PrFinalizeMergeMode, PrFinalizeOutput,
+    invoke_helper, invoke_helper_with, HelperError, HelperInvocation, HelperSkill, HelperStatus,
 };
 use plan_executor::job::step::StepContext;
 use tempfile::TempDir;
@@ -253,47 +255,32 @@ fn run_reviewer_team_envelope(status: &str) -> String {
     .to_string()
 }
 
-fn pr_finalize_envelope(status: &str) -> String {
-    serde_json::json!({
-        "status": status,
-        "next_step": "done",
-        "notes": "ok",
-        "state_updates": {
-            "pr_state": "MERGED",
-            "merge_sha": "0123456789abcdef0123456789abcdef01234567",
-            "bugbot_comments_addressed": 2
-        }
-    })
-    .to_string()
-}
-
-fn sample_pr_finalize_input() -> PrFinalizeInput {
-    PrFinalizeInput {
-        owner: "octo".to_string(),
-        repo: "demo".to_string(),
-        pr: 42,
-        merge_mode: PrFinalizeMergeMode::Merge,
-    }
-}
-
 // =====================================================================
-// Scenario P1: invoke_pr_finalize happy path returns typed output.
+// Scenario P1: invoke_helper happy path returns the parsed envelope.
 // =====================================================================
 
 #[test]
-fn invoke_pr_finalize_returns_typed_output_on_success() {
-    let h = HelperHarness::new().with_response(&pr_finalize_envelope("success"));
+fn invoke_helper_returns_typed_output_on_success() {
+    let h = HelperHarness::new().with_response(&run_reviewer_team_envelope("success"));
     let ctx = step_ctx(h.workdir());
 
-    let result = invoke_pr_finalize_with_timeout(sample_pr_finalize_input(), &ctx);
+    let result = invoke_helper_with(
+        HelperSkill::RunReviewerTeam,
+        serde_json::json!({}),
+        &ctx,
+        &fast_options(),
+    );
 
-    let expected: PrFinalizeOutput = serde_json::from_value(serde_json::json!({
-        "pr_state": "MERGED",
-        "merge_sha": "0123456789abcdef0123456789abcdef01234567",
-        "bugbot_comments_addressed": 2
-    }))
-    .expect("decode expected PrFinalizeOutput");
-    assert_eq!(result.expect("invoke_pr_finalize Ok"), expected);
+    let envelope = result.expect("invoke_helper Ok");
+    assert_eq!(envelope.status, HelperStatus::Success);
+    assert_eq!(envelope.next_step, "proceed");
+    assert_eq!(
+        envelope
+            .state_updates
+            .get("findings_path")
+            .and_then(|v| v.as_str()),
+        Some("/tmp/findings.md")
+    );
 }
 
 // =====================================================================
@@ -523,15 +510,15 @@ fn extra_top_level_field_maps_to_protocol_violation() {
 
 #[test]
 fn invoke_helper_writes_input_sidecar_under_workdir() {
-    let h = HelperHarness::new().with_response(&pr_finalize_envelope("success"));
+    let h = HelperHarness::new().with_response(&run_reviewer_team_envelope("success"));
     let ctx = step_ctx(h.workdir());
 
     // SAFETY: harness owns ENV_LOCK.
     unsafe { std::env::set_var("PLAN_EXECUTOR_HELPER_TIMEOUT_SECS", "2") };
 
     let result = invoke_helper(
-        HelperSkill::PrFinalize,
-        serde_json::json!({"owner":"o","repo":"r","pr":1,"merge_mode":"none"}),
+        HelperSkill::RunReviewerTeam,
+        serde_json::json!({}),
         &ctx,
     );
 
@@ -544,34 +531,13 @@ fn invoke_helper_writes_input_sidecar_under_workdir() {
 
     assert_eq!(entries.len(), 1, "expected one sidecar, got {entries:?}");
     let only = entries.first().expect("entry");
-    let expected_name = "001-001-pr_finalize.input.json".to_string();
+    let expected_name = "001-001-run_reviewer_team.input.json".to_string();
     assert_eq!(only, &expected_name);
-    // Sanity: the helper run succeeded (PrFinalize returns Ok HelperOutput).
     assert!(
         result.is_ok(),
         "expected helper Ok envelope, got {:?}",
         result.err()
     );
-}
-
-// ---------------------------------------------------------------------
-// Wrapper helpers — every wrapper takes a `HelperInvocation` indirectly
-// through `invoke_helper`; these shims thread `fast_options()` through
-// the typed entry points by re-implementing the wrapper inline. This
-// preserves the public-API guarantee while keeping per-test wall-clock
-// bounded to ≤ 1 s on success and ≤ 1 s + spawn overhead on errors.
-// ---------------------------------------------------------------------
-
-fn invoke_pr_finalize_with_timeout(
-    input: PrFinalizeInput,
-    ctx: &StepContext,
-) -> Result<PrFinalizeOutput, HelperError> {
-    let json = serde_json::to_value(&input).expect("serialize PrFinalizeInput");
-    let raw = invoke_helper_with(HelperSkill::PrFinalize, json, ctx, &fast_options())?;
-    serde_json::from_value(raw.state_updates).map_err(|e| HelperError::ProtocolViolation {
-        category: "state_updates_shape".to_string(),
-        detail: format!("decode state_updates failed: {e}"),
-    })
 }
 
 /// Returns the `category` string of a `ProtocolViolation`, panicking
@@ -581,11 +547,4 @@ fn protocol_violation_category(err: &HelperError) -> String {
         HelperError::ProtocolViolation { category, .. } => category.clone(),
         other => panic!("expected ProtocolViolation, got {other:?}"),
     }
-}
-
-// Suppress unused-import warning when the only typed wrapper shim left
-// (pr_finalize) happens to be unused on a given test cfg.
-#[allow(dead_code)]
-fn _api_surface_smoke() {
-    let _ = invoke_pr_finalize;
 }
