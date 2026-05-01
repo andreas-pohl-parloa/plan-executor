@@ -372,6 +372,14 @@ impl SchedulerHooks {
         self.publish_display_line(line);
     }
 
+    /// Persists + broadcasts a single execution-summary display line. Used
+    /// by `SummaryStep` to surface the counts block (tasks / attempts /
+    /// retries / protocol violations) in `output -f` without forcing
+    /// callers to grep `<job_dir>/.tmp-execution-summary.md`.
+    pub fn announce_summary_line(&self, line: String) {
+        self.publish_display_line(line);
+    }
+
     /// Persists + broadcasts a wave-retry banner naming which sub-agent
     /// indices are being re-dispatched after a transient failure. Distinct
     /// from `announce_wave_dispatch` so `output -f` and `jobs` can show
@@ -1087,14 +1095,9 @@ async fn run_rust_scheduler_steps(
     job_id: &str,
     manifest_path: &Path,
 ) -> bool {
-    use crate::job::metrics::JobMetrics;
-    use crate::job::step::StepContext;
+    use crate::job::runtime;
     use crate::job::storage::JobStore;
-    use crate::job::types::{AttemptOutcome, JobId};
-
-    let job_id_owned = JobId(job_id.to_string());
-    let mut metrics = JobMetrics::new(job_id_owned.clone());
-    let mut pipeline_ok = true;
+    use crate::job::types::JobId;
 
     let event_tx = { state.lock().await.event_tx.clone() };
     let hooks = Arc::new(SchedulerHooks {
@@ -1104,132 +1107,23 @@ async fn run_rust_scheduler_steps(
         helper_dispatch_counter: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1000)),
     });
 
-    // `current_workdir` lives across the whole pipeline so a step that
-    // mutates `ctx.workdir` (preflight redirects to the per-plan
-    // worktree) propagates that change to every subsequent step. Before
-    // this hoist, each step received a fresh `StepContext` with the
-    // original `workdir`, so validation / review / pr_finalize ran
-    // against the source repo instead of the worktree where the work
-    // actually happened.
-    let mut current_workdir = workdir.clone();
+    let observer: Arc<dyn runtime::PipelineObserver> = Arc::new(DaemonObserver {
+        job_id: job_id.to_string(),
+        state: Arc::clone(state),
+        hooks: Arc::clone(&hooks),
+    });
 
-    for (idx, step) in steps.iter().enumerate() {
-        let seq = u32::try_from(idx + 1).unwrap_or(u32::MAX);
-
-        // Bail out cleanly if a KillJob / watchdog kill removed the job
-        // from `running_jobs` while a previous step was running.
-        {
-            let st = state.lock().await;
-            if !st.running_jobs.contains_key(job_id) {
-                tracing::info!(job = %job_id, "rust scheduler: job no longer running, aborting pipeline");
-                pipeline_ok = false;
-                break;
-            }
-        }
-
-        let mut ctx = StepContext {
-            job_dir: job_dir.clone(),
-            step_seq: seq,
-            attempt_n: 1,
-            workdir: current_workdir.clone(),
-            daemon_hooks: Some(Arc::clone(&hooks)),
-        };
-
-        let line = format!("⏺ [plan-executor] step {} ({}) starting", seq, step.name());
-        append_display(job_id, &line);
-        {
-            let mut st = state.lock().await;
-            st.job_last_activity.insert(job_id.to_string(), Instant::now());
-            st.job_display_output
-                .entry(job_id.to_string())
-                .or_default()
-                .push_back(line.clone());
-            let _ = st.event_tx.send(DaemonEvent::JobDisplayLine {
-                job_id: job_id.to_string(),
-                line,
-            });
-        }
-
-        // Step boundary — count once per step before running attempts.
-        metrics.record_step();
-
-        let policy = step.recovery_policy();
-        let outcome = run_step_with_retries(
-            step.as_ref(),
-            &policy,
-            &mut ctx,
-            &mut metrics,
-            job_id,
-            seq,
-            state,
-        )
-        .await;
-
-        // Carry any workdir mutation made by this step (e.g. preflight
-        // redirecting into the freshly-created per-plan worktree)
-        // forward to the next step's `StepContext`.
-        current_workdir = ctx.workdir.clone();
-
-        let (ok, summary) = match &outcome {
-            AttemptOutcome::Success => (true, "success".to_string()),
-            // Placeholder shells (`PreflightStep`, `PrFinalizeStep`) emit
-            // `Pending` today; treat as a pass so the pipeline reaches
-            // the real step bodies that follow.
-            AttemptOutcome::Pending => (true, "pending (placeholder)".to_string()),
-            AttemptOutcome::TransientInfra { error } => (false, format!("transient_infra: {error}")),
-            AttemptOutcome::HardInfra { error } => (false, format!("hard_infra: {error}")),
-            AttemptOutcome::ProtocolViolation { category, detail } => {
-                (false, format!("protocol_violation [{category}]: {detail}"))
-            }
-            AttemptOutcome::SemanticMistake { fix_loop_round } => {
-                (false, format!("semantic_mistake (round {fix_loop_round})"))
-            }
-            AttemptOutcome::SpecDrift { gap } => (false, format!("spec_drift: {gap}")),
-        };
-
-        let line = format!(
-            "⏺ [plan-executor] step {} ({}) {}",
-            seq,
-            step.name(),
-            summary
-        );
-        append_display(job_id, &line);
-        {
-            let mut st = state.lock().await;
-            st.job_last_activity.insert(job_id.to_string(), Instant::now());
-            st.job_display_output
-                .entry(job_id.to_string())
-                .or_default()
-                .push_back(line.clone());
-            let _ = st.event_tx.send(DaemonEvent::JobDisplayLine {
-                job_id: job_id.to_string(),
-                line,
-            });
-        }
-
-        if !ok {
-            tracing::error!(
-                step = step.name(),
-                seq,
-                outcome = ?outcome,
-                "step failed; aborting pipeline",
-            );
-            pipeline_ok = false;
-            break;
-        }
-    }
+    let run = runtime::run_pipeline(steps, job_dir, workdir, observer).await;
+    let pipeline_ok = run.success;
 
     // On terminal failure, flip the manifest's `plan.status` to
-    // `FAILED` so the READY-only execution gate refuses to re-run
-    // a half-broken manifest without a fresh compile. The success
-    // path is owned by `SummaryStep`, which writes `COMPLETED`.
-    // Best-effort: a persistence failure here only loses the
-    // status-machine signal, not the underlying job-failure record
-    // already captured below.
+    // `FAILED` so the READY-only execution gate refuses to re-run a
+    // half-broken manifest without a fresh compile. The success path
+    // is owned by `SummaryStep`, which writes `COMPLETED`. Best-effort:
+    // a persistence failure here only loses the status-machine signal,
+    // not the underlying job-failure record already captured below.
     if !pipeline_ok {
-        if let Err(e) =
-            crate::job::steps::plan::set_manifest_status(manifest_path, "FAILED")
-        {
+        if let Err(e) = crate::job::steps::plan::set_manifest_status(manifest_path, "FAILED") {
             tracing::warn!(
                 job = %job_id,
                 manifest = %manifest_path.display(),
@@ -1239,224 +1133,134 @@ async fn run_rust_scheduler_steps(
         }
     }
 
-    // Finalize and persist metrics on every terminal state (success or
-    // failure). Errors here are logged but do not change the return value;
-    // the metrics file is best-effort observability data. While we have the
-    // job dir open, also flip `job.json`'s top-level state to the matching
-    // terminal variant so `output -f` and `jobs` reflect the real outcome
-    // instead of an indefinite "running".
-    metrics.finalize();
+    // Flip `job.json`'s top-level state to the matching terminal
+    // variant so `output -f` and `jobs` reflect the real outcome
+    // instead of an indefinite "running". Metrics persistence is
+    // owned by the runtime; we just touch `job.json` here.
+    let job_id_owned = JobId(job_id.to_string());
     match JobStore::new().and_then(|s| s.open(&job_id_owned)) {
-        Ok(dir) => {
-            if let Err(e) = dir.write_metrics(&metrics) {
-                tracing::warn!(job = %job_id, error = %e, "failed to write metrics.json");
-            } else {
-                tracing::debug!(
-                    job = %job_id,
-                    attempts = metrics.attempts_total,
-                    steps = metrics.step_count,
-                    "wrote job metrics.json",
-                );
-            }
-            match dir.read_job() {
-                Ok(mut job) => {
-                    job.state = if pipeline_ok {
-                        crate::job::types::JobState::Succeeded
-                    } else {
-                        crate::job::types::JobState::Failed {
-                            reason: "pipeline aborted".to_string(),
-                            recoverable: false,
-                        }
-                    };
-                    if let Err(e) = dir.write_job_metadata(&job) {
-                        tracing::warn!(job = %job_id, error = %e, "failed to write terminal job.json");
+        Ok(dir) => match dir.read_job() {
+            Ok(mut job) => {
+                job.state = if pipeline_ok {
+                    crate::job::types::JobState::Succeeded
+                } else {
+                    crate::job::types::JobState::Failed {
+                        reason: "pipeline aborted".to_string(),
+                        recoverable: false,
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(job = %job_id, error = %e, "failed to read job.json for terminal update");
+                };
+                if let Err(e) = dir.write_job_metadata(&job) {
+                    tracing::warn!(job = %job_id, error = %e, "failed to write terminal job.json");
                 }
             }
-        }
+            Err(e) => {
+                tracing::warn!(job = %job_id, error = %e, "failed to read job.json for terminal update");
+            }
+        },
         Err(e) => {
-            tracing::warn!(job = %job_id, error = %e, "failed to open job dir for metrics");
+            tracing::warn!(job = %job_id, error = %e, "failed to open job dir for terminal job.json update");
         }
     }
 
+    tracing::debug!(
+        job = %job_id,
+        attempts = run.metrics.attempts_total,
+        steps = run.metrics.step_count,
+        "pipeline finished",
+    );
     pipeline_ok
 }
 
-/// Runs a single step with the retry semantics encoded in `policy`.
-///
-/// Each attempt is recorded into `metrics` so the persisted aggregates
-/// reflect the true attempt count even when later attempts succeed. On
-/// retry, broadcasts a `step N (name) attempt X/Y after <reason>: <detail>`
-/// display line so `output -f` and `jobs` see the loop is in motion.
-///
-/// Honors any combination of [`RetryTransient`] and [`RetryProtocol`]
-/// reachable from `policy`, including nested inside [`RecoveryPolicy::Compose`]
-/// (the canonical shape `helper_compose_policy` builds for `code_review` /
-/// `validation`). Per-kind budgets are tracked independently so a Compose
-/// of `[RetryTransient { max: 3 }, RetryProtocol { max: 1 }]` can absorb up
-/// to three transient blips AND one protocol violation in the same step run.
-///
-/// Other outcomes (`Success`, `Pending`, `HardInfra`, `SemanticMistake`,
-/// `SpecDrift`) short-circuit with no retry. `Rollback` and `OperatorDecision`
-/// children are recognized but treated as no-op for retry budgeting today.
-async fn run_step_with_retries(
-    step: &dyn crate::job::step::Step,
-    policy: &crate::job::recovery::RecoveryPolicy,
-    ctx: &mut crate::job::step::StepContext,
-    metrics: &mut crate::job::metrics::JobMetrics,
-    job_id: &str,
-    seq: u32,
-    state: &Arc<Mutex<DaemonState>>,
-) -> crate::job::types::AttemptOutcome {
-    use crate::job::types::AttemptOutcome;
-
-    // Resolve the active retry budgets from `policy` once. Compose unwrapping
-    // collects the *first* RetryTransient / RetryProtocol it finds (matching
-    // the Rust scheduler's "linear policy chain" interpretation; nested
-    // Composes are flattened).
-    let (transient_budget, protocol_budget) = collect_retry_budgets(policy);
-
-    let mut transient_used: u32 = 0;
-    let mut protocol_used: u32 = 0;
-    let mut attempt: u32 = 1;
-
-    loop {
-        ctx.attempt_n = attempt;
-        tracing::info!(
-            step = step.name(),
-            seq,
-            attempt,
-            "running step"
-        );
-        let outcome = step.run(ctx).await;
-        metrics.record_attempt(&outcome, Some(policy));
-
-        let retry_decision = match &outcome {
-            AttemptOutcome::TransientInfra { .. } => transient_budget
-                .as_ref()
-                .filter(|b| transient_used < u32::from(b.max))
-                .map(|b| ("transient_infra", b.backoff.delay(attempt))),
-            AttemptOutcome::ProtocolViolation { .. } => protocol_budget
-                .as_ref()
-                .filter(|b| protocol_used < u32::from(b.max))
-                .map(|_| ("protocol_violation", std::time::Duration::ZERO)),
-            _ => None,
-        };
-
-        let Some((reason_kind, delay)) = retry_decision else {
-            return outcome;
-        };
-
-        let detail = match &outcome {
-            AttemptOutcome::TransientInfra { error } => error.clone(),
-            AttemptOutcome::ProtocolViolation { category, detail } => {
-                format!("[{category}] {detail}")
-            }
-            _ => unreachable!("retry_decision matched non-retryable outcome"),
-        };
-        let next_attempt = attempt + 1;
-        let total_budget = u32::from(transient_budget.as_ref().map(|b| b.max).unwrap_or(0))
-            + u32::from(protocol_budget.as_ref().map(|b| b.max).unwrap_or(0));
-        let line = format!(
-            "⏺ [plan-executor] step {} ({}) attempt {}/{} after {}: {}",
-            seq,
-            step.name(),
-            next_attempt,
-            total_budget + 1,
-            reason_kind,
-            truncate_ellipsis(&detail, 160),
-        );
-        append_display(job_id, &line);
-        {
-            let mut st = state.lock().await;
-            st.job_last_activity.insert(job_id.to_string(), Instant::now());
-            st.job_display_output
-                .entry(job_id.to_string())
-                .or_default()
-                .push_back(line.clone());
-            let _ = st.event_tx.send(DaemonEvent::JobDisplayLine {
-                job_id: job_id.to_string(),
-                line,
-            });
-        }
-
-        match reason_kind {
-            "transient_infra" => transient_used += 1,
-            "protocol_violation" => protocol_used += 1,
-            _ => unreachable!(),
-        }
-
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-        attempt = next_attempt;
-    }
+/// Daemon-side [`runtime::PipelineObserver`]. Routes display lines to
+/// the broadcast bus + per-job display buffer, ticks
+/// `job_last_activity` for the watchdog, and watches `running_jobs`
+/// for KillJob / watchdog kicks so the pipeline stops cleanly.
+struct DaemonObserver {
+    job_id: String,
+    state: Arc<Mutex<DaemonState>>,
+    hooks: Arc<SchedulerHooks>,
 }
 
-/// Linearizes the retry budgets reachable from `policy`. Returns the first
-/// `RetryTransient` and the first `RetryProtocol` encountered in a
-/// depth-first walk, ignoring `None` / `Rollback` / `OperatorDecision`
-/// children (those are no-op for retry budgeting today).
-fn collect_retry_budgets(
-    policy: &crate::job::recovery::RecoveryPolicy,
-) -> (Option<RetryTransientBudget>, Option<RetryProtocolBudget>) {
-    use crate::job::recovery::RecoveryPolicy;
-    let mut transient = None;
-    let mut protocol = None;
-    fn walk(
-        p: &RecoveryPolicy,
-        transient: &mut Option<RetryTransientBudget>,
-        protocol: &mut Option<RetryProtocolBudget>,
+#[async_trait::async_trait]
+impl crate::job::runtime::PipelineObserver for DaemonObserver {
+    fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    fn on_step_start(&self, seq: u32, name: &str) {
+        let line = format!("⏺ [plan-executor] step {seq} ({name}) starting");
+        publish_display_line(&self.state, &self.job_id, line);
+    }
+
+    fn on_step_end(
+        &self,
+        seq: u32,
+        name: &str,
+        _outcome: &crate::job::types::AttemptOutcome,
+        summary: &str,
     ) {
-        match p {
-            RecoveryPolicy::RetryTransient { max, backoff } => {
-                if transient.is_none() {
-                    *transient = Some(RetryTransientBudget {
-                        max: *max,
-                        backoff: backoff.clone(),
-                    });
-                }
-            }
-            RecoveryPolicy::RetryProtocol { max, .. } => {
-                if protocol.is_none() {
-                    *protocol = Some(RetryProtocolBudget { max: *max });
-                }
-            }
-            RecoveryPolicy::Compose { policies } => {
-                for child in policies {
-                    walk(child, transient, protocol);
-                }
-            }
-            RecoveryPolicy::Rollback { then, .. } => {
-                walk(then, transient, protocol);
-            }
-            RecoveryPolicy::None | RecoveryPolicy::OperatorDecision { .. } => {}
+        let line = format!("⏺ [plan-executor] step {seq} ({name}) {summary}");
+        publish_display_line(&self.state, &self.job_id, line);
+    }
+
+    fn on_step_retry(
+        &self,
+        seq: u32,
+        name: &str,
+        next_attempt: u32,
+        total_budget: u32,
+        reason: &str,
+        detail: &str,
+    ) {
+        let line = format!(
+            "⏺ [plan-executor] step {seq} ({name}) attempt {next_attempt}/{total_budget} after {reason}: {detail}"
+        );
+        publish_display_line(&self.state, &self.job_id, line);
+    }
+
+    async fn is_killed(&self) -> bool {
+        let st = self.state.lock().await;
+        !st.running_jobs.contains_key(&self.job_id)
+    }
+
+    fn touch_activity(&self) {
+        // Best-effort sync touch — try_lock so a hot retry loop never
+        // blocks on the daemon mutex.
+        if let Ok(mut st) = self.state.try_lock() {
+            st.job_last_activity
+                .insert(self.job_id.clone(), Instant::now());
         }
     }
-    walk(policy, &mut transient, &mut protocol);
-    (transient, protocol)
-}
 
-struct RetryTransientBudget {
-    max: u8,
-    backoff: crate::job::recovery::Backoff,
-}
-
-struct RetryProtocolBudget {
-    max: u8,
-}
-
-fn truncate_ellipsis(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-        out.push('…');
-        out
+    fn daemon_hooks(&self) -> Option<Arc<SchedulerHooks>> {
+        Some(Arc::clone(&self.hooks))
     }
+}
+
+/// Helper used by [`DaemonObserver`] to push a display line into both
+/// the per-job display buffer and the broadcast bus that `output -f`
+/// listens to. Mirrors the inline blocks the previous `run_rust_scheduler_steps`
+/// repeated for every line.
+fn publish_display_line(state: &Arc<Mutex<DaemonState>>, job_id: &str, line: String) {
+    append_display(job_id, &line);
+    let job_id_owned = job_id.to_string();
+    let state = Arc::clone(state);
+    // Spawn a tokio task to take the async lock without blocking the
+    // sync caller. Drop semantics: if the runtime is shutting down,
+    // the line just gets logged via append_display above.
+    tokio::spawn(async move {
+        let mut st = state.lock().await;
+        st.job_last_activity
+            .insert(job_id_owned.clone(), Instant::now());
+        st.job_display_output
+            .entry(job_id_owned.clone())
+            .or_default()
+            .push_back(line.clone());
+        let _ = st.event_tx.send(DaemonEvent::JobDisplayLine {
+            job_id: job_id_owned,
+            line,
+        });
+    });
 }
 
 fn find_repo_root(path: &Path) -> Option<PathBuf> {
@@ -1584,73 +1388,6 @@ async fn handle_tui_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn collect_retry_budgets_unwraps_compose_pair() {
-        use crate::job::recovery::{Backoff, CorrectivePromptKey, RecoveryPolicy};
-        // Mirrors the canonical helper_compose_policy shape used by
-        // CodeReviewStep / ValidationStep: Compose([RetryTransient,
-        // RetryProtocol]). Both budgets must be lifted out so retries fire
-        // for either outcome kind.
-        let policy = RecoveryPolicy::Compose {
-            policies: vec![
-                RecoveryPolicy::RetryTransient {
-                    max: 3,
-                    backoff: Backoff::Fixed { ms: 100 },
-                },
-                RecoveryPolicy::RetryProtocol {
-                    max: 1,
-                    corrective: CorrectivePromptKey("k".to_string()),
-                },
-            ],
-        };
-        let (t, p) = collect_retry_budgets(&policy);
-        assert_eq!(t.as_ref().expect("transient").max, 3);
-        assert_eq!(p.as_ref().expect("protocol").max, 1);
-    }
-
-    #[test]
-    fn collect_retry_budgets_handles_bare_retry_transient() {
-        use crate::job::recovery::{Backoff, RecoveryPolicy};
-        let policy = RecoveryPolicy::RetryTransient {
-            max: 2,
-            backoff: Backoff::Fixed { ms: 0 },
-        };
-        let (t, p) = collect_retry_budgets(&policy);
-        assert_eq!(t.expect("transient").max, 2);
-        assert!(p.is_none());
-    }
-
-    #[test]
-    fn collect_retry_budgets_returns_none_for_recovery_none() {
-        use crate::job::recovery::RecoveryPolicy;
-        let (t, p) = collect_retry_budgets(&RecoveryPolicy::None);
-        assert!(t.is_none());
-        assert!(p.is_none());
-    }
-
-    #[test]
-    fn collect_retry_budgets_walks_nested_compose() {
-        use crate::job::recovery::{Backoff, CorrectivePromptKey, RecoveryPolicy};
-        let policy = RecoveryPolicy::Compose {
-            policies: vec![
-                RecoveryPolicy::None,
-                RecoveryPolicy::Compose {
-                    policies: vec![RecoveryPolicy::RetryTransient {
-                        max: 5,
-                        backoff: Backoff::Fixed { ms: 0 },
-                    }],
-                },
-                RecoveryPolicy::RetryProtocol {
-                    max: 2,
-                    corrective: CorrectivePromptKey("k".to_string()),
-                },
-            ],
-        };
-        let (t, p) = collect_retry_budgets(&policy);
-        assert_eq!(t.expect("transient").max, 5);
-        assert_eq!(p.expect("protocol").max, 2);
-    }
 
     #[test]
     fn compute_watchdog_timings_uses_monotonic_start() {
