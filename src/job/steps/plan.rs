@@ -32,7 +32,7 @@ use serde_json::json;
 use crate::finding::{Finding, Severity};
 use crate::helper::{
     invoke_helper, invoke_pr_finalize, HelperError, HelperOutput, HelperSkill, HelperStatus,
-    PrFinalizeInput, PrFinalizeMergeMode, ReviewTeamInput, ReviewTriageInput, ValidatorInput,
+    PrFinalizeInput, PrFinalizeMergeMode, ReviewTeamInput, ValidatorInput,
 };
 use crate::job::recovery::{Backoff, CorrectivePromptKey, RecoveryPolicy};
 use crate::job::step::{Step, StepContext};
@@ -1449,68 +1449,108 @@ fn build_findings_for_fix_wave(
 ) -> Result<PathBuf, AttemptOutcome> {
     match kind {
         HelperLoopKind::CodeReview => {
-            // The fix-wave triage helper is invoked synchronously after a
-            // SemanticFailure; if the helper requests `waiting_for_handoffs`
-            // it has its own dispatch round-trip handled by run_helper_fix_loop.
-            // We don't pre-populate `prior_handoff_outputs_path` here (the
-            // first call into the triage skill is always dispatch mode).
-            let triage_input = ReviewTriageInput {
-                plan_path: plan_path.to_path_buf(),
-                execution_root: ctx.workdir.clone(),
-                changed_files: Vec::new(),
-                language: detect_language(&ctx.workdir),
-                recipe_list: Vec::new(),
-                skip_code_review: false,
-                state_file_path: ctx.workdir.join(".tmp-execute-plan-state.json"),
-                execution_state: json!({}),
-                review_state: json!({}),
-                review_state_path: None,
-                prior_review_notes: json!({}),
-                prior_handoff_outputs_path: String::new(),
-            };
-            let envelope = serde_json::to_value(&triage_input).map_err(|e| {
-                AttemptOutcome::ProtocolViolation {
-                    category: "input_serialize".to_string(),
-                    detail: format!("serialize ReviewTriageInput failed: {e}"),
-                }
-            })?;
-            let raw = invoke_helper(HelperSkill::ReviewExecutionOutput, envelope, ctx)
-                .map_err(helper_error_to_outcome)?;
-            // Triage state_updates carries `triaged_findings_path` and
-            // optionally `wave_id_for_fix`. The triage helper guarantees the
-            // findings file is in `findings.json` shape (the file the CLI
-            // consumes directly). The reviewer-team `findings_path` (when
-            // present) and the validator `validation_report_path` are also
-            // helper-supplied paths; we canonicalize each one and require
-            // it to remain under `ctx.workdir` before trusting it.
-            let triaged_findings_path = raw
-                .state_updates
-                .get("triaged_findings_path")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AttemptOutcome::ProtocolViolation {
-                    category: "triage_missing_path".to_string(),
-                    detail: "triage state_updates missing triaged_findings_path".to_string(),
-                })?;
-            let triaged_buf = PathBuf::from(triaged_findings_path);
-            let canonical =
-                ensure_path_under_workdir(&triaged_buf, &ctx.workdir, "triaged_findings_path")?;
-            // If the reviewer team also reported its raw `findings_path`,
-            // confirm it is contained too. We do not consume that path here
-            // (the triaged file is what the CLI ingests), but a missing
-            // containment check would still let an attacker influence
-            // downstream consumers via the same payload.
-            if let Some(findings_path_str) = raw
-                .state_updates
+            // `run_reviewer_team` already triaged its reviewer batch and
+            // wrote the result to `state_updates.findings_path`. Re-
+            // invoking `review-execution-output` here was duplicate work
+            // and broke under the helper's "input must match on-disk
+            // state" contract: we passed empty state inputs but the
+            // workdir already carried `.tmp-helper-findings-attempt-N.json`
+            // from the just-completed reviewer-team triage, so the helper
+            // returned `status: blocked` with a spec_drift message. Read
+            // the run_reviewer_team file directly, filter to the
+            // `FIX_REQUIRED` rows, project them onto the
+            // `findings.schema.json` shape, and hand that to
+            // `compile-fix-waves`.
+            let findings_path_str = state_updates
                 .get("findings_path")
                 .and_then(|v| v.as_str())
-            {
-                ensure_path_under_workdir(
-                    Path::new(findings_path_str),
-                    &ctx.workdir,
-                    "findings_path",
-                )?;
-            }
-            Ok(canonical)
+                .ok_or_else(|| AttemptOutcome::ProtocolViolation {
+                    category: "review_missing_findings_path".to_string(),
+                    detail: "run_reviewer_team state_updates missing findings_path"
+                        .to_string(),
+                })?;
+            let findings_buf = PathBuf::from(findings_path_str);
+            let canonical_src =
+                ensure_path_under_workdir(&findings_buf, &ctx.workdir, "findings_path")?;
+            let raw_bytes = std::fs::read(&canonical_src).map_err(|e| {
+                AttemptOutcome::HardInfra {
+                    error: format!(
+                        "read run_reviewer_team findings file {}: {e}",
+                        canonical_src.display()
+                    ),
+                }
+            })?;
+            let raw: serde_json::Value = serde_json::from_slice(&raw_bytes).map_err(|e| {
+                AttemptOutcome::ProtocolViolation {
+                    category: "findings_invalid_json".to_string(),
+                    detail: format!(
+                        "findings file {} not valid JSON: {e}",
+                        canonical_src.display()
+                    ),
+                }
+            })?;
+            let raw_findings = raw
+                .get("findings")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| AttemptOutcome::ProtocolViolation {
+                    category: "findings_shape".to_string(),
+                    detail: "findings file missing top-level `findings` array"
+                        .to_string(),
+                })?;
+            let converted: Vec<crate::finding::Finding> = raw_findings
+                .iter()
+                .filter_map(|f| {
+                    if f.get("category").and_then(|v| v.as_str()) != Some("FIX_REQUIRED") {
+                        return None;
+                    }
+                    let id = f.get("id").and_then(|v| v.as_str())?.to_string();
+                    let description_base =
+                        f.get("description").and_then(|v| v.as_str())?.to_string();
+                    let description = match f.get("reasoning").and_then(|v| v.as_str()) {
+                        Some(r) if !r.is_empty() => {
+                            format!("{description_base}\n\nReviewer reasoning: {r}")
+                        }
+                        _ => description_base,
+                    };
+                    let files = f
+                        .get("file")
+                        .and_then(|v| v.as_str())
+                        .map(|s| vec![s.to_string()])
+                        .unwrap_or_default();
+                    Some(crate::finding::Finding {
+                        id,
+                        severity: crate::finding::Severity::Major,
+                        category: "code_review".to_string(),
+                        description,
+                        files,
+                        suggested_fix: f
+                            .get("suggested_fix")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                    })
+                })
+                .collect();
+
+            let dest_dir = ctx.workdir.join(".plan-executor").join("fix-loop");
+            std::fs::create_dir_all(&dest_dir).map_err(|e| AttemptOutcome::HardInfra {
+                error: format!("create fix-loop dir {}: {e}", dest_dir.display()),
+            })?;
+            let dest = dest_dir.join(format!(
+                "code-review-findings-attempt-{}.json",
+                iteration
+            ));
+            let doc = crate::finding::FindingsFile { findings: converted };
+            let body =
+                serde_json::to_vec_pretty(&doc).map_err(|e| AttemptOutcome::HardInfra {
+                    error: format!("serialize findings.json: {e}"),
+                })?;
+            std::fs::write(&dest, body).map_err(|e| AttemptOutcome::HardInfra {
+                error: format!("write findings file {}: {e}", dest.display()),
+            })?;
+            // Suppress unused-arg warning on `plan_path` here — kept on
+            // the signature because the Validation branch still uses it.
+            let _ = plan_path;
+            Ok(dest)
         }
         HelperLoopKind::Validation => {
             // The validator's `state_updates` payload was forwarded from
