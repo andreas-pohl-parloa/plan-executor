@@ -158,7 +158,9 @@ fn build_plan_step(name: &str, manifest_path: &std::path::Path) -> Box<dyn Step>
         "pr_creation" => Box::new(steps::plan::PrCreationStep {
             manifest_path: manifest_path.to_path_buf(),
         }),
-        "pr_finalize" => Box::new(steps::plan::PrFinalizeStep),
+        "pr_finalize" => Box::new(steps::plan::PrFinalizeStep {
+            manifest_path: manifest_path.to_path_buf(),
+        }),
         "summary" => Box::new(steps::plan::SummaryStep {
             manifest_path: manifest_path.to_path_buf(),
         }),

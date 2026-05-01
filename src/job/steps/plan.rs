@@ -649,8 +649,25 @@ impl Step for PrCreationStep {
     }
 }
 
-/// Stub. Phase D3.3 delegates to PR finalize.
-pub struct PrFinalizeStep;
+/// Real pr_finalize step.
+///
+/// Reads the PR URL persisted by [`PrCreationStep`] from
+/// `<job_dir>/pr-url`, then delegates to
+/// [`crate::helper::invoke_pr_finalize`]. The pr-finalize SKILL runs
+/// `pr-monitor.sh` (poll loop with a 30-minute upper bound) inside its
+/// 35-minute helper timeout (see PR #45) and emits a structured
+/// envelope per `pr_finalize/output.schema.json` (Sidecar Mode, plugin
+/// PR #31).
+///
+/// Skipped when `plan.flags.skip_pr` is `true` or no PR URL is on disk
+/// (e.g. local-only run); both cases short-circuit to
+/// [`AttemptOutcome::Success`] so the summary step still runs.
+#[derive(Debug, Clone)]
+pub struct PrFinalizeStep {
+    /// Absolute path to the compiled `tasks.json` manifest. Used to
+    /// read `plan.flags.skip_pr` / `merge` / `merge_admin`.
+    pub manifest_path: PathBuf,
+}
 
 #[async_trait]
 impl Step for PrFinalizeStep {
@@ -661,11 +678,43 @@ impl Step for PrFinalizeStep {
         true
     }
     fn recovery_policy(&self) -> RecoveryPolicy {
+        // `invoke_pr_finalize` is a single helper subprocess; the
+        // helper's own retry loop (PRs #31 / #32) handles the
+        // protocol-violation / transient-infra cases without needing a
+        // step-level wrapper. Failures here surface to the registry,
+        // which fails the pipeline rather than retrying — pr-monitor
+        // already polls for ~30 minutes; another full pass on top
+        // doubles the wall-clock budget for no benefit.
         RecoveryPolicy::None
     }
-    async fn run(&self, _ctx: &mut StepContext) -> AttemptOutcome {
-        AttemptOutcome::Pending
+    async fn run(&self, ctx: &mut StepContext) -> AttemptOutcome {
+        run_pr_finalize(ctx, &self.manifest_path)
     }
+}
+
+/// Implementation split out as a free function to mirror the
+/// `run_pr_creation` / `run_summary` pattern and stay testable without
+/// constructing the trait object.
+fn run_pr_finalize(ctx: &StepContext, manifest_path: &Path) -> AttemptOutcome {
+    let plan_meta = match load_plan_meta(manifest_path) {
+        Ok(m) => m,
+        Err(outcome) => return outcome,
+    };
+    if plan_meta.flags.skip_pr {
+        tracing::info!("pr_finalize: skipped (plan.flags.skip_pr=true)");
+        return AttemptOutcome::Success;
+    }
+    let pr_url = match read_pr_url(ctx) {
+        Some(u) => u,
+        None => {
+            tracing::warn!(
+                "pr_finalize: skipped — no pr-url file found, but skip_pr=false; \
+                 pr_creation may have run with `--no-pr` or been skipped",
+            );
+            return AttemptOutcome::Success;
+        }
+    };
+    delegate_to_pr_finalize(ctx, &pr_url, plan_meta.flags)
 }
 
 /// Real summary step (D3.3).
@@ -2504,12 +2553,10 @@ fn is_transient_gh_error(stderr: &str) -> bool {
 /// Filename the summary step writes when running locally (skip_pr=true).
 const SUMMARY_FILE: &str = ".tmp-execution-summary.md";
 
-/// Drives the summary step.
-///
-/// When `flags.skip_pr` is `false` and a PR URL is on disk, calls
-/// [`invoke_pr_finalize`] to delegate finalize / Bugbot triage to the
-/// shared helper. Otherwise writes a best-effort markdown summary to
-/// `<job_dir>/.tmp-execution-summary.md`.
+/// Drives the summary step. PR finalize / Bugbot triage moved to the
+/// dedicated `PrFinalizeStep` (step 7); summary is now purely the
+/// markdown artifact + worktree teardown so each step has a single
+/// concern.
 fn run_summary(ctx: &StepContext, manifest_path: &Path) -> AttemptOutcome {
     let plan_meta = match load_plan_meta(manifest_path) {
         Ok(m) => m,
@@ -2517,19 +2564,7 @@ fn run_summary(ctx: &StepContext, manifest_path: &Path) -> AttemptOutcome {
     };
 
     let pr_url = read_pr_url(ctx);
-
-    let outcome = if !plan_meta.flags.skip_pr && pr_url.is_some() {
-        delegate_to_pr_finalize(ctx, pr_url.as_deref().expect("checked"), plan_meta.flags)
-    } else {
-        if !plan_meta.flags.skip_pr {
-            // skip_pr=false but no PR URL on disk; fall through to the
-            // local summary so the run still produces an artifact.
-            tracing::warn!(
-                "summary: skip_pr=false but no pr-url file present; writing local summary",
-            );
-        }
-        write_local_summary(ctx, manifest_path, &plan_meta, pr_url.as_deref())
-    };
+    let outcome = write_local_summary(ctx, manifest_path, &plan_meta, pr_url.as_deref());
 
     if matches!(outcome, AttemptOutcome::Success) && !plan_meta.flags.no_worktree {
         cleanup_worktree_after_summary(ctx, manifest_path, &plan_meta);
