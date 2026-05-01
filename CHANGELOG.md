@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.56.0] - 2026-05-01
+
+### Features
+
+- **runtime:** Unify daemon + foreground execution; add execution-summary counts ([14b402b](https://github.com/andreas-pohl-parloa/plan-executor/commit/14b402b27f209c8b78bf0ce0f4d94494fbb5d931))
 ## [0.55.0] - 2026-05-01
 
 ### Features
