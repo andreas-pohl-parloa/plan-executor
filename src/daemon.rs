@@ -992,6 +992,7 @@ async fn spawn_rust_scheduler_job(
     }
 
     let state_clone = Arc::clone(state);
+    let manifest_for_step = manifest_path.clone();
     tokio::spawn(async move {
         let success = run_rust_scheduler_steps(
             runtime_steps,
@@ -999,6 +1000,7 @@ async fn spawn_rust_scheduler_job(
             execution_root,
             &state_clone,
             &job_id,
+            &manifest_for_step,
         )
         .await;
 
@@ -1042,6 +1044,7 @@ async fn run_rust_scheduler_steps(
     workdir: PathBuf,
     state: &Arc<Mutex<DaemonState>>,
     job_id: &str,
+    manifest_path: &Path,
 ) -> bool {
     use crate::job::metrics::JobMetrics;
     use crate::job::step::StepContext;
@@ -1172,6 +1175,26 @@ async fn run_rust_scheduler_steps(
             );
             pipeline_ok = false;
             break;
+        }
+    }
+
+    // On terminal failure, flip the manifest's `plan.status` to
+    // `FAILED` so the READY-only execution gate refuses to re-run
+    // a half-broken manifest without a fresh compile. The success
+    // path is owned by `SummaryStep`, which writes `COMPLETED`.
+    // Best-effort: a persistence failure here only loses the
+    // status-machine signal, not the underlying job-failure record
+    // already captured below.
+    if !pipeline_ok {
+        if let Err(e) =
+            crate::job::steps::plan::set_manifest_status(manifest_path, "FAILED")
+        {
+            tracing::warn!(
+                job = %job_id,
+                manifest = %manifest_path.display(),
+                error = %e,
+                "failed to flip manifest plan.status to FAILED",
+            );
         }
     }
 
