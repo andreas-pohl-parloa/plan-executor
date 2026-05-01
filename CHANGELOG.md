@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.52.6] - 2026-05-01
+
+### Bug Fixes
+
+- **fix-loop:** Bump iteration cap from 3 to 5 for converging tail (#47) ([7088c2b](https://github.com/andreas-pohl-parloa/plan-executor/commit/7088c2ba76ba6c742fe35886ce88d9c974ef91f3))
 ## [0.52.5] - 2026-05-01
 
 ### Bug Fixes
