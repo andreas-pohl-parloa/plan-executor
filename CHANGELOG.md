@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.55.0] - 2026-05-01
+
+### Features
+
+- **manifest:** Wire READY → EXECUTING → COMPLETED / FAILED transitions ([e93c572](https://github.com/andreas-pohl-parloa/plan-executor/commit/e93c572384ce2844671af7036e5c4bf3741a7387))
+- **manifest:** Remote-side status flips; drop plan markdown headers; cap PR title ([d0ee4a9](https://github.com/andreas-pohl-parloa/plan-executor/commit/d0ee4a96ea9f7ec168aeab71a5b0ffaa1ba1c936))
 ## [0.54.0] - 2026-05-01
 
 ### Features
