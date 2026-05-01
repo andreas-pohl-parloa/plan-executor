@@ -1385,10 +1385,12 @@ fn invoke_loop_helper(
 
 /// Produces a [`ReviewTeamInput`] from the per-step context.
 ///
-/// Plan path is sourced from the manifest. `changed_files` is populated from
-/// the helper-state file if available; otherwise an empty list (the helper
-/// will fall back to its own discovery). `recipe_list` defaults to the empty
-/// vec — the helper consults the workdir for project-specific recipes.
+/// Plan path is sourced from the manifest. `changed_files` is computed
+/// once from `git diff <target_branch>...HEAD --name-only` in the
+/// worktree so every reviewer in the team gets the same list without
+/// each one shelling out independently. `recipe_list` defaults to the
+/// empty vec — the helper consults the workdir for project-specific
+/// recipes.
 fn build_review_team_input(
     ctx: &StepContext,
     manifest_path: &Path,
@@ -1419,7 +1421,10 @@ fn build_review_team_input(
             "wave_execution iteration {iteration}; manifest at {}",
             manifest_path.display()
         ),
-        changed_files: Vec::new(),
+        changed_files: compute_changed_files(
+            &ctx.workdir,
+            manifest.plan.target_branch.as_deref(),
+        ),
         language: detect_language(&ctx.workdir),
         recipe_list: Vec::new(),
         prior_review_context: json!({}),
@@ -1457,7 +1462,10 @@ fn build_validator_input(
     Ok(ValidatorInput {
         plan_path: PathBuf::from(&manifest.plan.path),
         execution_root: ctx.workdir.clone(),
-        changed_files: Vec::new(),
+        changed_files: compute_changed_files(
+            &ctx.workdir,
+            manifest.plan.target_branch.as_deref(),
+        ),
         language: detect_language(&ctx.workdir),
         recipe_list: Vec::new(),
         skip_code_review: false,
@@ -1470,6 +1478,74 @@ fn build_validator_input(
         prior_helper_outcomes: json!({}),
         prior_handoff_outputs_path: prior_outputs,
     })
+}
+
+/// Computes the list of files this plan run has changed against the
+/// PR's eventual merge target. Runs `git diff <base>...HEAD --name-only
+/// --no-renames` once in `workdir` so the orchestrator can hand the
+/// result to every reviewer + the validator instead of each helper
+/// independently shelling out for the same answer (and risking a
+/// different base than the orchestrator picked).
+///
+/// Base resolution priority:
+/// 1. `base_branch` when non-empty (sourced from `plan.target_branch`).
+/// 2. `origin/HEAD` symbolic-ref short name (e.g. `origin/main`).
+/// 3. Literal `main`.
+///
+/// Best-effort: any git failure returns an empty `Vec` so reviewers
+/// fall back to their own discovery rather than failing the step
+/// outright. Three-dot range (`A...B`) is the merge-base form, so the
+/// list is "files this branch added" rather than "files that differ
+/// between tips" — matches the semantics PR reviews want.
+pub(crate) fn compute_changed_files(workdir: &Path, base_branch: Option<&str>) -> Vec<PathBuf> {
+    let base = base_branch
+        .filter(|b| !b.is_empty())
+        .map(str::to_string)
+        .or_else(|| detect_default_remote_branch(workdir))
+        .unwrap_or_else(|| "main".to_string());
+    let spec = format!("{base}...HEAD");
+    let out = std::process::Command::new("git")
+        .arg("diff")
+        .arg(&spec)
+        .arg("--name-only")
+        .arg("--no-renames")
+        .current_dir(workdir)
+        .output();
+    let Ok(output) = out else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Resolves `origin/HEAD` to its short name (e.g. `origin/main`) so
+/// [`compute_changed_files`] has a sensible default when the manifest
+/// omits `target_branch`. Returns `None` when the symbolic-ref lookup
+/// fails or the workdir has no `origin` remote.
+fn detect_default_remote_branch(workdir: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("symbolic-ref")
+        .arg("--short")
+        .arg("refs/remotes/origin/HEAD")
+        .current_dir(workdir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// Heuristic language detector for helper inputs. Looks for canonical project
@@ -3475,6 +3551,68 @@ mod preflight_tests {
     #[test]
     fn truncate_at_word_boundary_is_a_noop_when_input_fits() {
         assert_eq!(truncate_at_word_boundary("hello world", 50), "hello world");
+    }
+
+    /// Builds a throwaway git repo with one commit on `main` and one
+    /// extra commit on a feature branch. Returns the workdir + the
+    /// changed file's name. Used by the changed-files tests so they
+    /// don't depend on the host repo's working state.
+    fn build_two_commit_repo(extra_file: &str) -> (tempfile::TempDir, &'static str) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workdir = tmp.path();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(workdir)
+                .output()
+                .expect("spawn git");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "test"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(workdir.join("seed.txt"), b"seed").expect("seed");
+        run(&["add", "seed.txt"]);
+        run(&["commit", "-q", "--no-verify", "-m", "seed"]);
+        run(&["checkout", "-q", "-b", "feature"]);
+        std::fs::write(workdir.join(extra_file), b"new").expect("write extra");
+        run(&["add", extra_file]);
+        run(&["commit", "-q", "--no-verify", "-m", "extra"]);
+        // Leak the &'static is fine for tests — we want the literal back.
+        (
+            tmp,
+            Box::leak(extra_file.to_string().into_boxed_str()) as &'static str,
+        )
+    }
+
+    #[test]
+    fn compute_changed_files_returns_diff_against_explicit_base() {
+        let (dir, file) = build_two_commit_repo("added.rs");
+        let changed = compute_changed_files(dir.path(), Some("main"));
+        assert_eq!(
+            changed,
+            vec![PathBuf::from(file)],
+            "expected only the new file to show up vs main: got {changed:?}",
+        );
+    }
+
+    #[test]
+    fn compute_changed_files_is_empty_on_unknown_base() {
+        // Best-effort: an unresolvable base ref must NOT panic, must
+        // return an empty list so reviewer fallback discovery still
+        // runs.
+        let (dir, _) = build_two_commit_repo("added.rs");
+        let changed = compute_changed_files(dir.path(), Some("nonexistent-branch-xyz"));
+        assert!(changed.is_empty(), "got: {changed:?}");
+    }
+
+    #[test]
+    fn compute_changed_files_returns_empty_outside_git_workdir() {
+        // No git repo → empty list, no panic.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let changed = compute_changed_files(dir.path(), Some("main"));
+        assert!(changed.is_empty(), "got: {changed:?}");
     }
 
     #[test]

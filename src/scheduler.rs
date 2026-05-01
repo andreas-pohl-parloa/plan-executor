@@ -89,6 +89,14 @@ pub struct PlanBlock {
     /// manifest schema constrains the names to the registry's known set.
     #[serde(default)]
     pub pipeline: Option<PipelineBlock>,
+    /// PR-target branch for the eventual merge. Used by `code_review`
+    /// and `validation` to compute `git diff <target_branch>...HEAD`
+    /// once instead of forcing every reviewer / validator helper to
+    /// re-derive the diff base. Older manifests without the field
+    /// deserialize as `None`, in which case callers fall back to
+    /// `origin/HEAD` and finally `main`.
+    #[serde(default)]
+    pub target_branch: Option<String>,
 }
 
 fn default_execution_mode() -> String {
@@ -742,6 +750,7 @@ mod tests {
                 path: "/tmp/plan.md".to_string(),
                 execution_mode: "local".to_string(),
                 pipeline: None,
+                target_branch: None,
             },
             waves,
             tasks: tasks
