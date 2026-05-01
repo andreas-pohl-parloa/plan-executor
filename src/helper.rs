@@ -80,15 +80,10 @@ const RUN_REVIEWER_TEAM_OUTPUT_SCHEMA: &str =
 const VALIDATE_EXECUTION_PLAN_OUTPUT_SCHEMA: &str =
     include_str!("schemas/helpers/validate_execution_plan/output.schema.json");
 
-/// Output schema for the `pr-finalize` helper.
-const PR_FINALIZE_OUTPUT_SCHEMA: &str =
-    include_str!("schemas/helpers/pr_finalize/output.schema.json");
-
 /// Identifies the narrow helper skill to invoke.
 ///
 /// The slash-command identifier returned by [`HelperSkill::skill_id`] is the
-/// non-interactive variant (`*-non-interactive`) for skills that have one;
-/// `pr-finalize` has only one form so its id is unsuffixed.
+/// non-interactive variant (`*-non-interactive`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum HelperSkill {
@@ -96,8 +91,6 @@ pub enum HelperSkill {
     RunReviewerTeam,
     /// `plan-executor:validate-execution-plan-non-interactive` — plan-vs-output validation.
     ValidateExecutionPlan,
-    /// `plan-executor:pr-finalize` — PR finalize / Bugbot triage.
-    PrFinalize,
 }
 
 impl HelperSkill {
@@ -107,7 +100,6 @@ impl HelperSkill {
         match self {
             Self::RunReviewerTeam => "run-reviewer-team-non-interactive",
             Self::ValidateExecutionPlan => "validate-execution-plan-non-interactive",
-            Self::PrFinalize => "pr-finalize",
         }
     }
 
@@ -121,7 +113,6 @@ impl HelperSkill {
         match self {
             Self::RunReviewerTeam => RUN_REVIEWER_TEAM_OUTPUT_SCHEMA,
             Self::ValidateExecutionPlan => VALIDATE_EXECUTION_PLAN_OUTPUT_SCHEMA,
-            Self::PrFinalize => PR_FINALIZE_OUTPUT_SCHEMA,
         }
     }
 
@@ -130,7 +121,6 @@ impl HelperSkill {
         match self {
             Self::RunReviewerTeam => "run_reviewer_team",
             Self::ValidateExecutionPlan => "validate_execution_plan",
-            Self::PrFinalize => "pr_finalize",
         }
     }
 }
@@ -720,12 +710,10 @@ fn schema_violation_category(instance_path: &str) -> String {
 fn compiled_validator(skill: HelperSkill) -> Result<&'static jsonschema::Validator, HelperError> {
     static RUN_REVIEWER_TEAM: OnceLock<jsonschema::Validator> = OnceLock::new();
     static VALIDATE_EXECUTION_PLAN: OnceLock<jsonschema::Validator> = OnceLock::new();
-    static PR_FINALIZE: OnceLock<jsonschema::Validator> = OnceLock::new();
 
     let cell: &OnceLock<jsonschema::Validator> = match skill {
         HelperSkill::RunReviewerTeam => &RUN_REVIEWER_TEAM,
         HelperSkill::ValidateExecutionPlan => &VALIDATE_EXECUTION_PLAN,
-        HelperSkill::PrFinalize => &PR_FINALIZE,
     };
 
     if let Some(v) = cell.get() {
@@ -761,27 +749,6 @@ fn compiled_validator(skill: HelperSkill) -> Result<&'static jsonschema::Validat
 // `Required Inputs`. The output shapes mirror the `state_updates` shape in
 // `src/schemas/helpers/<helper>/output.schema.json` (Task D1.1).
 // ---------------------------------------------------------------------------
-
-/// Decodes `state_updates` from a [`HelperOutput`] into the caller's typed
-/// output struct, mapping serde failures into [`HelperError::ProtocolViolation`].
-fn decode_state_updates<T: serde::de::DeserializeOwned>(
-    output: HelperOutput,
-) -> Result<T, HelperError> {
-    serde_json::from_value(output.state_updates).map_err(|e| HelperError::ProtocolViolation {
-        category: "state_updates_shape".to_string(),
-        detail: format!("decode state_updates failed: {e}"),
-    })
-}
-
-/// Serializes a wrapper input struct into the JSON envelope passed to
-/// [`invoke_helper`], mapping serde failures into
-/// [`HelperError::ProtocolViolation`] so callers see a uniform error type.
-fn serialize_wrapper_input<T: Serialize>(input: &T) -> Result<serde_json::Value, HelperError> {
-    serde_json::to_value(input).map_err(|e| HelperError::ProtocolViolation {
-        category: "input_serialize".to_string(),
-        detail: format!("serialize wrapper input failed: {e}"),
-    })
-}
 
 // ----- run-reviewer-team-non-interactive -----------------------------------
 
@@ -867,97 +834,6 @@ pub struct ValidationGap {
     pub goal: String,
     /// Description of the missing evidence preventing the goal from being satisfied.
     pub missing_evidence: String,
-}
-
-// ----- pr-finalize ---------------------------------------------------------
-
-/// Merge intent passed to [`invoke_pr_finalize`].
-///
-/// Mirrors the CLI surface of the `pr-finalize` skill (`--merge`,
-/// `--merge-admin`); kept as an enum (not a `bool`) so the wire shape is
-/// extensible without breaking callers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum PrFinalizeMergeMode {
-    /// Do not merge after finalization.
-    None,
-    /// Merge with `gh pr merge --merge` after finalization.
-    Merge,
-    /// Merge with `gh pr merge --merge --admin` after finalization.
-    MergeAdmin,
-}
-
-/// PR lifecycle state reported by [`invoke_pr_finalize`].
-///
-/// Mirrors the `state_updates.pr_state` enum in the pr-finalize output schema.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-#[non_exhaustive]
-pub enum PrState {
-    /// PR is open and not merged.
-    Open,
-    /// PR has been merged.
-    Merged,
-    /// PR was closed without merging.
-    Closed,
-    /// PR state could not be determined from the helper output.
-    Unknown,
-}
-
-/// Input envelope for [`invoke_pr_finalize`].
-///
-/// The pr-finalize skill is currently CLI-shaped; the wrapper exposes the
-/// minimal subset the orchestrator needs to identify the PR plus an explicit
-/// merge intent.
-#[derive(Debug, Clone, Serialize)]
-pub struct PrFinalizeInput {
-    /// PR owner (e.g. `parloa`).
-    pub owner: String,
-    /// PR repository name (e.g. `plan-executor`).
-    pub repo: String,
-    /// PR number.
-    pub pr: u32,
-    /// Whether (and how) to attempt the merge after finalization.
-    pub merge_mode: PrFinalizeMergeMode,
-}
-
-/// Typed output for [`invoke_pr_finalize`].
-///
-/// Mirrors the `state_updates` shape in the pr-finalize output schema.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct PrFinalizeOutput {
-    /// Lifecycle state of the PR after finalization.
-    pub pr_state: PrState,
-    /// 40-character lower-hex SHA of the merge commit, when the PR was merged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub merge_sha: Option<String>,
-    /// Number of Bugbot comments the helper resolved during finalization.
-    pub bugbot_comments_addressed: u32,
-}
-
-/// Invokes `plan-executor:pr-finalize` and returns its typed `state_updates`
-/// payload.
-///
-/// # Errors
-///
-/// Same as [`invoke_review_team`] but for the pr-finalize helper.
-pub fn invoke_pr_finalize(
-    input: PrFinalizeInput,
-    ctx: &StepContext,
-) -> Result<PrFinalizeOutput, HelperError> {
-    let json = serialize_wrapper_input(&input)?;
-    // pr-finalize delegates to `pr-monitor.sh`, a poll loop with a
-    // hardcoded 30-minute upper bound (`MAX_POLL_ITERATIONS=120` × 15s).
-    // The default 10-minute helper timeout kills the helper before the
-    // script can finish under any non-trivial CI / Bugbot wait. Give
-    // pr-finalize 35 minutes so the script's own deadline fires first.
-    let options = HelperInvocation {
-        timeout: Some(Duration::from_secs(2100)),
-    };
-    let raw = invoke_helper_with(HelperSkill::PrFinalize, json, ctx, &options)?;
-    decode_state_updates(raw)
 }
 
 #[cfg(test)]
