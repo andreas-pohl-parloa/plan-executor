@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.52.7] - 2026-05-01
+
+### Bug Fixes
+
+- **pr_creation:** Only reuse existing PR when state is OPEN (#48) ([1879fbf](https://github.com/andreas-pohl-parloa/plan-executor/commit/1879fbff14bf46954721123d4ff440175c4f98d6))
 ## [0.52.6] - 2026-05-01
 
 ### Bug Fixes
