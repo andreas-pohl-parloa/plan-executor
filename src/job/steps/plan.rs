@@ -2375,21 +2375,41 @@ fn resolve_current_branch(repo_dir: &Path) -> Result<String, AttemptOutcome> {
 /// Looks up an existing PR URL for `branch`. Returns `None` when no PR
 /// matches or when the lookup itself fails (lookups are best-effort; the
 /// caller falls through to `gh pr create`).
+/// Looks up an existing PR for `branch` and returns its URL **only when
+/// it is still `OPEN`**. CLOSED (without merging) PRs are explicitly
+/// ignored so the next `pr_creation` attempt opens a fresh PR instead
+/// of reusing a dead URL — without this filter `pr-finalize` later
+/// refused to operate on the closed PR (pr-monitor.sh won't start) and
+/// the whole pipeline died at the summary step with a `spec_drift`.
+/// MERGED PRs are also ignored: there's nothing left to PR.
+///
+/// On any `gh` error (no PR for branch, network, auth) returns `None`
+/// so the caller falls through to `gh pr create`.
 fn lookup_existing_pr(branch: &str, repo: Option<&str>) -> Option<String> {
-    let mut args: Vec<&str> = vec!["pr", "view", branch, "--json", "url", "--jq", ".url"];
+    let mut args: Vec<&str> = vec![
+        "pr", "view", branch, "--json", "url,state", "--jq", "[.url, .state] | @tsv",
+    ];
     if let Some(r) = repo {
         args.push("--repo");
         args.push(r);
     }
-    match Command::new("gh").args(&args).output() {
-        Ok(out) if out.status.success() => {
-            let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if url.is_empty() {
-                None
-            } else {
-                Some(url)
-            }
-        }
+    let out = Command::new("gh").args(&args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if line.is_empty() {
+        return None;
+    }
+    let mut parts = line.splitn(2, '\t');
+    let url = parts.next()?.trim().to_string();
+    let state = parts.next().unwrap_or("").trim().to_ascii_uppercase();
+    if url.is_empty() {
+        return None;
+    }
+    match state.as_str() {
+        "OPEN" => Some(url),
+        // CLOSED / MERGED / anything else → treat as "no usable PR".
         _ => None,
     }
 }
