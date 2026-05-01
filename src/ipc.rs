@@ -23,8 +23,15 @@ pub enum TuiRequest {
     ResumeJob { job_id: String },
     /// Request full state snapshot
     GetState,
-    /// Track a remote execution PR for status monitoring
-    TrackRemote { plan_path: String, remote_repo: String, pr_number: u64 },
+    /// Track a remote execution PR for status monitoring. `manifest_path`
+    /// is required so the daemon's poll loop can flip `plan.status` in
+    /// the compiled manifest when the GHA PR closes.
+    TrackRemote {
+        plan_path: String,
+        manifest_path: String,
+        remote_repo: String,
+        pr_number: u64,
+    },
 }
 
 /// Live process-group info for a locally running job. Empty for remote jobs.

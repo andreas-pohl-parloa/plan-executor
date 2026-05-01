@@ -8,7 +8,6 @@ mod helper;
 mod ipc;
 mod job;
 mod jobs;
-mod plan;
 mod proctree;
 mod remote;
 mod schema;

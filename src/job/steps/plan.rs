@@ -119,6 +119,18 @@ fn run_preflight(ctx: &mut StepContext, manifest_path: &Path) -> AttemptOutcome 
         Err(outcome) => return outcome,
     };
 
+    // Advance the manifest status machine before any side-effecting
+    // work. Failure to persist `EXECUTING` is fatal: subsequent
+    // re-runs would see `READY` and the trigger gate would let them
+    // through, double-executing the same manifest. Surface as
+    // HardInfra so the registry's recovery policy treats it as
+    // terminal rather than retrying it forever.
+    if let Err(e) = set_manifest_status(manifest_path, "EXECUTING") {
+        return AttemptOutcome::HardInfra {
+            error: format!("preflight: flip plan.status to EXECUTING: {e}"),
+        };
+    }
+
     if plan_meta.flags.no_worktree {
         tracing::info!(
             "preflight: skipped worktree setup (plan.flags.no_worktree=true)"
@@ -2111,6 +2123,59 @@ fn load_plan_meta(manifest_path: &Path) -> Result<PlanMeta, AttemptOutcome> {
     })
 }
 
+/// Allowed values for `plan.status` per `tasks.schema.json`.
+const MANIFEST_STATUS_VALUES: &[&str] = &["READY", "EXECUTING", "COMPLETED", "FAILED"];
+
+/// Atomically rewrites `plan.status` in the compiled manifest at
+/// `manifest_path` to `new_status`. Reads the file, mutates the
+/// `plan.status` field, and persists the result via a sibling
+/// `NamedTempFile` + rename so a crash mid-write cannot leave the
+/// manifest empty or half-updated.
+///
+/// Used by the plan pipeline to advance the schema-defined status
+/// machine: `PreflightStep` flips `READY → EXECUTING`, `SummaryStep`
+/// flips `EXECUTING → COMPLETED`, and the daemon flips to `FAILED`
+/// on terminal step failure. Without these transitions a manifest
+/// stays at `READY` indefinitely, which both lies about state and
+/// breaks the daemon's `READY`-only re-execution gate's intent of
+/// being a single-shot consume.
+pub(crate) fn set_manifest_status(manifest_path: &Path, new_status: &str) -> Result<(), String> {
+    if !MANIFEST_STATUS_VALUES.contains(&new_status) {
+        return Err(format!(
+            "set_manifest_status: invalid status `{new_status}` (allowed: {:?})",
+            MANIFEST_STATUS_VALUES
+        ));
+    }
+    let raw = std::fs::read_to_string(manifest_path)
+        .map_err(|e| format!("read manifest {}: {e}", manifest_path.display()))?;
+    let mut value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("parse manifest {}: {e}", manifest_path.display()))?;
+    let plan = value
+        .get_mut("plan")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| "manifest missing top-level `plan` object".to_string())?;
+    plan.insert(
+        "status".to_string(),
+        serde_json::Value::String(new_status.to_string()),
+    );
+    let bytes = serde_json::to_vec_pretty(&value)
+        .map_err(|e| format!("serialize manifest: {e}"))?;
+    let parent = manifest_path
+        .parent()
+        .ok_or_else(|| format!("manifest path has no parent: {}", manifest_path.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| format!("create temp file in {}: {e}", parent.display()))?;
+    use std::io::Write;
+    tmp.write_all(&bytes)
+        .map_err(|e| format!("write temp manifest {}: {e}", tmp.path().display()))?;
+    tmp.as_file_mut()
+        .sync_all()
+        .map_err(|e| format!("fsync temp manifest {}: {e}", tmp.path().display()))?;
+    tmp.persist(manifest_path)
+        .map_err(|e| format!("persist manifest to {}: {}", manifest_path.display(), e.error))?;
+    Ok(())
+}
+
 /// Persisted PR-URL filename under [`StepContext::job_dir`].
 const PR_URL_FILE: &str = "pr-url";
 
@@ -2330,8 +2395,16 @@ fn git_workdir_is_dirty(workdir: &Path) -> std::io::Result<bool> {
     Ok(!output.stdout.is_empty())
 }
 
+/// Maximum length for the goal portion of a generated PR title.
+/// Conventional commits target a ≤72-char subject; reserving room for
+/// the `feat(JIRA-1234): ` prefix lands the goal at ~50 chars.
+const PR_TITLE_GOAL_MAX_LEN: usize = 50;
+
 /// Builds the conventional-commits PR title from the plan metadata, falling
 /// back to a generic prefix when the manifest does not provide a `type`.
+/// The plan's `goal` is often a full sentence — too long for a PR title —
+/// so it is truncated at a word boundary with an ellipsis when it would
+/// exceed [`PR_TITLE_GOAL_MAX_LEN`].
 fn pr_title(plan: &PlanMeta) -> String {
     let prefix = match plan.plan_type.as_str() {
         "bug" => "fix".to_string(),
@@ -2345,7 +2418,33 @@ fn pr_title(plan: &PlanMeta) -> String {
     } else {
         format!("({scope})")
     };
-    format!("{prefix}{scope_segment}: {}", plan.goal)
+    let goal = truncate_at_word_boundary(&plan.goal, PR_TITLE_GOAL_MAX_LEN);
+    format!("{prefix}{scope_segment}: {goal}")
+}
+
+/// Returns `s` shortened to at most `max` characters, breaking on the last
+/// whitespace within the budget and appending an ellipsis (`…`). When
+/// `s` already fits, it is returned untouched. Operates on chars (not
+/// bytes) so multi-byte UTF-8 input is handled correctly. When no
+/// whitespace fits in the budget, falls back to a hard cut at `max - 1`
+/// chars + `…` so the output is always within the budget.
+fn truncate_at_word_boundary(s: &str, max: usize) -> String {
+    let trimmed = s.trim();
+    if trimmed.chars().count() <= max {
+        return trimmed.to_string();
+    }
+    // `max - 1` to leave room for the ellipsis character.
+    let budget = max.saturating_sub(1);
+    let head: String = trimmed.chars().take(budget).collect();
+    let cut = head.rfind(char::is_whitespace).unwrap_or(0);
+    if cut == 0 {
+        // No whitespace inside the budget — hard cut.
+        format!("{head}…")
+    } else {
+        let mut out = head[..cut].trim_end().to_string();
+        out.push('…');
+        out
+    }
 }
 
 /// Builds the PR body. Plain text — the orchestrator skill writes the
@@ -2538,8 +2637,23 @@ fn run_summary(ctx: &StepContext, manifest_path: &Path) -> AttemptOutcome {
     let pr_url = read_pr_url(ctx);
     let outcome = write_local_summary(ctx, manifest_path, &plan_meta, pr_url.as_deref());
 
-    if matches!(outcome, AttemptOutcome::Success) && !plan_meta.flags.no_worktree {
-        cleanup_worktree_after_summary(ctx, manifest_path, &plan_meta);
+    if matches!(outcome, AttemptOutcome::Success) {
+        if !plan_meta.flags.no_worktree {
+            cleanup_worktree_after_summary(ctx, manifest_path, &plan_meta);
+        }
+        // Final transition of the manifest status machine. The
+        // pipeline reaches summary only when every prior step
+        // returned Success, so `COMPLETED` is the correct terminal
+        // value here. A persistence failure must surface as
+        // HardInfra: the user-visible signal of "this run is done"
+        // lives in `plan.status`, and silently leaving it at
+        // `EXECUTING` would invite a re-execution attempt that
+        // re-does work already shipped.
+        if let Err(e) = set_manifest_status(manifest_path, "COMPLETED") {
+            return AttemptOutcome::HardInfra {
+                error: format!("summary: flip plan.status to COMPLETED: {e}"),
+            };
+        }
     }
     outcome
 }
@@ -3040,5 +3154,210 @@ mod preflight_tests {
                 "base-branch `{base}` should not be used as worktree branch",
             );
         }
+    }
+
+    /// Writes a minimal but schema-shape-correct manifest at
+    /// `<dir>/<name>/tasks.json` and returns the manifest path. The
+    /// `plan` block is enough to satisfy `load_plan_meta` and the
+    /// `set_manifest_status` round-trip.
+    fn write_manifest(dir: &Path, name: &str, status: &str) -> PathBuf {
+        let plan_dir = dir.join(name);
+        std::fs::create_dir_all(&plan_dir).expect("plan dir");
+        let manifest = plan_dir.join("tasks.json");
+        let body = serde_json::json!({
+            "version": 1,
+            "plan": {
+                "goal": "g",
+                "type": "feature",
+                "jira": "",
+                "target_repo": null,
+                "target_branch": null,
+                "path": "/tmp/plan.md",
+                "status": status,
+                "flags": {
+                    "merge": false,
+                    "merge_admin": false,
+                    "skip_pr": true,
+                    "skip_code_review": true,
+                    "no_worktree": true,
+                    "draft_pr": false
+                }
+            },
+            "waves": [],
+            "tasks": {}
+        });
+        std::fs::write(&manifest, serde_json::to_vec_pretty(&body).unwrap())
+            .expect("write manifest");
+        manifest
+    }
+
+    fn read_status(manifest_path: &Path) -> String {
+        let raw = std::fs::read_to_string(manifest_path).expect("read manifest");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("parse manifest");
+        value
+            .get("plan")
+            .and_then(|p| p.get("status"))
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn set_manifest_status_round_trip_through_all_terminal_states() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = write_manifest(dir.path(), "stem", "READY");
+
+        for target in ["EXECUTING", "COMPLETED", "FAILED", "READY"] {
+            set_manifest_status(&manifest, target).expect("flip");
+            assert_eq!(read_status(&manifest), target);
+        }
+    }
+
+    #[test]
+    fn set_manifest_status_preserves_unrelated_fields() {
+        // Important: a partial write that drops `tasks` or `waves`
+        // would silently corrupt every subsequent step in the
+        // pipeline. The atomic-rewrite must round-trip the full
+        // document.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = write_manifest(dir.path(), "stem", "READY");
+        let original = std::fs::read_to_string(&manifest).expect("read");
+        let original_value: serde_json::Value = serde_json::from_str(&original).expect("parse");
+        let original_goal = original_value["plan"]["goal"].clone();
+
+        set_manifest_status(&manifest, "EXECUTING").expect("flip");
+
+        let after_value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&manifest).expect("read after"),
+        )
+        .expect("parse after");
+        assert_eq!(after_value["plan"]["status"], "EXECUTING");
+        assert_eq!(after_value["plan"]["goal"], original_goal);
+        assert!(after_value.get("waves").is_some(), "waves preserved");
+        assert!(after_value.get("tasks").is_some(), "tasks preserved");
+        assert_eq!(after_value["version"], 1, "version preserved");
+    }
+
+    #[test]
+    fn set_manifest_status_rejects_unknown_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = write_manifest(dir.path(), "stem", "READY");
+        let err = set_manifest_status(&manifest, "DONE").expect_err("invalid status rejected");
+        assert!(err.contains("invalid status"), "got: {err}");
+        // Original status must not be touched.
+        assert_eq!(read_status(&manifest), "READY");
+    }
+
+    #[test]
+    fn preflight_flips_ready_to_executing_under_no_worktree() {
+        // `no_worktree=true` short-circuits the worktree machinery,
+        // so we can drive `run_preflight` end-to-end against a temp
+        // manifest without needing a real git repo.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = write_manifest(dir.path(), "stem", "READY");
+        let mut ctx = StepContext {
+            job_dir: dir.path().to_path_buf(),
+            step_seq: 1,
+            attempt_n: 1,
+            workdir: dir.path().to_path_buf(),
+            daemon_hooks: None,
+        };
+
+        let outcome = run_preflight(&mut ctx, &manifest);
+        assert!(matches!(outcome, AttemptOutcome::Success), "outcome: {outcome:?}");
+        assert_eq!(read_status(&manifest), "EXECUTING");
+    }
+
+    #[test]
+    fn summary_flips_executing_to_completed_on_success() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = write_manifest(dir.path(), "stem", "EXECUTING");
+        let job_dir = dir.path().join("job");
+        std::fs::create_dir_all(&job_dir).expect("job dir");
+        let ctx = StepContext {
+            job_dir: job_dir.clone(),
+            step_seq: 8,
+            attempt_n: 1,
+            workdir: dir.path().to_path_buf(),
+            daemon_hooks: None,
+        };
+
+        let outcome = run_summary(&ctx, &manifest);
+        assert!(matches!(outcome, AttemptOutcome::Success), "outcome: {outcome:?}");
+        assert_eq!(read_status(&manifest), "COMPLETED");
+    }
+
+    #[test]
+    fn pr_title_truncates_long_goals_at_word_boundary() {
+        let mut meta = meta_with(Some("CCP-123"), None, "feature");
+        meta.goal = "wire the manifest plan.status machine through every step of the daemon pipeline".into();
+        let title = pr_title(&meta);
+        assert!(title.starts_with("feat(CCP-123): "), "title: {title}");
+        // Goal portion stays within the budget + ends on an ellipsis,
+        // never mid-word.
+        let goal_part = title.strip_prefix("feat(CCP-123): ").unwrap();
+        assert!(goal_part.chars().count() <= PR_TITLE_GOAL_MAX_LEN, "goal_part: {goal_part}");
+        assert!(goal_part.ends_with('…'), "should be ellipsised: {goal_part}");
+        // Last char before the ellipsis should be a complete word.
+        let body = goal_part.trim_end_matches('…');
+        assert!(
+            !body.ends_with(char::is_whitespace),
+            "body: `{body}` should not end with whitespace",
+        );
+    }
+
+    #[test]
+    fn pr_title_keeps_short_goals_intact() {
+        let mut meta = meta_with(None, None, "bug");
+        meta.goal = "fix race in scheduler".into();
+        assert_eq!(pr_title(&meta), "fix: fix race in scheduler");
+    }
+
+    #[test]
+    fn truncate_at_word_boundary_is_a_noop_when_input_fits() {
+        assert_eq!(truncate_at_word_boundary("hello world", 50), "hello world");
+    }
+
+    #[test]
+    fn truncate_at_word_boundary_breaks_on_whitespace() {
+        // 50-char budget: "the quick brown fox jumps over the lazy dog and the".
+        // First 50 chars contain "the lazy dog and the" — last whitespace is
+        // before "the" (the trailing one), so the cut keeps the prior words.
+        let s = "the quick brown fox jumps over the lazy dog and the cat";
+        let out = truncate_at_word_boundary(s, 50);
+        assert!(out.chars().count() <= 50, "out: `{out}` ({} chars)", out.chars().count());
+        assert!(out.ends_with('…'));
+        assert!(!out.contains("  "), "no double-space: `{out}`");
+    }
+
+    #[test]
+    fn summary_does_not_flip_status_when_artifact_write_fails() {
+        // When the summary itself can't be written (job_dir missing
+        // and not creatable as a directory because a file blocks
+        // it), the step must not advance the status machine — that
+        // would lie about completion.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = write_manifest(dir.path(), "stem", "EXECUTING");
+        // Block job_dir by creating a regular file at that path.
+        let job_dir = dir.path().join("blocked-job-dir");
+        std::fs::write(&job_dir, b"not a directory").expect("seed blocker");
+        let ctx = StepContext {
+            job_dir,
+            step_seq: 8,
+            attempt_n: 1,
+            workdir: dir.path().to_path_buf(),
+            daemon_hooks: None,
+        };
+
+        let outcome = run_summary(&ctx, &manifest);
+        assert!(
+            !matches!(outcome, AttemptOutcome::Success),
+            "outcome should not be Success: {outcome:?}",
+        );
+        assert_eq!(
+            read_status(&manifest),
+            "EXECUTING",
+            "status must remain EXECUTING when summary fails",
+        );
     }
 }
