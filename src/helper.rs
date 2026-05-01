@@ -76,10 +76,6 @@ const HELPER_TIMEOUT_ENV: &str = "PLAN_EXECUTOR_HELPER_TIMEOUT_SECS";
 const RUN_REVIEWER_TEAM_OUTPUT_SCHEMA: &str =
     include_str!("schemas/helpers/run_reviewer_team/output.schema.json");
 
-/// Output schema for the `review-execution-output-non-interactive` helper.
-const REVIEW_EXECUTION_OUTPUT_OUTPUT_SCHEMA: &str =
-    include_str!("schemas/helpers/review_execution_output/output.schema.json");
-
 /// Output schema for the `validate-execution-plan-non-interactive` helper.
 const VALIDATE_EXECUTION_PLAN_OUTPUT_SCHEMA: &str =
     include_str!("schemas/helpers/validate_execution_plan/output.schema.json");
@@ -98,8 +94,6 @@ const PR_FINALIZE_OUTPUT_SCHEMA: &str =
 pub enum HelperSkill {
     /// `plan-executor:run-reviewer-team-non-interactive` — frozen reviewer set.
     RunReviewerTeam,
-    /// `plan-executor:review-execution-output-non-interactive` — Phase-5 review loop.
-    ReviewExecutionOutput,
     /// `plan-executor:validate-execution-plan-non-interactive` — plan-vs-output validation.
     ValidateExecutionPlan,
     /// `plan-executor:pr-finalize` — PR finalize / Bugbot triage.
@@ -112,7 +106,6 @@ impl HelperSkill {
     pub fn skill_id(self) -> &'static str {
         match self {
             Self::RunReviewerTeam => "run-reviewer-team-non-interactive",
-            Self::ReviewExecutionOutput => "review-execution-output-non-interactive",
             Self::ValidateExecutionPlan => "validate-execution-plan-non-interactive",
             Self::PrFinalize => "pr-finalize",
         }
@@ -127,7 +120,6 @@ impl HelperSkill {
     pub fn output_schema(self) -> &'static str {
         match self {
             Self::RunReviewerTeam => RUN_REVIEWER_TEAM_OUTPUT_SCHEMA,
-            Self::ReviewExecutionOutput => REVIEW_EXECUTION_OUTPUT_OUTPUT_SCHEMA,
             Self::ValidateExecutionPlan => VALIDATE_EXECUTION_PLAN_OUTPUT_SCHEMA,
             Self::PrFinalize => PR_FINALIZE_OUTPUT_SCHEMA,
         }
@@ -137,7 +129,6 @@ impl HelperSkill {
     fn input_file_stem(self) -> &'static str {
         match self {
             Self::RunReviewerTeam => "run_reviewer_team",
-            Self::ReviewExecutionOutput => "review_execution_output",
             Self::ValidateExecutionPlan => "validate_execution_plan",
             Self::PrFinalize => "pr_finalize",
         }
@@ -728,13 +719,11 @@ fn schema_violation_category(instance_path: &str) -> String {
 /// Compiles the embedded schema for `skill` once per process.
 fn compiled_validator(skill: HelperSkill) -> Result<&'static jsonschema::Validator, HelperError> {
     static RUN_REVIEWER_TEAM: OnceLock<jsonschema::Validator> = OnceLock::new();
-    static REVIEW_EXECUTION_OUTPUT: OnceLock<jsonschema::Validator> = OnceLock::new();
     static VALIDATE_EXECUTION_PLAN: OnceLock<jsonschema::Validator> = OnceLock::new();
     static PR_FINALIZE: OnceLock<jsonschema::Validator> = OnceLock::new();
 
     let cell: &OnceLock<jsonschema::Validator> = match skill {
         HelperSkill::RunReviewerTeam => &RUN_REVIEWER_TEAM,
-        HelperSkill::ReviewExecutionOutput => &REVIEW_EXECUTION_OUTPUT,
         HelperSkill::ValidateExecutionPlan => &VALIDATE_EXECUTION_PLAN,
         HelperSkill::PrFinalize => &PR_FINALIZE,
     };
@@ -825,41 +814,6 @@ pub struct ReviewTeamInput {
     /// invocation (dispatch mode); non-empty on the re-invocation that
     /// follows a `waiting_for_handoffs` envelope, signaling the skill to
     /// enter triage mode and parse the sidecar at the given path.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub prior_handoff_outputs_path: String,
-}
-
-// ----- review-execution-output-non-interactive -----------------------------
-
-/// Input envelope for `plan-executor:review-execution-output-non-interactive`.
-#[derive(Debug, Clone, Serialize)]
-pub struct ReviewTriageInput {
-    /// Absolute plan path.
-    pub plan_path: PathBuf,
-    /// Absolute execution root.
-    pub execution_root: PathBuf,
-    /// Files created or modified during execution.
-    pub changed_files: Vec<PathBuf>,
-    /// Detected language for the changed code.
-    pub language: String,
-    /// Recipe skills relevant to the changed code.
-    pub recipe_list: Vec<String>,
-    /// Explicit review-skip flag.
-    pub skip_code_review: bool,
-    /// Absolute path to `.tmp-execute-plan-state.json`.
-    pub state_file_path: PathBuf,
-    /// Execution orchestration state (orchestrator-owned).
-    pub execution_state: serde_json::Value,
-    /// Helper-owned review state when already available; pass `{}` on first run.
-    pub review_state: serde_json::Value,
-    /// Persisted helper-owned review-state path when state is resumed from storage.
-    pub review_state_path: Option<PathBuf>,
-    /// Prior review findings, triage notes, and fix history.
-    pub prior_review_notes: serde_json::Value,
-    /// Absolute path to the JSON sidecar carrying the dispatched sub-agent
-    /// outputs the orchestrator just collected. Empty string on the first
-    /// invocation; non-empty on the re-invocation that follows a
-    /// `waiting_for_handoffs` envelope (triage mode).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prior_handoff_outputs_path: String,
 }
