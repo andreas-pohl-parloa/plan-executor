@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.53.0] - 2026-05-01
+
+### Features
+
+- **pr_finalize:** Implement step 7; demote summary to summary-only (#49) ([ff2300d](https://github.com/andreas-pohl-parloa/plan-executor/commit/ff2300db04c502a88f26913ff31290ba2ce01f42))
 ## [0.52.7] - 2026-05-01
 
 ### Bug Fixes
