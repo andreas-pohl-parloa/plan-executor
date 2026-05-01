@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.52.5] - 2026-05-01
+
+### Bug Fixes
+
+- **code_review:** Consume run_reviewer_team findings directly; drop second triage (#46) ([c27e1ce](https://github.com/andreas-pohl-parloa/plan-executor/commit/c27e1cedf7b3364c4913b311f674ad132f1d00cb))
 ## [0.52.4] - 2026-04-30
 
 ### Bug Fixes
