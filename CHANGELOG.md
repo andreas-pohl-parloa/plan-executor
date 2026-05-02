@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.57.0] - 2026-05-02
+
+### Bug Fixes
+
+- **daemon:** Filter task-notification result events; restore summary line colors ([752e50d](https://github.com/andreas-pohl-parloa/plan-executor/commit/752e50db85bc17e9b6268dcfdd06438d82608231))
+
+### Features
+
+- **pr_finalize:** Stream pr-monitor.sh stdio through the display channel ([02db00a](https://github.com/andreas-pohl-parloa/plan-executor/commit/02db00a8094a2a979167e28b8af2029724f1e76a))
+
+### Performance
+
+- **orchestrator:** Compute changed_files once instead of per-reviewer ([1c9cbe5](https://github.com/andreas-pohl-parloa/plan-executor/commit/1c9cbe54c07871e75b8823037cabe28b1e91225d))
 ## [0.56.0] - 2026-05-01
 
 ### Features
