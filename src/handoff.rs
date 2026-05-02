@@ -258,8 +258,24 @@ pub(crate) fn extract_result_text(lines: &[String]) -> Option<String> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        // Claude / Gemini stream-json terminal event.
+        // Claude / Gemini stream-json terminal event. Skip events
+        // tagged `origin.kind == "task-notification"` — those carry
+        // the agent's reply to a post-turn system notification (e.g.
+        // "your hook produced output X, anything to do?"), NOT the
+        // helper's envelope. When two result events appear in the
+        // same JSONL — the real terminal followed by a notification
+        // reply — reverse iteration would otherwise pick the latter
+        // and surface a spurious `no_json_envelope` protocol
+        // violation at the daemon level.
         if parsed.get("type").and_then(|v| v.as_str()) == Some("result") {
+            let is_task_notification = parsed
+                .get("origin")
+                .and_then(|o| o.get("kind"))
+                .and_then(|v| v.as_str())
+                == Some("task-notification");
+            if is_task_notification {
+                continue;
+            }
             if let Some(text) = parsed.get("result").and_then(|v| v.as_str()) {
                 return Some(text.to_string());
             }
@@ -682,6 +698,43 @@ mod tests {
             r#"{"type":"result","result":"second"}"#.to_string(),
         ];
         assert_eq!(extract_result_text(&lines), Some("second".to_string()));
+    }
+
+    #[test]
+    fn extract_result_text_skips_task_notification_origin_events() {
+        // Real shape observed in dispatch-1005 of job
+        // 6d7cf3a2-1c8f-4367-98bf-1a0b6e7ecbe6: Claude Code emitted a
+        // primary result event followed by a `task-notification`
+        // result event answering a post-turn system notification.
+        // Reverse iteration must skip the notification and return the
+        // primary terminal text — otherwise the helper subprocess'
+        // real envelope is masked and the daemon raises a spurious
+        // `no_json_envelope` protocol violation.
+        let lines = vec![
+            r#"{"type":"result","subtype":"success","num_turns":18,"result":"the real envelope"}"#
+                .to_string(),
+            r#"{"type":"result","subtype":"success","num_turns":1,"result":"chatty notification reply","origin":{"kind":"task-notification"}}"#
+                .to_string(),
+        ];
+        assert_eq!(
+            extract_result_text(&lines),
+            Some("the real envelope".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_result_text_returns_none_when_only_task_notification_present() {
+        // When the *only* result event is a task-notification reply
+        // (the primary turn produced no terminal event for whatever
+        // reason), surface None rather than picking the notification
+        // — the caller's `no_json_envelope` path will retry under
+        // the existing protocol-violation budget rather than feeding
+        // the wrong text into envelope extraction.
+        let lines = vec![
+            r#"{"type":"result","result":"only notification","origin":{"kind":"task-notification"}}"#
+                .to_string(),
+        ];
+        assert_eq!(extract_result_text(&lines), None);
     }
 
     #[test]

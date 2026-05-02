@@ -372,11 +372,12 @@ impl SchedulerHooks {
         self.publish_display_line(line);
     }
 
-    /// Persists + broadcasts a single execution-summary display line. Used
-    /// by `SummaryStep` to surface the counts block (tasks / attempts /
-    /// retries / protocol violations) in `output -f` without forcing
-    /// callers to grep `<job_dir>/.tmp-execution-summary.md`.
-    pub fn announce_summary_line(&self, line: String) {
+    /// Persists + broadcasts a generic step-emitted display line. Used by
+    /// step impls that want to surface their own progress lines in
+    /// `output -f` without inventing a new transport: `SummaryStep` for
+    /// the counts block, `PrFinalizeStep` for streamed `pr-monitor.sh`
+    /// output, and any future step that has multi-line progress to share.
+    pub fn announce_step_line(&self, line: String) {
         self.publish_display_line(line);
     }
 
