@@ -2799,13 +2799,18 @@ fn post_pr_summary_comment(url: &str, body: &str) -> Result<(), String> {
 /// GHA runner's job log without callers having to dig through the
 /// summary file.
 fn publish_summary_lines(ctx: &StepContext, counts: &ExecutionCounts) {
+    // The `⏺ ` bullet is what `print_display_line` (cli.rs) keys on to
+    // apply the yellow `[plan-executor]` + green `⏺` palette. Without
+    // it the lines render as plain text in `output -f` while every
+    // surrounding step transition is colored, which looks like an
+    // emit-channel mismatch.
     let lines = [
         format!(
-            "[plan-executor] summary: tasks={} waves={} steps={}",
+            "⏺ [plan-executor] summary: tasks={} waves={} steps={}",
             counts.tasks_total, counts.waves_total, counts.steps_total
         ),
         format!(
-            "[plan-executor] summary: attempts={} retries={} protocol_violations={}",
+            "⏺ [plan-executor] summary: attempts={} retries={} protocol_violations={}",
             counts.attempts_total, counts.retries_total, counts.protocol_violations
         ),
     ];
