@@ -2817,7 +2817,7 @@ fn publish_summary_lines(ctx: &StepContext, counts: &ExecutionCounts) {
     for line in &lines {
         eprintln!("{line}");
         if let Some(hooks) = ctx.daemon_hooks.as_ref() {
-            hooks.announce_summary_line(line.clone());
+            hooks.announce_step_line(line.clone());
         }
     }
 }
@@ -2963,7 +2963,7 @@ fn delegate_to_pr_finalize(
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
 
-    let status = std::process::Command::new("bash")
+    let mut child = match std::process::Command::new("bash")
         .arg(&script)
         .arg("--owner").arg(&owner)
         .arg("--repo").arg(&repo)
@@ -2974,7 +2974,36 @@ fn delegate_to_pr_finalize(
         .arg("--summary-file").arg(&summary_file)
         .arg("--log-file").arg(&log_file)
         .current_dir(&ctx.workdir)
-        .status();
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return AttemptOutcome::HardInfra {
+                error: format!("spawn pr-monitor.sh failed: {e}"),
+            };
+        }
+    };
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_thread = stdout.map(|s| {
+        let hooks = ctx.daemon_hooks.clone();
+        std::thread::spawn(move || stream_pr_finalize_lines(s, hooks))
+    });
+    let stderr_thread = stderr.map(|s| {
+        let hooks = ctx.daemon_hooks.clone();
+        std::thread::spawn(move || stream_pr_finalize_lines(s, hooks))
+    });
+
+    let status = child.wait();
+    if let Some(t) = stdout_thread {
+        let _ = t.join();
+    }
+    if let Some(t) = stderr_thread {
+        let _ = t.join();
+    }
 
     match status {
         Ok(s) if s.success() => {}
@@ -2990,7 +3019,7 @@ fn delegate_to_pr_finalize(
         }
         Err(e) => {
             return AttemptOutcome::HardInfra {
-                error: format!("spawn pr-monitor.sh failed: {e}"),
+                error: format!("wait pr-monitor.sh failed: {e}"),
             };
         }
     }
@@ -3009,6 +3038,38 @@ fn delegate_to_pr_finalize(
     }
 
     AttemptOutcome::Success
+}
+
+/// Drains a child process pipe (`stdout` or `stderr`) line-by-line and
+/// forwards each line to both stderr (foreground / GHA-runner visibility)
+/// and the daemon's broadcast bus via `announce_step_line` (so
+/// `output -f` shows live `pr-monitor.sh` progress instead of "step 7
+/// pr_finalize starting" → multi-minute silence → "success").
+///
+/// The lines are prefixed `⏺ [plan-executor] pr-finalize: …` so
+/// `print_display_line` colors them like every other plan-executor
+/// banner. Errors in line decoding are silently dropped — a malformed
+/// byte sequence in the script's output should not abort the streamer
+/// and mask the rest of the script's progress.
+///
+/// Caveat: bash's libc-buffered stdout flushes in ~4 KB chunks when
+/// connected to a pipe, so very chatty bursts can arrive grouped.
+/// Acceptable for the script's actual output cadence (15-second
+/// polling intervals with ~80 char lines).
+fn stream_pr_finalize_lines<R>(
+    pipe: R,
+    hooks: Option<std::sync::Arc<crate::daemon::SchedulerHooks>>,
+) where
+    R: std::io::Read,
+{
+    use std::io::{BufRead, BufReader};
+    for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+        let display = format!("⏺ [plan-executor] pr-finalize: {line}");
+        eprintln!("{display}");
+        if let Some(h) = hooks.as_ref() {
+            h.announce_step_line(display);
+        }
+    }
 }
 
 /// Locates `pr-monitor.sh` inside the plan-executor plugin cache.
