@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.59.1] - 2026-05-03
+
+### Bug Fixes
+
+- **foreground:** Add ⏺ bullet to step start/end/retry lines ([a1bdd63](https://github.com/andreas-pohl-parloa/plan-executor/commit/a1bdd6394f4bbe4674aa835d52fd39d15a7b26c3))
 ## [0.59.0] - 2026-05-03
 
 ### Features
