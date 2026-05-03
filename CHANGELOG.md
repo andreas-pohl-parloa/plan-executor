@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.58.2] - 2026-05-03
+
+### Bug Fixes
+
+- **remote:** Ship compile-plan task prompts to execution PR ([156b8da](https://github.com/andreas-pohl-parloa/plan-executor/commit/156b8da42ba9efec367eb8bb2ee65abf96917406))
 ## [0.58.1] - 2026-05-03
 
 ### Bug Fixes
