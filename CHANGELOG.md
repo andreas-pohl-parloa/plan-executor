@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.59.0] - 2026-05-03
+
+### Features
+
+- **foreground:** Stream sub-agent output + quiet tracing ([8927c22](https://github.com/andreas-pohl-parloa/plan-executor/commit/8927c22bd18e5c0b03c59fa039e4568480ad92c9))
 ## [0.58.2] - 2026-05-03
 
 ### Bug Fixes
