@@ -97,6 +97,14 @@ pub struct PlanBlock {
     /// `origin/HEAD` and finally `main`.
     #[serde(default)]
     pub target_branch: Option<String>,
+    /// Short summary of the plan, supplied by `plan-executor:handover`
+    /// at compile time. Used as the body of the PR title (after the
+    /// `feat(JIRA): ` prefix). Schema-capped at 50 chars so the full
+    /// title stays under the conventional-commit 72-char ceiling.
+    /// Older manifests without the field deserialize as `None`, in
+    /// which case `pr_title` falls back to truncating `goal`.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 fn default_execution_mode() -> String {
@@ -751,6 +759,7 @@ mod tests {
                 execution_mode: "local".to_string(),
                 pipeline: None,
                 target_branch: None,
+                title: None,
             },
             waves,
             tasks: tasks
