@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.58.0] - 2026-05-03
+
+### Features
+
+- **manifest:** Plan.title field as PR title source ([19543db](https://github.com/andreas-pohl-parloa/plan-executor/commit/19543dbea71776da38956c9ad064af1a890debe6))
 ## [0.57.0] - 2026-05-02
 
 ### Bug Fixes
