@@ -110,6 +110,10 @@ pub fn validate_repo_slug(slug: &str) -> bool {
 }
 
 /// Finds `.tmp-subtask-*.md` files co-located with the plan file.
+/// Legacy convention from the in-session orchestrator skill — kept
+/// because remote runs from older flows still rely on the plan-dir
+/// scan. New compile-plan-format runs use
+/// [`read_manifest_prompt_files`] instead.
 pub fn find_prompt_files(plan_path: &Path) -> Vec<PathBuf> {
     let Some(dir) = plan_path.parent() else {
         return vec![];
@@ -126,6 +130,38 @@ pub fn find_prompt_files(plan_path: &Path) -> Vec<PathBuf> {
             } else {
                 None
             }
+        })
+        .collect()
+}
+
+/// Reads `tasks.json` at `manifest_path` and returns absolute paths to
+/// every task's `prompt_file`, resolved relative to the manifest's
+/// parent directory. Returns an empty Vec when the manifest cannot be
+/// read or doesn't carry a `tasks` object so callers can fall back to
+/// other discovery mechanisms.
+///
+/// Used by [`trigger_remote_execution`] to ship the compile-plan-emitted
+/// `tasks/task-<id>.md` prompt files to the execution PR — without
+/// these, the remote runner's wave_execution step fails synchronously
+/// with `prompt file not found` for every sub-agent because the
+/// manifest's relative paths don't resolve to anything on the runner.
+pub fn read_manifest_prompt_files(manifest_path: &Path) -> Vec<PathBuf> {
+    let Ok(raw) = std::fs::read_to_string(manifest_path) else {
+        return vec![];
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return vec![];
+    };
+    let manifest_dir = manifest_path.parent().unwrap_or(Path::new("."));
+    let Some(tasks) = value.get("tasks").and_then(|t| t.as_object()) else {
+        return vec![];
+    };
+    tasks
+        .values()
+        .filter_map(|task| {
+            task.get("prompt_file")
+                .and_then(|v| v.as_str())
+                .map(|rel| manifest_dir.join(rel))
         })
         .collect()
 }
@@ -424,7 +460,13 @@ pub fn trigger_remote_execution(
     let meta_json = serde_json::to_string_pretty(meta)?;
     let branch = branch_name(&meta.plan_filename, &meta.started_at);
     let title = pr_title(meta);
-    let prompt_files = find_prompt_files(plan_path);
+    // Compile-plan-emitted task prompts (the shape every modern run
+    // uses) live alongside the manifest. Walk `tasks.json` so the
+    // execution PR ships every `tasks/task-<id>.md` referenced by
+    // the manifest, not just the legacy `.tmp-subtask-*.md` set
+    // [`find_prompt_files`] returns.
+    let manifest_prompts = read_manifest_prompt_files(manifest_path);
+    let legacy_prompts = find_prompt_files(plan_path);
 
     // Create branch from main
     run_gh(&[
@@ -448,8 +490,26 @@ pub fn trigger_remote_execution(
         .with_context(|| format!("read manifest {}", manifest_path.display()))?;
     push_file_to_branch(remote_repo, &branch, "tasks.json", &manifest_content)?;
 
-    // Push prompt files
-    for pf in &prompt_files {
+    // Push compile-plan-format prompt files into `tasks/` so the
+    // execution PR mirrors the manifest's local layout. The runner's
+    // workflow copies `tasks/` next to `tasks.json` in
+    // `.tmp-plan-compiled/`, which is exactly where the orchestrator's
+    // `prompt_file` relative-path resolution looks for them.
+    for pf in &manifest_prompts {
+        let name = pf
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("prompt.md");
+        let content = std::fs::read_to_string(pf)
+            .with_context(|| format!("read manifest prompt file {}", pf.display()))?;
+        let dest = format!("tasks/{}", name);
+        push_file_to_branch(remote_repo, &branch, &dest, &content)?;
+    }
+    // Legacy `.tmp-subtask-*.md` set still ships under `prompt-files/`
+    // for older orchestrator-skill flows that don't go through
+    // compile-plan. New runs produce an empty list here, so this is a
+    // no-op for the modern path.
+    for pf in &legacy_prompts {
         let name = pf
             .file_name()
             .and_then(|n| n.to_str())
@@ -929,6 +989,59 @@ fn base64_encode(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_manifest_prompt_files_resolves_relative_paths_against_manifest_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest_dir = dir.path().join("plan-stem");
+        std::fs::create_dir_all(manifest_dir.join("tasks")).expect("tasks dir");
+        let manifest_path = manifest_dir.join("tasks.json");
+        let manifest = serde_json::json!({
+            "version": 1,
+            "plan": {
+                "path": "/abs/repo/plan.md",
+                "goal": "x",
+                "type": "feature",
+                "status": "READY",
+                "flags": {
+                    "merge": false, "merge_admin": false, "skip_pr": false,
+                    "skip_code_review": false, "no_worktree": false, "draft_pr": false
+                }
+            },
+            "waves": [{"id": 1, "task_ids": ["1", "2"], "depends_on": []}],
+            "tasks": {
+                "1": {"prompt_file": "tasks/task-1.md", "agent_type": "claude", "description": "a"},
+                "2": {"prompt_file": "tasks/task-2.md", "agent_type": "claude", "description": "b"}
+            }
+        });
+        std::fs::write(&manifest_path, manifest.to_string()).expect("write manifest");
+
+        let resolved = read_manifest_prompt_files(&manifest_path);
+        let mut names: Vec<String> = resolved
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["task-1.md", "task-2.md"]);
+        for p in &resolved {
+            assert!(p.starts_with(&manifest_dir), "not under manifest dir: {}", p.display());
+        }
+    }
+
+    #[test]
+    fn read_manifest_prompt_files_returns_empty_on_missing_or_malformed_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist.json");
+        assert!(read_manifest_prompt_files(&missing).is_empty());
+
+        let malformed = dir.path().join("malformed.json");
+        std::fs::write(&malformed, "not json").expect("seed");
+        assert!(read_manifest_prompt_files(&malformed).is_empty());
+
+        let no_tasks = dir.path().join("no-tasks.json");
+        std::fs::write(&no_tasks, "{\"version\": 1}").expect("seed");
+        assert!(read_manifest_prompt_files(&no_tasks).is_empty());
+    }
 
     #[test]
     fn test_is_branch_protection_error_matches_known_messages() {

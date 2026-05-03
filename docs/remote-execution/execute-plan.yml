@@ -335,6 +335,16 @@ jobs:
           MANIFEST_DIR="workspace/.tmp-plan-compiled"
           mkdir -p "$MANIFEST_DIR"
           cp tasks.json "$MANIFEST_DIR/tasks.json"
+          # Compile-plan-emitted task prompts (`tasks/task-<id>.md`)
+          # ship at the PR root under `tasks/`. The orchestrator's
+          # wave_execution resolves manifest `prompt_file` paths
+          # relative to the manifest directory, so the prompts must
+          # live next to `tasks.json` here too. Guard on existence so
+          # legacy orchestrator-only flows (no compile-plan output)
+          # don't break under `set -e`.
+          if [ -d tasks ]; then
+            cp -r tasks "$MANIFEST_DIR/"
+          fi
           NEW_PLAN_PATH="$(pwd)/$PLAN_DIR/$PLAN_FILENAME"
           jq --arg p "$NEW_PLAN_PATH" '.plan.path = $p' "$MANIFEST_DIR/tasks.json" > "$MANIFEST_DIR/tasks.json.tmp"
           mv "$MANIFEST_DIR/tasks.json.tmp" "$MANIFEST_DIR/tasks.json"
