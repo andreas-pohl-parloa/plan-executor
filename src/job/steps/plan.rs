@@ -2078,8 +2078,14 @@ fn has_transient_token(lower: &str, targets: &[&str]) -> bool {
 /// fields the scheduler itself uses.
 #[derive(Debug, Clone)]
 struct PlanMeta {
-    /// Plan goal (used as the PR title prefix).
+    /// Plan goal (full sentence — used in the PR body, and as the
+    /// fallback for [`Self::title`] when title is missing).
     goal: String,
+    /// Short conventional-commit-subject summary supplied by
+    /// `plan-executor:handover`. When `Some`, it becomes the body of
+    /// the PR title verbatim. When `None` (older manifests),
+    /// `pr_title` falls back to truncating `goal`.
+    title: Option<String>,
     /// Plan kind (`feature` / `bug` / `refactor` / `chore` / `docs` / `infra`).
     plan_type: String,
     /// JIRA ticket id, when present.
@@ -2148,6 +2154,11 @@ fn load_plan_meta(manifest_path: &Path) -> Result<PlanMeta, AttemptOutcome> {
             detail: "manifest plan.goal missing or not a string".to_string(),
         })?
         .to_string();
+    let title = plan
+        .get("title")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let plan_type = plan
         .get("type")
         .and_then(|v| v.as_str())
@@ -2191,6 +2202,7 @@ fn load_plan_meta(manifest_path: &Path) -> Result<PlanMeta, AttemptOutcome> {
     };
     Ok(PlanMeta {
         goal,
+        title,
         plan_type,
         jira,
         target_repo,
@@ -2471,16 +2483,20 @@ fn git_workdir_is_dirty(workdir: &Path) -> std::io::Result<bool> {
     Ok(!output.stdout.is_empty())
 }
 
-/// Maximum length for the goal portion of a generated PR title.
-/// Conventional commits target a ≤72-char subject; reserving room for
-/// the `feat(JIRA-1234): ` prefix lands the goal at ~50 chars.
+/// Maximum length for the goal-or-title portion of a generated PR
+/// title. Conventional commits target a ≤72-char subject; reserving
+/// room for the `feat(JIRA-1234): ` prefix lands the body at ~50
+/// chars. Mirrored by `plan.title.maxLength` in `tasks.schema.json`
+/// so the schema rejects oversized titles before they reach the
+/// orchestrator.
 const PR_TITLE_GOAL_MAX_LEN: usize = 50;
 
-/// Builds the conventional-commits PR title from the plan metadata, falling
-/// back to a generic prefix when the manifest does not provide a `type`.
-/// The plan's `goal` is often a full sentence — too long for a PR title —
-/// so it is truncated at a word boundary with an ellipsis when it would
-/// exceed [`PR_TITLE_GOAL_MAX_LEN`].
+/// Builds the conventional-commits PR title from the plan metadata.
+/// Prefers `plan.title` (a curated short summary supplied by
+/// `plan-executor:handover` at compile time) when present. Falls back
+/// to truncating `plan.goal` at a word boundary so older manifests
+/// keep working — a goal that overshoots [`PR_TITLE_GOAL_MAX_LEN`]
+/// gets ellipsised, which is uglier but never wrong.
 fn pr_title(plan: &PlanMeta) -> String {
     let prefix = match plan.plan_type.as_str() {
         "bug" => "fix".to_string(),
@@ -2494,8 +2510,14 @@ fn pr_title(plan: &PlanMeta) -> String {
     } else {
         format!("({scope})")
     };
-    let goal = truncate_at_word_boundary(&plan.goal, PR_TITLE_GOAL_MAX_LEN);
-    format!("{prefix}{scope_segment}: {goal}")
+    let body = plan
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| truncate_at_word_boundary(&plan.goal, PR_TITLE_GOAL_MAX_LEN));
+    format!("{prefix}{scope_segment}: {body}")
 }
 
 /// Returns `s` shortened to at most `max` characters, breaking on the last
@@ -3310,6 +3332,7 @@ mod preflight_tests {
     fn meta_with(jira: Option<&str>, target_branch: Option<&str>, plan_type: &str) -> PlanMeta {
         PlanMeta {
             goal: "g".into(),
+            title: None,
             plan_type: plan_type.into(),
             jira: jira.map(str::to_string),
             target_repo: None,
@@ -3612,6 +3635,37 @@ mod preflight_tests {
         let mut meta = meta_with(None, None, "bug");
         meta.goal = "fix race in scheduler".into();
         assert_eq!(pr_title(&meta), "fix: fix race in scheduler");
+    }
+
+    #[test]
+    fn pr_title_uses_title_when_present_over_goal() {
+        // Title-supplied path: when handover wrote a curated short
+        // summary into the manifest, `pr_title` must use it verbatim
+        // and ignore the goal entirely. The goal here would have
+        // produced an ugly mid-sentence ellipsis; the title is clean.
+        let mut meta = meta_with(Some("CCP-456"), None, "feature");
+        meta.goal = "wire READY → EXECUTING → COMPLETED / FAILED transitions \
+                     in the manifest plan.status state machine"
+            .into();
+        meta.title = Some("wire plan.status state machine transitions".into());
+        assert_eq!(
+            pr_title(&meta),
+            "feat(CCP-456): wire plan.status state machine transitions",
+        );
+    }
+
+    #[test]
+    fn pr_title_falls_back_to_truncated_goal_when_title_is_empty() {
+        // Some(""), Some(" ") — defensive: an empty/whitespace title
+        // should not produce `feat: ` (trailing nothing). Treat it
+        // the same as None and fall back to the truncated goal.
+        let mut meta = meta_with(None, None, "feature");
+        meta.goal = "fix race in scheduler".into();
+        meta.title = Some(String::new());
+        assert_eq!(pr_title(&meta), "feat: fix race in scheduler");
+
+        meta.title = Some("   ".into());
+        assert_eq!(pr_title(&meta), "feat: fix race in scheduler");
     }
 
     #[test]

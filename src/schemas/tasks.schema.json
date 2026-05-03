@@ -17,6 +17,12 @@
       "additionalProperties": false,
       "properties": {
         "goal": { "type": "string", "minLength": 1 },
+        "title": {
+          "description": "Short conventional-commit-subject summary of the plan, used as the PR title body. Sized to leave room for the `feat(JIRA-1234): ` prefix in a 72-char title; the orchestrator's PR_TITLE_GOAL_MAX_LEN constant tracks this maxLength. Optional for back-compat with manifests compiled before this field existed; the orchestrator falls back to truncating `goal` when absent.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 50
+        },
         "type": {
           "description": "Plan type drives default review/validation sets.",
           "enum": ["feature", "bug", "refactor", "chore", "docs", "infra"]
