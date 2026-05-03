@@ -1540,7 +1540,10 @@ impl crate::job::runtime::PipelineObserver for ForegroundObserver {
     }
 
     fn on_step_start(&self, seq: u32, name: &str) {
-        let prefix = "\x1b[33m[plan-executor]\x1b[0m";
+        // Match the `⏺ [plan-executor]` style of every other display line
+        // (sub-agent dispatch, summary counts, pr-monitor stream) so the
+        // GHA / foreground log scans cleanly with one bullet per event.
+        let prefix = "\x1b[33m⏺ [plan-executor]\x1b[0m";
         eprintln!("{prefix} step {seq:03} {name}: running");
     }
 
@@ -1551,7 +1554,7 @@ impl crate::job::runtime::PipelineObserver for ForegroundObserver {
         outcome: &crate::job::types::AttemptOutcome,
         summary: &str,
     ) {
-        let prefix = "\x1b[33m[plan-executor]\x1b[0m";
+        let prefix = "\x1b[33m⏺ [plan-executor]\x1b[0m";
         use crate::job::types::AttemptOutcome;
         match outcome {
             AttemptOutcome::Success => {
@@ -1561,7 +1564,11 @@ impl crate::job::runtime::PipelineObserver for ForegroundObserver {
                 eprintln!("{prefix} step {seq:03} {name}: {summary}");
             }
             _ => {
-                eprintln!("{prefix} step {seq:03} {name}: \x1b[31mFAILED\x1b[0m — {summary}");
+                // Mirror `cli::print_display_line`'s failure styling: when
+                // the line carries `failed` the whole prefix flips to red
+                // so a long log scans cleanly for terminal failures.
+                let red = "\x1b[31m⏺ [plan-executor]\x1b[0m";
+                eprintln!("{red} step {seq:03} {name}: \x1b[31mFAILED\x1b[0m — {summary}");
             }
         }
     }
@@ -1575,7 +1582,7 @@ impl crate::job::runtime::PipelineObserver for ForegroundObserver {
         reason: &str,
         detail: &str,
     ) {
-        let prefix = "\x1b[33m[plan-executor]\x1b[0m";
+        let prefix = "\x1b[33m⏺ [plan-executor]\x1b[0m";
         eprintln!(
             "{prefix} step {seq:03} {name}: retry {next_attempt}/{total_budget} after {reason}: {detail}"
         );
