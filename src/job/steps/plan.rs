@@ -201,17 +201,54 @@ fn find_source_repo(ctx: &StepContext, manifest_path: &Path) -> Option<PathBuf> 
 }
 
 /// Plan-file stem (filename minus extension), used as the slug component
-/// of both the worktree path and the derived branch name. Falls back to
-/// `"plan"` when the manifest path has no usable parent directory name.
+/// of both the worktree path and the derived branch name.
+///
+/// Resolution order:
+/// 1. The filename portion of the manifest's `plan.path` field — stable
+///    across local and remote runs because it's the original plan
+///    markdown filename. Always a valid git path component.
+/// 2. The manifest's parent directory name — the legacy convention
+///    where `tasks.json` lives at `<plan-dir>/<plan-stem>/tasks.json`.
+///    Reliable locally because handover writes to that layout.
+/// 3. Literal `"plan"` — last-resort fallback so we always return
+///    something usable.
+///
+/// Why prefer `plan.path` over the parent dir: the GHA remote-runner
+/// workflow flattens the manifest into a fixed `.tmp-plan-compiled/`
+/// directory regardless of original plan name, which then leaks into
+/// the worktree branch name as `fix/.tmp-plan-compiled` and trips
+/// git's ref-format rules (no segment may start with `.`). Reading
+/// the stem from `plan.path` instead means the original filename
+/// drives the branch name everywhere.
 fn plan_stem_from_manifest(manifest_path: &Path) -> String {
-    // tasks.json lives at `<plan-dir>/<plan-stem>/tasks.json`; the
-    // plan-stem is the parent directory's name.
+    if let Some(stem) = read_plan_path_stem(manifest_path) {
+        return stem;
+    }
     manifest_path
         .parent()
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
         .map(str::to_string)
         .unwrap_or_else(|| "plan".to_string())
+}
+
+/// Reads `plan.path` from the manifest at `manifest_path` and returns
+/// its filename stem (basename minus the final extension), or `None`
+/// when the file can't be read, isn't valid JSON, or the path doesn't
+/// resolve to a non-empty stem.
+fn read_plan_path_stem(manifest_path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(manifest_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let plan_path = value.get("plan")?.get("path")?.as_str()?;
+    let stem = std::path::Path::new(plan_path)
+        .file_stem()?
+        .to_str()?
+        .to_string();
+    if stem.is_empty() {
+        None
+    } else {
+        Some(stem)
+    }
 }
 
 /// Subdirectory of the source repo that holds plan-executor worktrees.
@@ -304,7 +341,66 @@ fn derive_branch_name(plan_meta: &PlanMeta, plan_stem: &str) -> String {
         // refactor / chore / docs / infra all map to themselves
         other => other,
     };
-    format!("{prefix}/{plan_stem}")
+    let sanitized_stem = sanitize_branch_segment(plan_stem);
+    format!("{prefix}/{sanitized_stem}")
+}
+
+/// Strips characters from `segment` that git's check-ref-format rejects
+/// in branch path components: leading dots (`.tmp-foo` → `tmp-foo`),
+/// trailing dots, double dots, and the small set of always-illegal
+/// chars (`~`, `^`, `:`, `?`, `*`, `[`, `\`, whitespace, control).
+/// Each illegal char or run of dots collapses to a single `-`.
+/// Resulting empty segments collapse to `"plan"` so the caller never
+/// emits a bare `<type>/` branch name.
+///
+/// Defense-in-depth on top of [`plan_stem_from_manifest`] — if a future
+/// caller hands us a stem we couldn't sanitize at source, this layer
+/// keeps `git worktree add` from failing with a cryptic ref-format
+/// error.
+fn sanitize_branch_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    let mut last_dash = false;
+    for ch in segment.chars() {
+        let illegal = ch.is_whitespace()
+            || ch.is_control()
+            || matches!(ch, '~' | '^' | ':' | '?' | '*' | '[' | '\\');
+        if illegal {
+            if !last_dash {
+                out.push('-');
+                last_dash = true;
+            }
+        } else {
+            out.push(ch);
+            last_dash = false;
+        }
+    }
+    // Strip leading dots (git rejects refs whose path component
+    // starts with `.`).
+    let stripped: String = out.trim_start_matches('.').to_string();
+    // Collapse `..` runs (git rejects them anywhere).
+    let mut collapsed = String::with_capacity(stripped.len());
+    let mut prev_dot = false;
+    for ch in stripped.chars() {
+        if ch == '.' {
+            if !prev_dot {
+                collapsed.push('.');
+            }
+            prev_dot = true;
+        } else {
+            collapsed.push(ch);
+            prev_dot = false;
+        }
+    }
+    // Strip trailing `.lock` and trailing dots.
+    let trimmed = collapsed
+        .trim_end_matches(".lock")
+        .trim_end_matches('.')
+        .to_string();
+    if trimmed.is_empty() {
+        "plan".to_string()
+    } else {
+        trimmed
+    }
 }
 
 /// Removes the worktree at `worktree_path` (best-effort). Idempotent: a
@@ -3343,6 +3439,9 @@ mod preflight_tests {
 
     #[test]
     fn plan_stem_uses_manifest_parent_directory_name() {
+        // Legacy convention path — when there's no plan.path in the
+        // manifest (or when the manifest doesn't exist on disk) we
+        // fall back to the parent dir name.
         let manifest = std::path::Path::new(
             "/abs/repo/docs/superpowers/plans/2026-04-29-month-reporting-fix/tasks.json",
         );
@@ -3354,6 +3453,72 @@ mod preflight_tests {
         let manifest = std::path::Path::new("tasks.json");
         // No parent → "plan"
         assert_eq!(plan_stem_from_manifest(manifest), "plan");
+    }
+
+    #[test]
+    fn plan_stem_prefers_plan_path_filename_over_parent_dir() {
+        // Reproduces the GHA-runner case: manifest sits in a
+        // tooling-flavored directory (`.tmp-plan-compiled`) but
+        // `plan.path` carries the original markdown filename. We
+        // MUST derive the stem from the filename so the eventual
+        // worktree branch (`fix/<stem>`) is a valid git ref.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest_dir = dir.path().join(".tmp-plan-compiled");
+        std::fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        let manifest_path = manifest_dir.join("tasks.json");
+        let manifest = serde_json::json!({
+            "version": 1,
+            "plan": {
+                "path": "/repo/.my/plans/2026-04-29-month-reporting-fix-design.md",
+                "goal": "x",
+                "type": "bug",
+                "status": "READY",
+                "flags": {
+                    "merge": false, "merge_admin": false, "skip_pr": false,
+                    "skip_code_review": false, "no_worktree": false, "draft_pr": false
+                }
+            },
+            "waves": [],
+            "tasks": {}
+        });
+        std::fs::write(&manifest_path, manifest.to_string()).expect("write");
+
+        assert_eq!(
+            plan_stem_from_manifest(&manifest_path),
+            "2026-04-29-month-reporting-fix-design",
+        );
+    }
+
+    #[test]
+    fn derive_branch_strips_leading_dots_from_stem() {
+        // Defense-in-depth: even if upstream callers somehow hand
+        // us a stem starting with `.`, the resulting branch must
+        // not include it (git rejects refs with `.<segment>`).
+        let meta = meta_with(None, None, "bug");
+        assert_eq!(
+            derive_branch_name(&meta, ".tmp-plan-compiled"),
+            "fix/tmp-plan-compiled",
+        );
+    }
+
+    #[test]
+    fn sanitize_branch_segment_handles_git_invalid_inputs() {
+        // Leading dot stripped.
+        assert_eq!(sanitize_branch_segment(".hidden"), "hidden");
+        // Double-dot collapsed.
+        assert_eq!(sanitize_branch_segment("a..b"), "a.b");
+        // Trailing `.lock` stripped (git refuses .lock suffix).
+        assert_eq!(sanitize_branch_segment("foo.lock"), "foo");
+        // Whitespace + illegal chars become `-`.
+        assert_eq!(sanitize_branch_segment("foo bar~baz"), "foo-bar-baz");
+        // All-illegal collapses to "plan".
+        assert_eq!(sanitize_branch_segment("..."), "plan");
+        assert_eq!(sanitize_branch_segment(""), "plan");
+        // Normal stems pass through.
+        assert_eq!(
+            sanitize_branch_segment("2026-04-29-month-reporting-fix-design"),
+            "2026-04-29-month-reporting-fix-design",
+        );
     }
 
     #[test]
