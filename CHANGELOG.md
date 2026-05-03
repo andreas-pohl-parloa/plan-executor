@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.58.1] - 2026-05-03
+
+### Bug Fixes
+
+- **preflight:** Derive plan-stem from plan.path; sanitize branch segments ([8c62664](https://github.com/andreas-pohl-parloa/plan-executor/commit/8c626646725c7ea6f3404675cbe1e960e5cfb94b))
 ## [0.58.0] - 2026-05-03
 
 ### Features
