@@ -1083,11 +1083,22 @@ pub fn run() {
         }
     }
 
-    // Default to info-level logging when RUST_LOG is not set.
-    // After daemonize(), stderr points to ~/.plan-executor/daemon.log.
+    // Default RUST_LOG by command. Daemon runs detached and writes
+    // tracing to `~/.plan-executor/daemon.log` — `info` is right there.
+    // Foreground `Execute` (used by both `--foreground` locally and the
+    // GHA remote runner) prints `[plan-executor]` colored display lines
+    // to stderr that already cover the same signal as the INFO traces;
+    // `warn` keeps the foreground stream uncluttered. Other commands
+    // keep `info` for parity with the prior default.
     if std::env::var("RUST_LOG").is_err() {
+        let level = match &cli.command {
+            Commands::Execute {
+                foreground: true, ..
+            } => "plan_executor=warn",
+            _ => "plan_executor=info",
+        };
         unsafe {
-            std::env::set_var("RUST_LOG", "plan_executor=info");
+            std::env::set_var("RUST_LOG", level);
         }
     }
     tracing_subscriber::fmt::init();
@@ -1496,8 +1507,8 @@ async fn execute_foreground(manifest_arg: String, config: crate::config::Config)
 /// to stderr (the daemon path uses the broadcast bus instead) but
 /// otherwise shares every behavior with the daemon: `JobMetrics`
 /// tracking, recovery / retry per step, per-step `metrics.json`
-/// persistence, terminal `metrics.json` persistence. Bails on the
-/// first non-success / non-pending outcome.
+/// persistence, terminal `metrics.json` persistence, sub-agent stream
+/// rendering. Bails on the first non-success / non-pending outcome.
 pub(crate) async fn run_rust_scheduler_pipeline(
     steps: Vec<Box<dyn crate::job::step::Step>>,
     job_id: String,
@@ -1505,16 +1516,21 @@ pub(crate) async fn run_rust_scheduler_pipeline(
     workdir: PathBuf,
 ) -> bool {
     use crate::job::runtime;
+    let hooks = std::sync::Arc::new(crate::daemon::SchedulerHooks::new_stderr(job_id.clone()));
     let observer: std::sync::Arc<dyn runtime::PipelineObserver> =
-        std::sync::Arc::new(ForegroundObserver { job_id });
+        std::sync::Arc::new(ForegroundObserver { job_id, hooks });
     let run = runtime::run_pipeline(steps, job_dir, workdir, observer).await;
     run.success
 }
 
 /// Foreground / GHA-runner [`runtime::PipelineObserver`]. Pure
-/// `eprintln` for display; never killed externally; no daemon hooks.
+/// `eprintln` for step transitions; never killed externally. Sub-agent
+/// stream events flow through `hooks` (stderr transport) so wave dispatch,
+/// per-line sub-agent output, and dispatch-done lines all surface in the
+/// same eprintln stream.
 struct ForegroundObserver {
     job_id: String,
+    hooks: std::sync::Arc<crate::daemon::SchedulerHooks>,
 }
 
 #[async_trait::async_trait]
@@ -1563,6 +1579,10 @@ impl crate::job::runtime::PipelineObserver for ForegroundObserver {
         eprintln!(
             "{prefix} step {seq:03} {name}: retry {next_attempt}/{total_budget} after {reason}: {detail}"
         );
+    }
+
+    fn daemon_hooks(&self) -> Option<std::sync::Arc<crate::daemon::SchedulerHooks>> {
+        Some(std::sync::Arc::clone(&self.hooks))
     }
 }
 

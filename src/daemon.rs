@@ -284,48 +284,99 @@ pub async fn run_daemon(config: crate::config::Config) -> Result<()> {
     }
 }
 
+/// Where [`SchedulerHooks`] route display lines and sub-agent stream events.
+/// Daemon mode goes through the broadcast bus + on-disk display.log so
+/// `plan-executor output -f` can render live; foreground/GHA-runner mode
+/// prints directly to stderr because there is no follower process.
+pub enum HooksTransport {
+    /// Long-running daemon: hooks publish to the broadcast bus, persist to
+    /// `display.log`, and check `DaemonState.running_jobs` so a `KillJob`
+    /// stops in-flight sub-agent writers.
+    Daemon {
+        state: Arc<Mutex<DaemonState>>,
+        event_tx: broadcast::Sender<DaemonEvent>,
+    },
+    /// One-shot foreground / GHA-runner: hooks print to stderr with the
+    /// same color scheme as `cli::print_display_line`. No broadcast, no
+    /// kill check (foreground can't be killed externally), and an
+    /// in-process atomic counter replaces `DaemonState.sub_agent_dispatch_counter`.
+    Stderr {
+        wave_dispatch_counter: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    },
+}
+
 /// Hooks the Rust-side scheduler can use to emit display lines, register
 /// sub-agent process groups for `KillJob`, and stream sub-agent JSONL output
-/// to disk + TUI broadcast. Plumbed through `StepContext::daemon_hooks` so
-/// the foreground (`cli::run_rust_scheduler_pipeline`) one-shot path keeps
-/// running with `daemon_hooks: None` while the daemon path gets the full
-/// observability surface.
+/// to disk + TUI broadcast (daemon mode) or directly to stderr (foreground
+/// mode). Plumbed through `StepContext::daemon_hooks` so step impls call
+/// the same methods regardless of transport.
 pub struct SchedulerHooks {
     /// Job id used as the dispatch_counter map key, file-naming prefix, and
     /// `JobDisplayLine` recipient.
     pub job_id: String,
-    /// Daemon state — needed for `running_jobs` membership checks inside the
-    /// writer (it stops on KillJob), for `sub_agent_pgids` registration,
-    /// and for `sub_agent_dispatch_counter` increments.
-    pub state: Arc<Mutex<DaemonState>>,
-    /// Broadcast bus for `JobDisplayLine` / `SubAgentLine` events the
-    /// `output -f` follower renders live via sjv.
-    pub event_tx: broadcast::Sender<DaemonEvent>,
+    /// Where display lines and sub-agent stream events are routed.
+    pub transport: HooksTransport,
     /// Per-job dispatch counter for **helper subprocess** invocations
     /// (validate / review / pr-finalize / run-reviewer-team). Lives
-    /// alongside the wave-dispatch counter on `DaemonState` because
-    /// helpers run from sync code — `helper.rs::run_claude_subprocess`
-    /// can't `.await` on the tokio Mutex. Starts at 1000 so the
-    /// resulting `dispatch-<N>-...` filenames stay visually distinct
-    /// from wave dispatches (1, 2, 3, ...).
+    /// alongside the wave-dispatch counter because helpers run from sync
+    /// code — `helper.rs::run_claude_subprocess` can't `.await` on the
+    /// tokio Mutex. Starts at 1000 so the resulting `dispatch-<N>-...`
+    /// filenames stay visually distinct from wave dispatches (1, 2, 3, ...).
     pub helper_dispatch_counter: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl SchedulerHooks {
+    /// Daemon constructor: long-running broadcast-bus + display.log path.
+    pub fn new_daemon(
+        job_id: String,
+        state: Arc<Mutex<DaemonState>>,
+        event_tx: broadcast::Sender<DaemonEvent>,
+    ) -> Self {
+        Self {
+            job_id,
+            transport: HooksTransport::Daemon { state, event_tx },
+            helper_dispatch_counter: std::sync::Arc::new(
+                std::sync::atomic::AtomicU32::new(1000),
+            ),
+        }
+    }
+
+    /// Foreground / GHA-runner constructor: stderr-only path with no
+    /// broadcast bus, no kill check, in-process wave counter.
+    pub fn new_stderr(job_id: String) -> Self {
+        Self {
+            job_id,
+            transport: HooksTransport::Stderr {
+                wave_dispatch_counter: std::sync::Arc::new(
+                    std::sync::atomic::AtomicU32::new(0),
+                ),
+            },
+            helper_dispatch_counter: std::sync::Arc::new(
+                std::sync::atomic::AtomicU32::new(1000),
+            ),
+        }
+    }
+
     /// Bumps the per-job dispatch counter, persists + broadcasts a
     /// `dispatching N sub-agent(s)` display line, and returns the new
     /// counter value. The `output -f` CLI uses the persisted line to
     /// advance its own `dispatch_counter` so it can resolve the matching
     /// per-sub-agent JSONL file under `<job>/sub-agents/dispatch-<N>-...`.
     pub async fn announce_wave_dispatch(&self, count: usize, kind: &str) -> u32 {
-        let dispatch_num = {
-            let mut st = self.state.lock().await;
-            let entry = st
-                .sub_agent_dispatch_counter
-                .entry(self.job_id.clone())
-                .or_insert(0);
-            *entry += 1;
-            *entry
+        use std::sync::atomic::Ordering;
+        let dispatch_num = match &self.transport {
+            HooksTransport::Daemon { state, .. } => {
+                let mut st = state.lock().await;
+                let entry = st
+                    .sub_agent_dispatch_counter
+                    .entry(self.job_id.clone())
+                    .or_insert(0);
+                *entry += 1;
+                *entry
+            }
+            HooksTransport::Stderr {
+                wave_dispatch_counter,
+            } => wave_dispatch_counter.fetch_add(1, Ordering::Relaxed) + 1,
         };
         let line = format!(
             "⏺ [plan-executor] dispatching {count} sub-agent(s) (kind: {kind})"
@@ -421,13 +472,20 @@ impl SchedulerHooks {
         dispatch_num: u32,
     ) -> tokio::sync::mpsc::UnboundedSender<crate::handoff::SubAgentLine> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        spawn_subagent_writer(
-            Arc::clone(&self.state),
-            self.job_id.clone(),
-            dispatch_num,
-            self.event_tx.clone(),
-            rx,
-        );
+        match &self.transport {
+            HooksTransport::Daemon { state, event_tx } => {
+                spawn_subagent_writer(
+                    Arc::clone(state),
+                    self.job_id.clone(),
+                    dispatch_num,
+                    event_tx.clone(),
+                    rx,
+                );
+            }
+            HooksTransport::Stderr { .. } => {
+                spawn_subagent_writer_stderr(self.job_id.clone(), dispatch_num, rx);
+            }
+        }
         tx
     }
 
@@ -439,16 +497,52 @@ impl SchedulerHooks {
         &self,
     ) -> tokio::sync::mpsc::UnboundedSender<u32> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        spawn_pgid_registrar(Arc::clone(&self.state), self.job_id.clone(), rx);
+        match &self.transport {
+            HooksTransport::Daemon { state, .. } => {
+                spawn_pgid_registrar(Arc::clone(state), self.job_id.clone(), rx);
+            }
+            HooksTransport::Stderr { .. } => {
+                // Foreground / GHA-runner: no kill, but the channel must
+                // still drain so `dispatch_all` can hand off pgids without
+                // its sender blocking. Best-effort discard is fine — the
+                // pgids are only consumed by the daemon's KillJob path.
+                spawn_pgid_registrar_drain(rx);
+            }
+        }
         tx
     }
 
     fn publish_display_line(&self, line: String) {
-        append_display(&self.job_id, &line);
-        let _ = self.event_tx.send(DaemonEvent::JobDisplayLine {
-            job_id: self.job_id.clone(),
-            line,
-        });
+        match &self.transport {
+            HooksTransport::Daemon { event_tx, .. } => {
+                append_display(&self.job_id, &line);
+                let _ = event_tx.send(DaemonEvent::JobDisplayLine {
+                    job_id: self.job_id.clone(),
+                    line,
+                });
+            }
+            HooksTransport::Stderr { .. } => {
+                eprint_display_line(&line);
+            }
+        }
+    }
+}
+
+/// Stderr renderer mirroring `cli::print_display_line`. Yellow prefix
+/// for `⏺ [plan-executor]` lines (red on `failed`), green ⏺ bullet for
+/// other ⏺-led lines, plain text otherwise. Foreground/GHA-runner only.
+fn eprint_display_line(line: &str) {
+    if let Some(rest) = line.strip_prefix("⏺ [plan-executor]") {
+        let is_failure = rest.contains("failed");
+        if is_failure {
+            eprintln!("\x1b[31m⏺ [plan-executor]{}\x1b[0m", rest);
+        } else {
+            eprintln!("\x1b[33m⏺ [plan-executor]\x1b[0m{}", rest);
+        }
+    } else if let Some(rest) = line.strip_prefix("⏺") {
+        eprintln!("\x1b[32m⏺\x1b[0m{}", rest);
+    } else {
+        eprintln!("{}", line);
     }
 }
 
@@ -558,6 +652,104 @@ fn spawn_pgid_registrar(
             }
         }
     })
+}
+
+/// Foreground / GHA-runner counterpart of [`spawn_subagent_writer`]. Per
+/// streamed line: prints the rendered output to stderr with a dim
+/// indented `│N│ ` prefix (matching `cli::render_subagent_live`) and
+/// appends the raw bytes to the same on-disk path the daemon path uses
+/// (`<job>/sub-agents/dispatch-<N>-agent-<idx>-<type>.{jsonl,stderr}`)
+/// so post-mortem `plan-executor output <id>` finds the same artifacts.
+fn spawn_subagent_writer_stderr(
+    job_id: String,
+    dispatch_num: u32,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::handoff::SubAgentLine>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let base_dir = Config::base_dir()
+            .join("jobs")
+            .join(&job_id)
+            .join("sub-agents");
+        if let Err(e) = tokio::fs::create_dir_all(&base_dir).await {
+            tracing::warn!(job = %job_id, error = %e, "sub-agent dir create failed");
+        }
+
+        let mut handles: HashMap<(usize, bool), tokio::fs::File> = HashMap::new();
+        while let Some(msg) = rx.recv().await {
+            // Render to stderr first so the operator sees activity even
+            // if the on-disk write fails for some reason.
+            render_subagent_line_stderr(msg.index, msg.is_stderr, &msg.line);
+
+            let key = (msg.index, msg.is_stderr);
+            let file = match handles.get_mut(&key) {
+                Some(f) => f,
+                None => {
+                    let ext = if msg.is_stderr { "stderr" } else { "jsonl" };
+                    let path = base_dir.join(format!(
+                        "dispatch-{}-agent-{}-{}.{}",
+                        dispatch_num, msg.index, msg.agent_type, ext
+                    ));
+                    match tokio::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .await
+                    {
+                        Ok(f) => {
+                            handles.insert(key, f);
+                            handles.get_mut(&key).expect("just inserted")
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                job = %job_id, path = %path.display(),
+                                error = %e, "sub-agent file open failed",
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
+            let _ = file.write_all(msg.line.as_bytes()).await;
+            let _ = file.write_all(b"\n").await;
+        }
+    })
+}
+
+/// Drains a pgid channel without recording anything. Foreground /
+/// GHA-runner uses this in place of [`spawn_pgid_registrar`] because it
+/// has no `KillJob` consumer for those pgids — but `dispatch_all` still
+/// needs a non-blocking receiver on the other end of its sender.
+fn spawn_pgid_registrar_drain(
+    mut pgid_rx: tokio::sync::mpsc::UnboundedReceiver<u32>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while pgid_rx.recv().await.is_some() {
+            // discard
+        }
+    })
+}
+
+/// Renders one streamed sub-agent line to stderr with the same dim
+/// indented prefix the CLI follower uses. Mirrors
+/// `cli::render_subagent_live` so daemon `output -f` and foreground
+/// stderr produce identical visual output for the same JSONL payload.
+pub(crate) fn render_subagent_line_stderr(index: usize, is_stderr: bool, line: &str) {
+    if line.is_empty() {
+        return;
+    }
+    let prefix = format!("\x1b[2m│{}│ \x1b[0m", index);
+    let rendered = if is_stderr {
+        format!("\x1b[2m{}\x1b[0m", line)
+    } else {
+        sjv::render_runtime_line(line, false, true)
+    };
+    for visual in rendered.lines() {
+        if visual.is_empty() {
+            continue;
+        }
+        eprintln!("{}{}", prefix, visual);
+    }
 }
 
 use crate::proctree::collect_descendant_pgids;
@@ -1101,12 +1293,11 @@ async fn run_rust_scheduler_steps(
     use crate::job::types::JobId;
 
     let event_tx = { state.lock().await.event_tx.clone() };
-    let hooks = Arc::new(SchedulerHooks {
-        job_id: job_id.to_string(),
-        state: Arc::clone(state),
+    let hooks = Arc::new(SchedulerHooks::new_daemon(
+        job_id.to_string(),
+        Arc::clone(state),
         event_tx,
-        helper_dispatch_counter: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1000)),
-    });
+    ));
 
     let observer: Arc<dyn runtime::PipelineObserver> = Arc::new(DaemonObserver {
         job_id: job_id.to_string(),
