@@ -36,7 +36,14 @@ impl AgentConfig {
         "codex --dangerously-bypass-approvals-and-sandbox exec".to_string()
     }
     fn default_gemini() -> String {
-        "gemini --yolo -p".to_string()
+        // `--yolo` auto-approves tool calls; `--skip-trust` skips the
+        // workspace-trust check that otherwise blocks gemini-cli on
+        // ephemeral directories (GHA runner checkouts, plan-executor
+        // worktrees, anything not interactively marked trusted) with
+        // "Gemini CLI is not running in a trusted directory.". Without
+        // it the reviewer hangs on the trust prompt and silently
+        // contributes nothing.
+        "gemini --yolo --skip-trust -p".to_string()
     }
     fn default_bash() -> String {
         "bash".to_string()
