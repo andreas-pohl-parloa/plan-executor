@@ -2932,10 +2932,18 @@ fn publish_summary_lines(ctx: &StepContext, counts: &ExecutionCounts) {
             counts.attempts_total, counts.retries_total, counts.protocol_violations
         ),
     ];
+    // Route via `hooks.announce_step_line` only — the foreground/Stderr
+    // transport already prints to stderr, the daemon transport publishes
+    // to display.log + broadcast bus. Direct eprintln here would produce
+    // duplicate lines in foreground (one uncolored from this fn, one
+    // colored from `eprint_display_line` in the hooks transport).
     for line in &lines {
-        eprintln!("{line}");
         if let Some(hooks) = ctx.daemon_hooks.as_ref() {
             hooks.announce_step_line(line.clone());
+        } else {
+            // No hooks at all (rare path: tests with `daemon_hooks: None`).
+            // Fall back to plain eprintln so the line still surfaces.
+            eprintln!("{line}");
         }
     }
 }
@@ -3181,11 +3189,19 @@ fn stream_pr_finalize_lines<R>(
     R: std::io::Read,
 {
     use std::io::{BufRead, BufReader};
+    // Route via `hooks.announce_step_line` only — the foreground/Stderr
+    // transport already prints to stderr, the daemon transport publishes
+    // to display.log + broadcast bus. Direct eprintln here would produce
+    // duplicate lines in foreground (one uncolored from this fn, one
+    // colored from `eprint_display_line` in the hooks transport).
     for line in BufReader::new(pipe).lines().map_while(Result::ok) {
         let display = format!("⏺ [plan-executor] pr-finalize: {line}");
-        eprintln!("{display}");
         if let Some(h) = hooks.as_ref() {
             h.announce_step_line(display);
+        } else {
+            // No hooks at all (rare path: tests with `daemon_hooks: None`).
+            // Fall back to plain eprintln so the line still surfaces.
+            eprintln!("{display}");
         }
     }
 }

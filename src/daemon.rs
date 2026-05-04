@@ -402,12 +402,17 @@ impl SchedulerHooks {
                 "⏺ [plan-executor] sub-agent {index} done ({stdout_chars} chars)"
             )
         } else {
-            // Surface the first non-empty stderr line so failure context isn't
-            // hidden in disk artifacts. Fall back to a generic message when
-            // nothing was captured (e.g. spawn-failure path that only sets a
-            // synthetic stderr).
+            // Surface the LAST non-empty stderr line — the actual failure
+            // is almost always the last thing the CLI emits, while the
+            // first stderr line is often a benign banner (e.g. gemini's
+            // "YOLO mode is enabled. All tool calls will be automatically
+            // approved." preamble that masked the real error in earlier
+            // GHA logs). Fall back to a generic message when nothing was
+            // captured (e.g. spawn-failure path that only sets a synthetic
+            // stderr).
             let detail = stderr
                 .lines()
+                .rev()
                 .find(|l| !l.trim().is_empty())
                 .map(|l| l.trim())
                 .filter(|l| !l.is_empty())
