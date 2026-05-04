@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.59.2] - 2026-05-04
+
+### Bug Fixes
+
+- Dedupe step output, surface last stderr on skip, add gemini --skip-trust ([af2a1a4](https://github.com/andreas-pohl-parloa/plan-executor/commit/af2a1a472913c7179925479631d314e2cebaac67))
 ## [0.59.1] - 2026-05-03
 
 ### Bug Fixes
