@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.61.0] - 2026-05-05
+
+### Features
+
+- **progress:** Fine-grained label, comma format, per-dispatch tick ([e393c33](https://github.com/andreas-pohl-parloa/plan-executor/commit/e393c3397db6830ddd96f1b66487f3809c4d3bbb))
 ## [0.60.0] - 2026-05-05
 
 ### Features
