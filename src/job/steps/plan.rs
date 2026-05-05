@@ -954,6 +954,14 @@ async fn run_helper_fix_loop(
     let mut prior_findings_hash: Option<String> = None;
     loop {
         iteration += 1;
+        // Surface the iteration count in the live progress label so
+        // operators watching `output -f` / GHA stderr see `, iter N`
+        // alongside `wave X/Y`. The marker is emitted on every
+        // iteration; the label parser suppresses `, iter 1` to keep
+        // the first-pass output uncluttered.
+        if let Some(hooks) = ctx.daemon_hooks.as_ref() {
+            hooks.announce_iteration(iteration);
+        }
         // Enforce wall-clock budget on top of the iteration cap.
         // Each iteration can take 30+ minutes, so without a wall-clock guard
         // the loop can far exceed any reasonable step timeout.

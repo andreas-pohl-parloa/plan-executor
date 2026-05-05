@@ -499,6 +499,23 @@ impl SchedulerHooks {
         self.publish_display_line(line);
     }
 
+    /// Persists + broadcasts a fix-loop iteration marker so the progress
+    /// label can render `, iter N` while a `code_review` or `validation`
+    /// step is mid-loop. Emitted once at the top of every iteration in
+    /// `run_helper_fix_loop`. The progress-label parser keys on these
+    /// markers (one per active step's iteration), so the line MUST land
+    /// in `display.log` before any subsequent `announce_wave_dispatch` /
+    /// `announce_progress` so the wave / progress lines pick up the new
+    /// iteration number on the same render.
+    pub fn announce_iteration(&self, iteration: u32) {
+        let line = format!("⏺ [plan-executor] iteration {iteration}");
+        self.publish_display_line(line);
+        // Refresh the live progress line so operators see `, iter N`
+        // immediately on iteration boundary, not only after the next
+        // wave dispatch.
+        self.announce_progress();
+    }
+
     /// Persists + broadcasts a wave-retry banner naming which sub-agent
     /// indices are being re-dispatched after a transient failure. Distinct
     /// from `announce_wave_dispatch` so `output -f` and `jobs` can show

@@ -223,6 +223,11 @@ pub(crate) fn progress_label(
     let mut max_seq: u32 = 0;
     let mut waves_dispatched_in_current_step: u32 = 0;
     let mut last_starting_seq: Option<u32> = None;
+    // Latest fix-loop iteration seen since the current step started.
+    // Reset on every step transition so iter resets for the next
+    // helper-driven step (code_review → validation each maintain their
+    // own counter).
+    let mut iteration_in_current_step: u32 = 0;
     for raw in content.lines() {
         let cleaned = strip_bullet_prefix(raw);
         if let Some((seq, name, status)) = parse_step_line(&cleaned) {
@@ -235,13 +240,18 @@ pub(crate) fn progress_label(
                 current = Some((seq, name));
                 last_starting_seq = Some(seq);
                 waves_dispatched_in_current_step = 0;
+                iteration_in_current_step = 0;
             } else {
                 // Any non-starting status line marks the step as resolved
                 // (success, pending placeholder, semantic_mistake, …).
                 completed.insert(seq);
             }
-        } else if last_starting_seq.is_some() && is_dispatch_line(&cleaned) {
-            waves_dispatched_in_current_step += 1;
+        } else if last_starting_seq.is_some() {
+            if is_dispatch_line(&cleaned) {
+                waves_dispatched_in_current_step += 1;
+            } else if let Some(n) = parse_iteration_line(&cleaned) {
+                iteration_in_current_step = n;
+            }
         }
     }
     let Some((cur_seq, cur_name)) = current else {
@@ -283,7 +293,22 @@ pub(crate) fn progress_label(
             label.push_str(&format!(", wave {cur_wave}/{total_w}"));
         }
     }
+    // Append iter marker for fix-loop steps. Suppress `iter 1` since
+    // every helper-driven step starts at iteration 1 and showing it
+    // would clutter the first-pass output without adding signal.
+    if iteration_in_current_step > 1 {
+        label.push_str(&format!(", iter {iteration_in_current_step}"));
+    }
     label
+}
+
+/// Parses `iteration N` lines emitted by `SchedulerHooks::announce_iteration`.
+/// Returns the iteration number when the line matches; `None` otherwise.
+/// The display.log line shape (after `strip_bullet_prefix`) is exactly
+/// `iteration <N>` with `N` an unsigned integer.
+fn parse_iteration_line(line: &str) -> Option<u32> {
+    let rest = line.strip_prefix("iteration ")?;
+    rest.trim().parse::<u32>().ok()
 }
 
 /// Returns `true` when `line` is the canonical
