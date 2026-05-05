@@ -39,21 +39,24 @@ use crate::job::step::{Step, StepContext};
 use crate::job::types::AttemptOutcome;
 use crate::scheduler::{self, Manifest, SchedulerError};
 
-/// Maximum number of inner fix-loop iterations attempted within a single step
-/// attempt. Each iteration runs (helper → triage → compile-fix-waves → wave
-/// re-execution → re-invoke helper). Beyond this cap the step gives up and
-/// surfaces a `SemanticMistake` outcome so the registry-level retry/abort
-/// machinery can take over.
+/// Maximum number of review (or validation) rounds run inside a single
+/// step attempt. The loop alternates *review → fix → review → fix → …*;
+/// the cap counts review rounds. After round `MAX_FIX_LOOP_ITERATIONS`
+/// the step dispatches its fix wave and exits `Success` WITHOUT a
+/// verification review on top — that final review can never produce a
+/// fix wave (cap exhausted) so it would only re-discover what
+/// `prior_review_context` already captured.
 ///
-/// Capped at 3: rounds 4-5 in observed runs are almost always loops on
-/// stylistic disagreement that the LLM cannot converge (250k-char Codex
-/// dumps, repeated re-flagging of the same line). Earlier converged-tail
-/// runs settle in 1-2 rounds; round 3 is the realistic ceiling for
-/// genuine multi-round fixes. Anything still flagged after round 3 is
-/// surfaced as a `Known Gaps` section in the PR description rather than
-/// burning another full reviewer wave. The same-findings early-exit
-/// (see [`run_helper_fix_loop`]) catches the no-progress case earlier
-/// when the LLM keeps re-raising the identical finding-set.
+/// Capped at 3: observed runs of 4-5 rounds are almost always
+/// non-converging — different findings each round because fix-agents
+/// occasionally regress earlier work, but the round-N+1 review can't
+/// drive a fix wave anyway. Round 3 is the realistic ceiling for
+/// genuine multi-round fixes. Anything still flagged after the round-3
+/// fix wave is surfaced as a `Known Gaps` section in the PR
+/// description rather than burning another full reviewer wave. The
+/// same-findings early-exit (see [`run_helper_fix_loop`]) catches the
+/// no-progress case earlier when the LLM keeps re-raising the
+/// identical finding-set.
 const MAX_FIX_LOOP_ITERATIONS: u32 = 3;
 
 /// Wall-clock budget for a single `run_helper_fix_loop` invocation.
@@ -954,6 +957,36 @@ async fn run_helper_fix_loop(
     let mut prior_findings_hash: Option<String> = None;
     loop {
         iteration += 1;
+        // Cap reviews at `max_iterations`. Today the cap is 3, so the
+        // loop runs review 1 → fix 1 → review 2 → fix 2 → review 3 →
+        // fix 3, and would otherwise re-enter for review 4 just to
+        // find FIX_REQUIRED again and bail with `SemanticMistake`. That
+        // 4th review is pure cost: it never gets a fix wave (cap), so
+        // it can't change anything beyond what `prior_review_context`
+        // already captured. Skip it. The 3 fix waves we already ran
+        // are the operator's best-effort batch; remaining findings
+        // (if any) get surfaced via the next `pr_creation` step's
+        // `Known Gaps` section in the PR description.
+        if iteration > max_iterations {
+            tracing::info!(
+                kind = ?kind,
+                rounds_run = max_iterations,
+                "fix-loop cap reached after max_iterations review+fix rounds; \
+                 skipping verification review and moving on",
+            );
+            if let Some(hooks) = ctx.daemon_hooks.as_ref() {
+                let label = match kind {
+                    HelperLoopKind::CodeReview => "code_review",
+                    HelperLoopKind::Validation => "validation",
+                };
+                hooks.announce_step_line(format!(
+                    "⏺ [plan-executor] {label}: cap reached after \
+                     {max_iterations} round(s) of review+fix; moving on \
+                     without verifying the final fix wave"
+                ));
+            }
+            return AttemptOutcome::Success;
+        }
         // Surface the iteration count in the live progress label so
         // operators watching `output -f` / GHA stderr see `, iter N`
         // alongside `wave X/Y`. The marker is emitted on every
@@ -994,16 +1027,10 @@ async fn run_helper_fix_loop(
                 state_updates,
             }) => match status {
                 HelperStatus::FixRequired => {
-                    if iteration > max_iterations {
-                        tracing::warn!(
-                            kind = ?kind,
-                            iteration,
-                            "fix-loop budget exhausted; surfacing semantic mistake",
-                        );
-                        return AttemptOutcome::SemanticMistake {
-                            fix_loop_round: iteration,
-                        };
-                    }
+                    // Cap is enforced at the top of the loop (before
+                    // invoking the helper), so we never reach this
+                    // arm beyond `max_iterations`. The check stays
+                    // simple here: dispatch the fix wave and continue.
                     // Same-findings early-exit. Hash the FIX_REQUIRED
                     // payload from the helper's findings_path (when it
                     // exists — validation gaps go through a different
