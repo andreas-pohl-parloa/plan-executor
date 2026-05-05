@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.62.0] - 2026-05-05
+
+### Features
+
+- **code-review:** Cap fix-loop at 3 + same-findings early-exit ([801063f](https://github.com/andreas-pohl-parloa/plan-executor/commit/801063fefbcfc26ca6520ae986f4450659207385))
 ## [0.61.0] - 2026-05-05
 
 ### Features
