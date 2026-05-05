@@ -72,7 +72,7 @@ fn cmd_list() -> Result<()> {
     }
     let job_processes = query_daemon_processes();
     println!(
-        "{:<10} {:<14} {:<11} {:<21} {:<38} TITLE",
+        "{:<10} {:<14} {:<11} {:<21} {:<42} TITLE",
         "ID", "KIND", "STATE", "CREATED_AT", "PROGRESS"
     );
     for entry in entries {
@@ -87,12 +87,12 @@ fn cmd_list() -> Result<()> {
                 let total_waves = job_opt.as_ref().and_then(plan_total_waves);
                 let progress = progress_label(&summary.id.0, total_steps, total_waves);
                 println!(
-                    "{:<10} {:<14} {:<11} {:<21} {:<38} {}",
+                    "{:<10} {:<14} {:<11} {:<21} {:<42} {}",
                     short_id(&summary.id.0),
                     summary.kind_tag,
                     state_label(&summary.state),
                     short_timestamp(&summary.created_at),
-                    truncate_to(&progress, 38),
+                    truncate_to(&progress, 42),
                     title,
                 );
                 if matches!(summary.state, JobState::Running) {
@@ -105,12 +105,12 @@ fn cmd_list() -> Result<()> {
                 let (kind, state, created, title) = legacy_summary(&path);
                 let progress = progress_label(&id, None, None);
                 println!(
-                    "{:<10} {:<14} {:<11} {:<21} {:<38} {}",
+                    "{:<10} {:<14} {:<11} {:<21} {:<42} {}",
                     short_id(&id),
                     kind,
                     state,
                     short_timestamp(&created),
-                    truncate_to(&progress, 38),
+                    truncate_to(&progress, 42),
                     title,
                 );
                 if state == "running" {
@@ -181,23 +181,31 @@ fn query_daemon_processes() -> HashMap<String, crate::ipc::JobProcesses> {
     }
 }
 
-/// Derives a short PROGRESS label from the job's `display.log`. Counts how
-/// many `step N (name) <terminal-status>` lines have been written to compute
-/// completion percentage out of `total_steps`, then identifies the currently
-/// running step and formats `<pct>% step <N>/<total> <name>`. When the
-/// current step is the wave executor and `total_waves` is known, also
-/// appends ` wave <X>/<Y>` so callers see how far through the wave DAG the
-/// run has progressed.
+/// Derives a PROGRESS label from the job's `display.log`. Counts how
+/// many `step N (name) <terminal-status>` lines have been written, blends
+/// in intra-step wave progress when the current step is `wave_execution`
+/// (`waves_dispatched / total_waves` of one step's worth), and formats
+/// `<pct>% step <N>/<total>, <name>[, wave <X>/<Y>]`.
+///
+/// Percentage spans every known sub-step: a step counts as `1.0` when
+/// complete, and the active `wave_execution` step contributes a fraction
+/// `dispatched_waves / total_waves` so the bar advances every time a new
+/// wave begins instead of jumping from 12% to 25% only at step boundaries.
 ///
 /// `wave X` is computed from the count of `dispatching N sub-agent(s)` lines
 /// in `display.log` — each wave dispatch emits exactly one such line via
 /// `SchedulerHooks::announce_wave_dispatch`. `wave Y` comes from the
 /// caller-supplied total (parsed from the compiled `tasks.json` once per
-/// listing render).
+/// listing render or read from disk by `SchedulerHooks::announce_progress`
+/// at runtime).
 ///
 /// Falls back to `-` when no display.log exists yet or no step line has been
 /// emitted (job freshly queued).
-fn progress_label(job_id: &str, total_steps: Option<u32>, total_waves: Option<u32>) -> String {
+pub(crate) fn progress_label(
+    job_id: &str,
+    total_steps: Option<u32>,
+    total_waves: Option<u32>,
+) -> String {
     let path = crate::config::Config::base_dir()
         .join("jobs")
         .join(job_id)
@@ -243,16 +251,36 @@ fn progress_label(job_id: &str, total_steps: Option<u32>, total_waves: Option<u3
     // highest seq seen in the log when job.json is unreadable.
     let total = total_steps.unwrap_or(max_seq).max(cur_seq);
     let completed_count = completed.len() as u32;
+    // Fine-grained percentage: completed steps + the active step's
+    // intra-step fraction (waves dispatched / total waves) when the
+    // current step is `wave_execution`. Other steps contribute nothing
+    // mid-flight today — the registry's other steps are atomic from the
+    // observer's perspective.
+    let intra_step_fraction = if cur_name == "wave_execution" {
+        match total_waves {
+            Some(total_w) if total_w > 0 => {
+                let dispatched = u32::min(waves_dispatched_in_current_step, total_w);
+                f64::from(dispatched) / f64::from(total_w)
+            }
+            _ => 0.0,
+        }
+    } else {
+        0.0
+    };
+    let done_units = f64::from(completed_count) + intra_step_fraction;
     let pct = if total == 0 {
         0
     } else {
-        (completed_count * 100) / total
+        let raw = (done_units * 100.0) / f64::from(total);
+        // Clamp to 0..=99 while the run is in flight; the final "100%"
+        // belongs on the terminal summary line, not on a progress tick.
+        raw.max(0.0).min(99.0).floor() as u32
     };
-    let mut label = format!("{pct:>3}% step {cur_seq}/{total} {cur_name}");
+    let mut label = format!("{pct:>3}% step {cur_seq}/{total}, {cur_name}");
     if cur_name == "wave_execution" {
         if let Some(total_w) = total_waves {
             let cur_wave = waves_dispatched_in_current_step.max(1).min(total_w);
-            label.push_str(&format!(" wave {cur_wave}/{total_w}"));
+            label.push_str(&format!(", wave {cur_wave}/{total_w}"));
         }
     }
     label
