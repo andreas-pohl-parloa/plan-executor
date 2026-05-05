@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.60.0] - 2026-05-05
+
+### Features
+
+- **integration_testing:** Manifest-driven language + command dispatch ([2ba18cc](https://github.com/andreas-pohl-parloa/plan-executor/commit/2ba18cc4fe15f7cb9d1fdb069d8a6e38613482e2))
 ## [0.59.2] - 2026-05-04
 
 ### Bug Fixes
