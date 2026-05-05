@@ -358,10 +358,12 @@ impl SchedulerHooks {
     }
 
     /// Bumps the per-job dispatch counter, persists + broadcasts a
-    /// `dispatching N sub-agent(s)` display line, and returns the new
-    /// counter value. The `output -f` CLI uses the persisted line to
-    /// advance its own `dispatch_counter` so it can resolve the matching
-    /// per-sub-agent JSONL file under `<job>/sub-agents/dispatch-<N>-...`.
+    /// `dispatching N sub-agent(s)` display line, emits a follow-up
+    /// `progress: …` line so operators see the percentage advance on
+    /// every wave, and returns the new counter value. The `output -f`
+    /// CLI uses the persisted dispatch line to advance its own
+    /// `dispatch_counter` so it can resolve the matching per-sub-agent
+    /// JSONL file under `<job>/sub-agents/dispatch-<N>-...`.
     pub async fn announce_wave_dispatch(&self, count: usize, kind: &str) -> u32 {
         use std::sync::atomic::Ordering;
         let dispatch_num = match &self.transport {
@@ -382,7 +384,67 @@ impl SchedulerHooks {
             "⏺ [plan-executor] dispatching {count} sub-agent(s) (kind: {kind})"
         );
         self.publish_display_line(line);
+        // Progress line follows the dispatch line so the count of
+        // `dispatching …` markers in display.log already includes the
+        // wave just announced. The label parser keys on those markers
+        // for `wave X/Y`, so the freshly bumped wave is the one shown.
+        self.announce_progress();
         dispatch_num
+    }
+
+    /// Reads the job's manifest + step count, computes a fine-grained
+    /// progress label (percentage spans every step plus the current
+    /// `wave_execution` step's intra-step wave fraction), and publishes
+    /// it through the same display-line transport as every other hook
+    /// emission. Called automatically from `announce_wave_dispatch`;
+    /// step impls outside the wave dispatcher can also call it directly
+    /// to emit a tick mid-step. No-op friendly when `display.log` has
+    /// no step lines yet — the label falls back to `-` and the tick is
+    /// suppressed rather than emit visual noise.
+    pub fn announce_progress(&self) {
+        let (total_steps, total_waves) = self.read_progress_totals();
+        let label = crate::job::cli::progress_label(
+            &self.job_id,
+            total_steps,
+            total_waves,
+        );
+        if label == "-" {
+            return;
+        }
+        self.publish_display_line(format!("⏺ [plan-executor] progress: {label}"));
+    }
+
+    /// Reads `total_steps` from the persisted `job.json` and `total_waves`
+    /// from the manifest at `JobKind::Plan.manifest_path`. Returns
+    /// `(None, None)` for non-`Plan` jobs or when either file is missing
+    /// / unreadable — the progress label gracefully degrades when
+    /// totals are absent.
+    fn read_progress_totals(&self) -> (Option<u32>, Option<u32>) {
+        use crate::job::storage::JobStore;
+        use crate::job::types::{JobId, JobKind};
+        let Ok(store) = JobStore::new() else {
+            return (None, None);
+        };
+        let Ok(dir) = store.open(&JobId(self.job_id.clone())) else {
+            return (None, None);
+        };
+        let Ok(job) = dir.read_job() else {
+            return (None, None);
+        };
+        let total_steps = u32::try_from(job.steps.len()).ok();
+        let total_waves = match &job.kind {
+            JobKind::Plan { manifest_path } => std::fs::read_to_string(manifest_path)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .and_then(|v| {
+                    v.get("waves")
+                        .and_then(|w| w.as_array())
+                        .map(|a| a.len())
+                })
+                .and_then(|c| u32::try_from(c).ok()),
+            _ => None,
+        };
+        (total_steps, total_waves)
     }
 
     /// Persists + broadcasts a `sub-agent <N> done|failed|skipped` display
@@ -455,9 +517,12 @@ impl SchedulerHooks {
 
     /// Sync version of [`Self::announce_wave_dispatch`] for helper
     /// subprocesses. Bumps a separate per-hooks atomic counter (so it
-    /// doesn't compete with wave dispatches for the async tokio Mutex)
-    /// and prints the same display line. The returned `dispatch_num` is
-    /// used to name the per-helper JSONL file under `<job>/sub-agents/`.
+    /// doesn't compete with wave dispatches for the async tokio Mutex),
+    /// prints the same display line, and emits a follow-up `progress: …`
+    /// tick so review / validation / pr-finalize helper dispatches show
+    /// progress alongside wave dispatches. The returned `dispatch_num`
+    /// is used to name the per-helper JSONL file under
+    /// `<job>/sub-agents/`.
     pub fn announce_helper_dispatch(&self, count: usize, kind: &str) -> u32 {
         use std::sync::atomic::Ordering;
         let dispatch_num = self.helper_dispatch_counter.fetch_add(1, Ordering::Relaxed);
@@ -465,6 +530,7 @@ impl SchedulerHooks {
             "⏺ [plan-executor] dispatching {count} sub-agent(s) (kind: {kind})"
         );
         self.publish_display_line(line);
+        self.announce_progress();
         dispatch_num
     }
 
