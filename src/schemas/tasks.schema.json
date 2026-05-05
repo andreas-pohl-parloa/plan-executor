@@ -84,6 +84,29 @@
             }
           }
         },
+        "typecheck_command": {
+          "description": "Explicit override for the post-fix-wave typecheck command. Runs after every fix wave dispatched inside `code_review` / `validation` so regressions surface immediately. Should be FAST — typecheck only, NOT the full test suite (`integration_test_command` runs that separately). When set, takes priority over `language`. Reuses the same shape as `integration_test_command`.",
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["program"],
+          "properties": {
+            "program": {
+              "description": "Executable to spawn. Resolved via PATH.",
+              "type": "string",
+              "minLength": 1
+            },
+            "args": {
+              "description": "Arguments passed after the program. May be empty.",
+              "type": "array",
+              "items": { "type": "string" },
+              "default": []
+            },
+            "workdir": {
+              "description": "Optional working directory. When omitted, the step uses ctx.workdir. Relative paths are resolved against ctx.workdir.",
+              "type": ["string", "null"]
+            }
+          }
+        },
         "flags": {
           "type": "object",
           "required": [

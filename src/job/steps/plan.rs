@@ -1506,9 +1506,239 @@ async fn dispatch_fix_wave(
     };
     let scheduler_outcome =
         scheduler::run_wave_execution(ctx, &scoped, &execution_root).await;
-    match scheduler_outcome {
-        AttemptOutcome::Success => FixWaveOutcome::Continue,
-        other => FixWaveOutcome::Outcome(other),
+    if !matches!(scheduler_outcome, AttemptOutcome::Success) {
+        return FixWaveOutcome::Outcome(scheduler_outcome);
+    }
+
+    // Step 4 — post-fix-wave typecheck. Surface regressions
+    // immediately so the next reviewer round does not eat 5-10 min
+    // re-discovering broken code the fix-agent just introduced.
+    // Best-effort: typecheck failures are logged and persisted as a
+    // structured regression notice; the loop continues and the next
+    // reviewer round picks up the regression via diff context. We
+    // never fail the fix wave on a typecheck error — the operator
+    // sees the warning in display.log + sub-agents/.
+    run_post_fix_typecheck(ctx, &execution_root, manifest_path, kind, iteration).await;
+
+    FixWaveOutcome::Continue
+}
+
+/// Resolves the typecheck command in priority order:
+///
+/// 1. `manifest.plan.typecheck_command` if present (explicit override)
+/// 2. `manifest.plan.language` if present (mapped to a fast default)
+/// 3. Marker-file detection in `workdir` (Cargo.toml / package.json / …)
+/// 4. `None` → skip
+fn resolve_typecheck_command(
+    manifest_path: &Path,
+    workdir: &Path,
+) -> Option<ResolvedTestCommand> {
+    let manifest = crate::scheduler::load_manifest(manifest_path).ok();
+
+    if let Some(spec) = manifest
+        .as_ref()
+        .and_then(|m| m.plan.typecheck_command.as_ref())
+    {
+        let cmd_workdir = spec.workdir.as_deref().map(|w| {
+            let p = Path::new(w);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                workdir.join(p)
+            }
+        });
+        return Some(ResolvedTestCommand {
+            program: spec.program.clone(),
+            args: spec.args.clone(),
+            workdir: cmd_workdir,
+            language: manifest
+                .as_ref()
+                .and_then(|m| m.plan.language.as_deref())
+                .map(language_label)
+                .unwrap_or("custom"),
+            source: TestCommandSource::ManifestCommand,
+        });
+    }
+
+    if let Some(lang) = manifest.as_ref().and_then(|m| m.plan.language.as_deref()) {
+        if let Some((program, args, label)) = typecheck_command_for_language(lang) {
+            return Some(ResolvedTestCommand {
+                program: program.to_string(),
+                args: args.iter().map(|s| s.to_string()).collect(),
+                workdir: None,
+                language: label,
+                source: TestCommandSource::ManifestLanguage,
+            });
+        }
+    }
+
+    // Detection fallback: same marker-file walk as the integration step,
+    // but mapped to the typecheck variant of each language default.
+    detect_integration_test_command(workdir).and_then(|d| {
+        typecheck_command_for_language(d.language).map(|(program, args, label)| {
+            ResolvedTestCommand {
+                program: program.to_string(),
+                args: args.iter().map(|s| s.to_string()).collect(),
+                workdir: None,
+                language: label,
+                source: TestCommandSource::DetectedMarker,
+            }
+        })
+    })
+}
+
+/// Runs the resolved typecheck command after a successful fix wave.
+/// Persists stdout+stderr to a per-iteration log under
+/// `<execution_root>/.plan-executor/fix-loop/typecheck-{kind}-iter{n}.log`
+/// and emits a `progress`-style display line summarizing the result.
+/// Failures are logged but do NOT fail the fix wave — the next
+/// reviewer round picks up regressions via the diff.
+async fn run_post_fix_typecheck(
+    ctx: &StepContext,
+    execution_root: &Path,
+    manifest_path: &Path,
+    kind: HelperLoopKind,
+    iteration: u32,
+) {
+    let Some(cmd) = resolve_typecheck_command(manifest_path, &ctx.workdir) else {
+        if let Some(hooks) = ctx.daemon_hooks.as_ref() {
+            hooks.announce_step_line(format!(
+                "⏺ [plan-executor] post-fix typecheck iter {iteration}: skipped \
+                 (no plan.typecheck_command / plan.language / marker file)"
+            ));
+        }
+        return;
+    };
+    let cmd_workdir = cmd
+        .workdir
+        .clone()
+        .unwrap_or_else(|| ctx.workdir.clone());
+    let log_dir = execution_root.join(".plan-executor").join("fix-loop");
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        tracing::warn!(error = %e, dir = %log_dir.display(), "post-fix typecheck: log dir create failed");
+        return;
+    }
+    let kind_label = match kind {
+        HelperLoopKind::CodeReview => "code_review",
+        HelperLoopKind::Validation => "validation",
+    };
+    let log_path = log_dir.join(format!(
+        "typecheck-{kind_label}-iter{iteration}.log"
+    ));
+
+    let started = Instant::now();
+    let output = match Command::new(&cmd.program)
+        .args(&cmd.args)
+        .current_dir(&cmd_workdir)
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(
+                program = %cmd.program,
+                error = %e,
+                "post-fix typecheck: spawn failed",
+            );
+            if let Some(hooks) = ctx.daemon_hooks.as_ref() {
+                hooks.announce_step_line(format!(
+                    "⏺ [plan-executor] post-fix typecheck iter {iteration}: \
+                     spawn failed ({}: {e})",
+                    cmd.program,
+                ));
+            }
+            return;
+        }
+    };
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    let mut combined = Vec::with_capacity(output.stdout.len() + output.stderr.len() + 256);
+    combined.extend_from_slice(b"# post-fix typecheck\n# kind: ");
+    combined.extend_from_slice(kind_label.as_bytes());
+    combined.extend_from_slice(b"\n# iteration: ");
+    combined.extend_from_slice(iteration.to_string().as_bytes());
+    combined.extend_from_slice(b"\n# command: ");
+    combined.extend_from_slice(cmd.program.as_bytes());
+    for arg in &cmd.args {
+        combined.push(b' ');
+        combined.extend_from_slice(arg.as_bytes());
+    }
+    combined.push(b'\n');
+    combined.extend_from_slice(b"# workdir: ");
+    combined.extend_from_slice(cmd_workdir.display().to_string().as_bytes());
+    combined.extend_from_slice(b"\n# exit: ");
+    combined.extend_from_slice(
+        output
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "?".to_string())
+            .as_bytes(),
+    );
+    combined.push(b'\n');
+    combined.extend_from_slice(b"\n## stdout\n");
+    combined.extend_from_slice(&output.stdout);
+    combined.extend_from_slice(b"\n## stderr\n");
+    combined.extend_from_slice(&output.stderr);
+    let _ = std::fs::write(&log_path, &combined);
+
+    if output.status.success() {
+        tracing::info!(
+            kind = ?kind,
+            iteration,
+            language = %cmd.language,
+            elapsed_ms,
+            log = %log_path.display(),
+            "post-fix typecheck passed",
+        );
+        if let Some(hooks) = ctx.daemon_hooks.as_ref() {
+            hooks.announce_step_line(format!(
+                "⏺ [plan-executor] post-fix typecheck iter {iteration}: ok \
+                 ({} {ms}ms)",
+                cmd.language,
+                ms = elapsed_ms,
+            ));
+        }
+    } else {
+        let exit_code = output.status.code();
+        let stderr_lossy = String::from_utf8_lossy(&output.stderr);
+        let last_meaningful = stderr_lossy
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| l.trim())
+            .unwrap_or("non-zero exit");
+        tracing::warn!(
+            kind = ?kind,
+            iteration,
+            language = %cmd.language,
+            ?exit_code,
+            elapsed_ms,
+            log = %log_path.display(),
+            "post-fix typecheck FAILED — fix-agent may have introduced a regression",
+        );
+        if let Some(hooks) = ctx.daemon_hooks.as_ref() {
+            hooks.announce_step_line(format!(
+                "⏺ [plan-executor] post-fix typecheck iter {iteration}: \
+                 FAILED — fix-agent may have introduced a regression. exit={:?} {detail}; log={log}",
+                exit_code,
+                detail = truncate_for_display(last_meaningful, 200),
+                log = log_path.display(),
+            ));
+        }
+    }
+}
+
+/// Truncates `s` to at most `max` chars, appending `…` when cut. Used
+/// for one-line failure summaries embedded in display.log so the line
+/// doesn't blow up the operator's terminal width.
+fn truncate_for_display(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
     }
 }
 
@@ -2450,6 +2680,29 @@ fn command_for_language(lang: &str) -> Option<(&'static str, &'static [&'static 
         }
         "python" => Some(("python", &["-m", "pytest", "-q"], "python")),
         "go" => Some(("go", &["test", "./..."], "go")),
+        _ => None,
+    }
+}
+
+/// Maps a `plan.language` value to a default *typecheck* command —
+/// faster than the full integration-test command. Goal: surface
+/// regressions introduced by a fix wave in seconds, not minutes.
+///
+///     rust   → `cargo check --workspace --quiet`
+///     node   → `npx --yes tsc --noEmit` (skips test runner)
+///     python → `python -m py_compile <pyproject roots>` (cheap parse)
+///     go     → `go build ./...`
+///
+/// Returns `None` for unknown languages so the post-fix verifier can
+/// gracefully skip rather than fail the wave.
+fn typecheck_command_for_language(lang: &str) -> Option<(&'static str, &'static [&'static str], &'static str)> {
+    match lang.to_ascii_lowercase().as_str() {
+        "rust" => Some(("cargo", &["check", "--workspace", "--quiet"], "rust")),
+        "node" | "nodejs" | "typescript" | "javascript" => {
+            Some(("npx", &["--yes", "tsc", "--noEmit"], "node"))
+        }
+        "python" => Some(("python", &["-m", "compileall", "-q", "."], "python")),
+        "go" => Some(("go", &["build", "./..."], "go")),
         _ => None,
     }
 }
