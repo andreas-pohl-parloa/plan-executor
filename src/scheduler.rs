@@ -129,6 +129,17 @@ pub struct PlanBlock {
     /// without the field deserialize as `None`.
     #[serde(default)]
     pub integration_test_command: Option<IntegrationTestCommandSpec>,
+    /// Explicit override for the post-fix-wave typecheck command. Run
+    /// after every fix wave dispatched inside `code_review` /
+    /// `validation` so regressions surface immediately, before the next
+    /// reviewer round eats another 5-10 min on findings the fix-agent
+    /// just introduced. Should be FAST — typecheck only, NOT the full
+    /// test suite (`integration_test_command` runs that separately).
+    /// When set, takes priority over `language`. Reuses the same shape
+    /// as `integration_test_command`. Older manifests without the
+    /// field deserialize as `None`.
+    #[serde(default)]
+    pub typecheck_command: Option<IntegrationTestCommandSpec>,
 }
 
 /// Manifest-level override for the orchestrator-level integration-test
@@ -805,6 +816,7 @@ mod tests {
                 title: None,
                 language: None,
                 integration_test_command: None,
+                typecheck_command: None,
             },
             waves,
             tasks: tasks
