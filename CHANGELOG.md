@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.65.0] - 2026-05-05
+
+### Features
+
+- **fix-loop:** Post-fix-wave typecheck so regressions surface fast ([b007e15](https://github.com/andreas-pohl-parloa/plan-executor/commit/b007e15aa38e9b0acfb51aa810602e3e13622525))
 ## [0.64.0] - 2026-05-05
 
 ### Features
