@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.63.0] - 2026-05-05
+
+### Features
+
+- **progress:** Add `, iter N` to label for code_review / validation ([80dcd82](https://github.com/andreas-pohl-parloa/plan-executor/commit/80dcd82a5e1f4b68a9edb30ac0c2de0ef60ae7ea))
 ## [0.62.0] - 2026-05-05
 
 ### Features
