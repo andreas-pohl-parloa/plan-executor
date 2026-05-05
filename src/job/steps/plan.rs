@@ -45,14 +45,16 @@ use crate::scheduler::{self, Manifest, SchedulerError};
 /// surfaces a `SemanticMistake` outcome so the registry-level retry/abort
 /// machinery can take over.
 ///
-/// Sized for converging-tail behavior: an early-round finding count of
-/// 4–8 typically drops to 1–2 by round 3 and cleans up within rounds 4–5
-/// (e.g. trailing `cargo fmt` / clippy nits the fix-agents take an extra
-/// pass to absorb). Bumping the cap from 3 to 5 trades a few extra
-/// reviewer minutes against the high cost of a `SemanticMistake` abort
-/// when a single trivial finding remains. The wall-clock guard
-/// (`MAX_FIX_LOOP_BUDGET`) still bounds total time.
-const MAX_FIX_LOOP_ITERATIONS: u32 = 5;
+/// Capped at 3: rounds 4-5 in observed runs are almost always loops on
+/// stylistic disagreement that the LLM cannot converge (250k-char Codex
+/// dumps, repeated re-flagging of the same line). Earlier converged-tail
+/// runs settle in 1-2 rounds; round 3 is the realistic ceiling for
+/// genuine multi-round fixes. Anything still flagged after round 3 is
+/// surfaced as a `Known Gaps` section in the PR description rather than
+/// burning another full reviewer wave. The same-findings early-exit
+/// (see [`run_helper_fix_loop`]) catches the no-progress case earlier
+/// when the LLM keeps re-raising the identical finding-set.
+const MAX_FIX_LOOP_ITERATIONS: u32 = 3;
 
 /// Wall-clock budget for a single `run_helper_fix_loop` invocation.
 ///
@@ -943,6 +945,13 @@ async fn run_helper_fix_loop(
 ) -> AttemptOutcome {
     let mut iteration: u32 = 0;
     let loop_started = Instant::now();
+    // Hash of the previous iteration's FIX_REQUIRED-bucketed findings, used
+    // for the same-findings early-exit. When iteration N+1 returns the
+    // identical finding set as iteration N, the fix wave didn't fix
+    // anything and another full reviewer pass would burn ~5-10 minutes
+    // for no progress. Exit early with a `SemanticMistake` carrying the
+    // round number so the operator sees the loop didn't converge.
+    let mut prior_findings_hash: Option<String> = None;
     loop {
         iteration += 1;
         // Enforce wall-clock budget on top of the iteration cap.
@@ -986,6 +995,39 @@ async fn run_helper_fix_loop(
                         return AttemptOutcome::SemanticMistake {
                             fix_loop_round: iteration,
                         };
+                    }
+                    // Same-findings early-exit. Hash the FIX_REQUIRED
+                    // payload from the helper's findings_path (when it
+                    // exists — validation gaps go through a different
+                    // channel and do not get hashed here). On a match
+                    // with the prior iteration's hash the fix wave
+                    // didn't change anything, so dispatching another
+                    // full reviewer wave is pure cost. Exit with a
+                    // `SemanticMistake` round-marker that survives to
+                    // the PR description's `Known Gaps` section.
+                    if let Some(hash) =
+                        hash_fix_required_findings(ctx, &state_updates)
+                    {
+                        if prior_findings_hash.as_deref() == Some(hash.as_str()) {
+                            tracing::warn!(
+                                kind = ?kind,
+                                iteration,
+                                hash = %hash,
+                                "fix-loop saw identical FIX_REQUIRED findings two rounds in a row; \
+                                 surfacing semantic mistake (no progress)",
+                            );
+                            if let Some(hooks) = ctx.daemon_hooks.as_ref() {
+                                hooks.announce_step_line(format!(
+                                    "⏺ [plan-executor] code_review: same findings as round \
+                                     {prev}; exiting early without round {iteration}",
+                                    prev = iteration - 1,
+                                ));
+                            }
+                            return AttemptOutcome::SemanticMistake {
+                                fix_loop_round: iteration,
+                            };
+                        }
+                        prior_findings_hash = Some(hash);
                     }
                     // Build and dispatch the fix wave; on any sub-failure we
                     // surface that as the attempt outcome and let the
@@ -1648,6 +1690,91 @@ fn detect_default_remote_branch(workdir: &Path) -> Option<String> {
     } else {
         Some(s)
     }
+}
+
+/// Reads the helper's `state_updates.findings_path`, filters to entries
+/// that would dispatch a fix wave (helper-bucketed FIX_REQUIRED), and
+/// returns a stable hash of the canonicalized payload.
+///
+/// Used by the fix-loop's same-findings early-exit. Two consecutive
+/// iterations producing the same hash means the fix wave didn't change
+/// the FIX_REQUIRED set — another full reviewer wave would be pure cost.
+///
+/// Returns `None` when the file is missing, unreadable, or not in the
+/// expected shape — the caller treats that as "couldn't determine
+/// progress" and proceeds with the loop unchanged.
+fn hash_fix_required_findings(
+    ctx: &StepContext,
+    state_updates: &serde_json::Value,
+) -> Option<String> {
+    let findings_path_str = state_updates
+        .get("findings_path")
+        .and_then(|v| v.as_str())?;
+    let findings_path = PathBuf::from(findings_path_str);
+    let canonical = ensure_path_under_workdir(&findings_path, &ctx.workdir, "findings_path")
+        .ok()?;
+    let raw = std::fs::read(&canonical).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+
+    // Findings live under one of two shapes the loop already handles:
+    //   * triage-output: `{ "findings": [...] }` (run-reviewer-team-non-interactive)
+    //   * compile-fix-waves input: `{ "findings": [...] }` (after projection)
+    // In both cases each entry is a JSON object; filter by helper-set
+    // bucket fields. A row counts as fix-required when ANY of these
+    // helper-vocabulary fields signals it: `disposition == "FIX_REQUIRED"`,
+    // `severity` set + `bucket == "FIX_REQUIRED"`, or no bucket marker
+    // (treat untagged as fix-required since compile-fix-waves treats
+    // them that way).
+    let entries = value
+        .get("findings")
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut fix_required: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter(|row| {
+            let disposition = row
+                .get("disposition")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_ascii_uppercase());
+            let bucket = row
+                .get("bucket")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_ascii_uppercase());
+            match (disposition.as_deref(), bucket.as_deref()) {
+                (Some("FIX_REQUIRED"), _) | (_, Some("FIX_REQUIRED")) => true,
+                (Some(_), _) | (_, Some(_)) => false,
+                (None, None) => true,
+            }
+        })
+        .collect();
+
+    // Canonicalize order so reorderings between iterations don't trip
+    // the comparison. Sort by (file, line, description) lexicographically.
+    fix_required.sort_by_cached_key(|row| {
+        let file = row
+            .get("file")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let line = row.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
+        let desc = row
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        (file, line, desc)
+    });
+
+    // Serialize the sorted slice through serde_json so field ordering
+    // inside each entry is also normalized (`Value` preserves insertion
+    // order; serde_json's serializer of `Map` is alphabetic when the
+    // `preserve_order` feature is OFF — which this crate uses).
+    let canonical_bytes = serde_json::to_vec(&fix_required).ok()?;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical_bytes.hash(&mut hasher);
+    Some(format!("{:016x}", hasher.finish()))
 }
 
 /// Heuristic language detector for helper inputs. Looks for canonical project
