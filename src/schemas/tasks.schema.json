@@ -56,6 +56,34 @@
           "enum": ["local", "remote"],
           "default": "local"
         },
+        "language": {
+          "description": "Project language. Drives the default `integration_testing` test command: rust→`cargo test --workspace`, node→`npm test --silent`, python→`python -m pytest -q`, go→`go test ./...`. Plans that don't need orchestrator-level integration tests should omit `integration_testing` from `pipeline.steps` instead. Optional for back-compat: when absent, the step falls back to detecting the language from marker files (Cargo.toml, package.json, etc.) in the working directory.",
+          "type": ["string", "null"],
+          "enum": ["rust", "node", "nodejs", "typescript", "javascript", "python", "go", null]
+        },
+        "integration_test_command": {
+          "description": "Explicit override for the orchestrator-level integration-test command. When set, takes priority over `language`. Use for monorepos where the test entry point is in a sub-package, custom test runners (pnpm, bazel, etc.), or any project that can't be expressed by the language defaults.",
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["program"],
+          "properties": {
+            "program": {
+              "description": "Executable to spawn. Resolved via PATH.",
+              "type": "string",
+              "minLength": 1
+            },
+            "args": {
+              "description": "Arguments passed after the program. May be empty.",
+              "type": "array",
+              "items": { "type": "string" },
+              "default": []
+            },
+            "workdir": {
+              "description": "Optional working directory. When omitted, the step uses ctx.workdir. Relative paths are resolved against ctx.workdir.",
+              "type": ["string", "null"]
+            }
+          }
+        },
         "flags": {
           "type": "object",
           "required": [

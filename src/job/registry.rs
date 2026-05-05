@@ -148,7 +148,9 @@ fn build_plan_step(name: &str, manifest_path: &std::path::Path) -> Box<dyn Step>
         "wave_execution" => Box::new(steps::plan::WaveExecutionStep {
             manifest_path: manifest_path.to_path_buf(),
         }),
-        "integration_testing" => Box::new(steps::plan::IntegrationTestingStep),
+        "integration_testing" => Box::new(steps::plan::IntegrationTestingStep {
+            manifest_path: manifest_path.to_path_buf(),
+        }),
         "code_review" => Box::new(steps::plan::CodeReviewStep {
             manifest_path: manifest_path.to_path_buf(),
         }),

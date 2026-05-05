@@ -105,6 +105,49 @@ pub struct PlanBlock {
     /// which case `pr_title` falls back to truncating `goal`.
     #[serde(default)]
     pub title: Option<String>,
+    /// Project language. Drives the default `integration_testing` test
+    /// command when `integration_test_command` is not set:
+    ///
+    /// - `rust` → `cargo test --workspace`
+    /// - `node` → `npm test --silent`
+    /// - `python` → `python -m pytest -q`
+    /// - `go` → `go test ./...`
+    ///
+    /// Plans that don't need orchestrator-level integration tests should
+    /// omit `integration_testing` from `pipeline.steps` instead of
+    /// setting language to a sentinel. Older manifests without the field
+    /// deserialize as `None`, in which case `IntegrationTestingStep`
+    /// falls back to detecting the language from `Cargo.toml`,
+    /// `package.json`, etc. in the working directory.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Explicit override for the orchestrator-level integration-test
+    /// command. When set, takes priority over `language`. Use for
+    /// monorepos where the test entry point is in a sub-package, custom
+    /// test runners (e.g. `pnpm`, `bazel test //…`), or any project that
+    /// can't be expressed by the language defaults. Older manifests
+    /// without the field deserialize as `None`.
+    #[serde(default)]
+    pub integration_test_command: Option<IntegrationTestCommandSpec>,
+}
+
+/// Manifest-level override for the orchestrator-level integration-test
+/// command. Mirrors the `plan.integration_test_command` shape in
+/// `tasks.schema.json`. When set, `IntegrationTestingStep` runs
+/// `program` with `args` from `workdir` (resolved against the step's
+/// workdir when relative).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[non_exhaustive]
+pub struct IntegrationTestCommandSpec {
+    /// Executable to spawn. Resolved via `PATH`. Required.
+    pub program: String,
+    /// Arguments to pass after the program. May be empty.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Optional working directory. When `None`, the step uses
+    /// `ctx.workdir`. Relative paths are joined onto `ctx.workdir`.
+    #[serde(default)]
+    pub workdir: Option<String>,
 }
 
 fn default_execution_mode() -> String {
@@ -760,6 +803,8 @@ mod tests {
                 pipeline: None,
                 target_branch: None,
                 title: None,
+                language: None,
+                integration_test_command: None,
             },
             waves,
             tasks: tasks
