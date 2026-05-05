@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.64.0] - 2026-05-05
+
+### Features
+
+- **fix-loop:** Exit Success after final fix wave; skip verification review ([347813d](https://github.com/andreas-pohl-parloa/plan-executor/commit/347813daad3273130e423633de730cd64e10d358))
 ## [0.63.0] - 2026-05-05
 
 ### Features
