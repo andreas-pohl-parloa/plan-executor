@@ -563,27 +563,33 @@ impl Step for WaveExecutionStep {
 
 /// Real integration-testing step (D3.3).
 ///
-/// Runs `cargo test --workspace` inside `ctx.workdir`, streaming combined
-/// stdout / stderr to
+/// Resolves the test command in priority order:
+///
+/// 1. `manifest.plan.integration_test_command` if set — explicit override
+///    for monorepos and custom runners.
+/// 2. `manifest.plan.language` if set — mapped to a language default
+///    (`rust`→`cargo test --workspace`, `node`→`npm test --silent`,
+///    `python`→`python -m pytest -q`, `go`→`go test ./...`).
+/// 3. Marker-file detection in `ctx.workdir` (Cargo.toml, package.json
+///    with a `test` script, pyproject.toml, go.mod) — fallback for
+///    older manifests.
+/// 4. Skip with `Success` when nothing matches; wave-level sub-agents
+///    have already run language-appropriate tests per task.
+///
+/// Combined stdout / stderr stream to
 /// `<job_dir>/steps/<NNN-integration_testing>/attempts/<n>/integration-tests.log`.
 /// On a non-zero exit the stderr tail is inspected for transient signals
 /// (network blips, sccache timeouts, file-system races); transient hits
 /// surface [`AttemptOutcome::TransientInfra`] so the registry-level
-/// `RetryTransient { max: 1 }` can re-try once. Anything else is treated as
-/// a semantic mistake on the implementation side and surfaced as
-/// [`AttemptOutcome::SemanticMistake`] so the prior code-review / validation
-/// steps see it on the next pass through the fix-loop.
-///
-/// The struct is field-less today; integration-test command override (e.g.
-/// `--skip-integration-tests` or a project-specific runner) will be wired in
-/// by a future task once a flag for it lives in the manifest schema.
-#[derive(Debug, Clone, Default)]
-pub struct IntegrationTestingStep;
-
-/// Default integration-test command. Mirrors the existing skill's behavior
-/// so the Rust side does not silently change semantics.
-const INTEGRATION_TEST_PROGRAM: &str = "cargo";
-const INTEGRATION_TEST_ARGS: &[&str] = &["test", "--workspace"];
+/// `RetryTransient { max: 1 }` can re-try once. Anything else is a
+/// [`AttemptOutcome::SemanticMistake`] so the prior code-review /
+/// validation steps see it on the next fix-loop pass.
+#[derive(Debug, Clone)]
+pub struct IntegrationTestingStep {
+    /// Path to `tasks.json` so the step can read
+    /// `plan.language` / `plan.integration_test_command` overrides.
+    pub manifest_path: PathBuf,
+}
 
 #[async_trait]
 impl Step for IntegrationTestingStep {
@@ -603,7 +609,7 @@ impl Step for IntegrationTestingStep {
     }
 
     async fn run(&self, ctx: &mut StepContext) -> AttemptOutcome {
-        run_integration_tests(ctx)
+        run_integration_tests(ctx, &self.manifest_path)
     }
 }
 
@@ -2047,7 +2053,7 @@ fn attempt_dir(ctx: &StepContext, step_name: &str) -> PathBuf {
 /// test bug;
 /// [`AttemptOutcome::HardInfra`] when the attempt-dir cannot be prepared or
 /// the test binary cannot be spawned.
-fn run_integration_tests(ctx: &StepContext) -> AttemptOutcome {
+fn run_integration_tests(ctx: &StepContext, manifest_path: &Path) -> AttemptOutcome {
     let dir = attempt_dir(ctx, "integration_testing");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return AttemptOutcome::HardInfra {
@@ -2056,10 +2062,52 @@ fn run_integration_tests(ctx: &StepContext) -> AttemptOutcome {
     }
     let log_path = dir.join("integration-tests.log");
 
+    let resolved = resolve_integration_test_command(manifest_path, &ctx.workdir);
+    let cmd = match resolved {
+        Some(c) => c,
+        None => {
+            // No manifest hint and no marker file. Wave sub-agents already
+            // ran language-appropriate tests per task — the orchestrator
+            // step has nothing to do, so Success rather than fail closed.
+            let note = format!(
+                "# integration-tests\n# skipped: no `plan.language` / \
+                 `plan.integration_test_command` in manifest and no marker \
+                 file (Cargo.toml, package.json with `test`, pyproject.toml, \
+                 go.mod) in {}\n",
+                ctx.workdir.display()
+            );
+            if let Err(e) = std::fs::write(&log_path, note.as_bytes()) {
+                return AttemptOutcome::HardInfra {
+                    error: format!(
+                        "write integration-tests.log to {}: {e}",
+                        log_path.display()
+                    ),
+                };
+            }
+            tracing::info!(
+                log = %log_path.display(),
+                workdir = %ctx.workdir.display(),
+                "integration tests skipped: no manifest hint or marker file",
+            );
+            if let Some(hooks) = ctx.daemon_hooks.as_ref() {
+                hooks.announce_step_line(
+                    "⏺ [plan-executor] integration_testing: skipped \
+                     (no plan.language / plan.integration_test_command, no marker file)"
+                        .to_string(),
+                );
+            }
+            return AttemptOutcome::Success;
+        }
+    };
+
+    let cmd_workdir = cmd
+        .workdir
+        .clone()
+        .unwrap_or_else(|| ctx.workdir.clone());
     let started = Instant::now();
-    let output = match Command::new(INTEGRATION_TEST_PROGRAM)
-        .args(INTEGRATION_TEST_ARGS)
-        .current_dir(&ctx.workdir)
+    let output = match Command::new(&cmd.program)
+        .args(&cmd.args)
+        .current_dir(&cmd_workdir)
         .stdin(Stdio::null())
         .output()
     {
@@ -2068,9 +2116,9 @@ fn run_integration_tests(ctx: &StepContext) -> AttemptOutcome {
             return AttemptOutcome::HardInfra {
                 error: format!(
                     "spawn `{} {}` in {}: {e}",
-                    INTEGRATION_TEST_PROGRAM,
-                    INTEGRATION_TEST_ARGS.join(" "),
-                    ctx.workdir.display()
+                    cmd.program,
+                    cmd.args.join(" "),
+                    cmd_workdir.display()
                 ),
             };
         }
@@ -2078,15 +2126,19 @@ fn run_integration_tests(ctx: &StepContext) -> AttemptOutcome {
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     let mut combined = Vec::with_capacity(output.stdout.len() + output.stderr.len() + 256);
-    combined.extend_from_slice(b"# integration-tests\n# command: ");
-    combined.extend_from_slice(INTEGRATION_TEST_PROGRAM.as_bytes());
-    for arg in INTEGRATION_TEST_ARGS {
+    combined.extend_from_slice(b"# integration-tests\n# source: ");
+    combined.extend_from_slice(cmd.source.label().as_bytes());
+    combined.extend_from_slice(b"\n# language: ");
+    combined.extend_from_slice(cmd.language.as_bytes());
+    combined.extend_from_slice(b"\n# command: ");
+    combined.extend_from_slice(cmd.program.as_bytes());
+    for arg in &cmd.args {
         combined.push(b' ');
         combined.extend_from_slice(arg.as_bytes());
     }
     combined.push(b'\n');
     combined.extend_from_slice(b"# workdir: ");
-    combined.extend_from_slice(ctx.workdir.display().to_string().as_bytes());
+    combined.extend_from_slice(cmd_workdir.display().to_string().as_bytes());
     combined.push(b'\n');
     combined.extend_from_slice(b"\n## stdout\n");
     combined.extend_from_slice(&output.stdout);
@@ -2100,6 +2152,8 @@ fn run_integration_tests(ctx: &StepContext) -> AttemptOutcome {
 
     if output.status.success() {
         tracing::info!(
+            source = %cmd.source.label(),
+            language = %cmd.language,
             elapsed_ms,
             log = %log_path.display(),
             "integration tests passed",
@@ -2109,6 +2163,8 @@ fn run_integration_tests(ctx: &StepContext) -> AttemptOutcome {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let exit_code = output.status.code();
     tracing::warn!(
+        source = %cmd.source.label(),
+        language = %cmd.language,
         ?exit_code,
         elapsed_ms,
         log = %log_path.display(),
@@ -2124,6 +2180,202 @@ fn run_integration_tests(ctx: &StepContext) -> AttemptOutcome {
     } else {
         AttemptOutcome::SemanticMistake { fix_loop_round: 0 }
     }
+}
+
+/// How a resolved integration-test command was selected. Logged in the
+/// step's `integration-tests.log` so the operator can tell at a glance
+/// whether the command came from the manifest or from fallback detection.
+#[derive(Debug, Clone, Copy)]
+enum TestCommandSource {
+    /// Manifest carried `plan.integration_test_command` directly.
+    ManifestCommand,
+    /// Manifest carried `plan.language`; mapped to the language default.
+    ManifestLanguage,
+    /// Manifest had neither field; resolved from a marker file in the workdir.
+    DetectedMarker,
+}
+
+impl TestCommandSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ManifestCommand => "manifest.plan.integration_test_command",
+            Self::ManifestLanguage => "manifest.plan.language",
+            Self::DetectedMarker => "detected (workdir marker file)",
+        }
+    }
+}
+
+/// Resolved integration-test command, ready to spawn.
+struct ResolvedTestCommand {
+    program: String,
+    args: Vec<String>,
+    /// Optional working directory — `None` means "use ctx.workdir".
+    /// Manifest-supplied relative paths are resolved against `ctx.workdir`.
+    workdir: Option<PathBuf>,
+    /// Short label for logs / metrics: `rust`, `node`, `python`, `go`,
+    /// or `custom` for a manifest-supplied command without a known language.
+    language: &'static str,
+    source: TestCommandSource,
+}
+
+/// Resolves the integration-test command in priority order:
+///
+/// 1. `manifest.plan.integration_test_command` if present
+/// 2. `manifest.plan.language` if present (mapped to a default per language)
+/// 3. Marker-file detection in `ctx.workdir`
+/// 4. `None` (caller skips with `Success`)
+fn resolve_integration_test_command(
+    manifest_path: &Path,
+    workdir: &Path,
+) -> Option<ResolvedTestCommand> {
+    let manifest = crate::scheduler::load_manifest(manifest_path).ok();
+
+    if let Some(spec) = manifest
+        .as_ref()
+        .and_then(|m| m.plan.integration_test_command.as_ref())
+    {
+        let cmd_workdir = spec.workdir.as_deref().map(|w| {
+            let p = Path::new(w);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                workdir.join(p)
+            }
+        });
+        return Some(ResolvedTestCommand {
+            program: spec.program.clone(),
+            args: spec.args.clone(),
+            workdir: cmd_workdir,
+            language: manifest
+                .as_ref()
+                .and_then(|m| m.plan.language.as_deref())
+                .map(language_label)
+                .unwrap_or("custom"),
+            source: TestCommandSource::ManifestCommand,
+        });
+    }
+
+    if let Some(lang) = manifest.as_ref().and_then(|m| m.plan.language.as_deref()) {
+        if let Some((program, args, label)) = command_for_language(lang) {
+            return Some(ResolvedTestCommand {
+                program: program.to_string(),
+                args: args.iter().map(|s| s.to_string()).collect(),
+                workdir: None,
+                language: label,
+                source: TestCommandSource::ManifestLanguage,
+            });
+        }
+    }
+
+    detect_integration_test_command(workdir).map(|d| ResolvedTestCommand {
+        program: d.program,
+        args: d.args,
+        workdir: None,
+        language: d.language,
+        source: TestCommandSource::DetectedMarker,
+    })
+}
+
+/// Maps a `plan.language` value to a default test command. Returns `None`
+/// for unknown languages so the schema can stay lenient (forward-compat
+/// with future languages) while the step skips cleanly until support
+/// lands.
+fn command_for_language(lang: &str) -> Option<(&'static str, &'static [&'static str], &'static str)> {
+    match lang.to_ascii_lowercase().as_str() {
+        "rust" => Some(("cargo", &["test", "--workspace"], "rust")),
+        "node" | "nodejs" | "typescript" | "javascript" => {
+            Some(("npm", &["test", "--silent"], "node"))
+        }
+        "python" => Some(("python", &["-m", "pytest", "-q"], "python")),
+        "go" => Some(("go", &["test", "./..."], "go")),
+        _ => None,
+    }
+}
+
+/// Stable label for a language string. Mirrors the keys
+/// [`command_for_language`] accepts, normalized to a single representative
+/// per family.
+fn language_label(lang: &str) -> &'static str {
+    match lang.to_ascii_lowercase().as_str() {
+        "rust" => "rust",
+        "node" | "nodejs" | "typescript" | "javascript" => "node",
+        "python" => "python",
+        "go" => "go",
+        _ => "custom",
+    }
+}
+
+/// Detected integration-test command from a workdir marker file. Older
+/// manifests without `plan.language` fall through to this path so the
+/// step keeps working without a manifest update.
+struct DetectedTestCommand {
+    program: String,
+    args: Vec<String>,
+    /// Short label for logs / metrics: `rust`, `node`, `python`, `go`.
+    language: &'static str,
+}
+
+/// Detects the project language and returns the matching test command.
+/// Looks for canonical marker files in `workdir` only — not walking up —
+/// because preflight already redirected `ctx.workdir` to the project
+/// root.
+fn detect_integration_test_command(workdir: &Path) -> Option<DetectedTestCommand> {
+    if workdir.join("Cargo.toml").is_file() {
+        return Some(DetectedTestCommand {
+            program: "cargo".to_string(),
+            args: vec!["test".to_string(), "--workspace".to_string()],
+            language: "rust",
+        });
+    }
+    let pkg_json = workdir.join("package.json");
+    if pkg_json.is_file() && package_json_has_test_script(&pkg_json) {
+        return Some(DetectedTestCommand {
+            program: "npm".to_string(),
+            args: vec!["test".to_string(), "--silent".to_string()],
+            language: "node",
+        });
+    }
+    if workdir.join("pyproject.toml").is_file() || workdir.join("setup.py").is_file() {
+        return Some(DetectedTestCommand {
+            program: "python".to_string(),
+            args: vec![
+                "-m".to_string(),
+                "pytest".to_string(),
+                "-q".to_string(),
+            ],
+            language: "python",
+        });
+    }
+    if workdir.join("go.mod").is_file() {
+        return Some(DetectedTestCommand {
+            program: "go".to_string(),
+            args: vec!["test".to_string(), "./...".to_string()],
+            language: "go",
+        });
+    }
+    None
+}
+
+/// Reads `package.json` and returns `true` when `scripts.test` is set to
+/// something that's not the npm-init placeholder. Used by
+/// [`detect_integration_test_command`] to avoid surfacing
+/// `Error: no test specified` (npm's default) as a semantic mistake.
+fn package_json_has_test_script(path: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let Some(test) = value
+        .get("scripts")
+        .and_then(|s| s.get("test"))
+        .and_then(|t| t.as_str())
+    else {
+        return false;
+    };
+    let trimmed = test.trim();
+    !trimmed.is_empty() && !trimmed.starts_with("echo \"Error: no test specified\"")
 }
 
 /// Detects transient test-runner errors that warrant `RetryTransient` rather
