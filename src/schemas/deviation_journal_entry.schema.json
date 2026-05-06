@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parloa.dev/plan-executor/deviation_journal_entry.schema.json",
+  "title": "Deviation journal entry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "job_id",
+    "phase",
+    "category",
+    "severity",
+    "claim",
+    "plan_anchor",
+    "evidence",
+    "impact",
+    "created_at"
+  ],
+  "properties": {
+    "version": { "type": "integer", "const": 1 },
+    "job_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "phase": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "wave_id": { "type": ["integer", "null"], "minimum": 1 },
+    "task_id": { "type": ["string", "null"], "minLength": 1, "maxLength": 128 },
+    "agent_index": { "type": ["integer", "null"], "minimum": 1, "maximum": 64 },
+    "category": {
+      "type": "string",
+      "enum": ["skip", "substitute", "scope_change", "discovery", "blocker"]
+    },
+    "severity": { "type": "string", "enum": ["info", "warning", "critical"] },
+    "claim": { "type": "string", "minLength": 1, "maxLength": 2048 },
+    "plan_anchor": { "type": "string", "minLength": 1, "maxLength": 1024 },
+    "evidence": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "summary"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": ["file_line", "command_log", "test_result", "commit"]
+          },
+          "path": { "type": ["string", "null"], "minLength": 1, "maxLength": 1024 },
+          "lines": { "type": ["string", "null"], "minLength": 1, "maxLength": 64 },
+          "command": { "type": ["string", "null"], "minLength": 1, "maxLength": 2048 },
+          "commit": { "type": ["string", "null"], "pattern": "^[0-9a-fA-F]{7,40}$" },
+          "summary": { "type": "string", "minLength": 1, "maxLength": 2048 }
+        }
+      }
+    },
+    "impact": { "type": "string", "minLength": 1, "maxLength": 2048 },
+    "recommended_followup": { "type": ["string", "null"], "maxLength": 2048 },
+    "created_at": { "type": "string", "format": "date-time" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "category": { "enum": ["skip", "substitute", "scope_change"] } } },
+      "then": { "properties": { "evidence": { "minItems": 1 } } }
+    }
+  ]
+}

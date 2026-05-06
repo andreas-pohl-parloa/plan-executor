@@ -13,6 +13,17 @@ pub enum AgentType {
     Bash,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviationContext {
+    pub journal_path: PathBuf,
+    pub job_id: String,
+    pub phase: String,
+    pub wave_id: Option<u32>,
+    pub task_id: Option<String>,
+    pub agent_index: usize,
+    pub prior_digest: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Handoff {
     pub index: usize,
@@ -22,6 +33,7 @@ pub struct Handoff {
     /// A can-fail agent that exits non-zero does NOT fail the job; its slot
     /// receives an error-annotated block so the batch stays structurally complete.
     pub can_fail: bool,
+    pub deviation_context: Option<DeviationContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +174,65 @@ fn sub_agent_prompt_arg(agent_type: &AgentType, path: &str) -> String {
 /// plugin SKILL.md copies so we don't duplicate a block the orchestrator
 /// correctly emitted.
 const HYGIENE_MARKER: &str = "Subprocess hygiene (MANDATORY";
+
+/// Marker that identifies the deviation-journal block prepended to
+/// non-bash sub-agent prompts. Must match the opening of the block
+/// emitted by `deviation_block` so `ensure_deviation_block_in_prompt`
+/// is idempotent.
+const DEVIATION_MARKER: &str = "Deviation journal (plan-executor enforced";
+
+fn deviation_block(ctx: &DeviationContext) -> String {
+    let wave_id = ctx.wave_id.map(|x| x.to_string()).unwrap_or_else(|| "null".into());
+    let task_id = ctx.task_id.as_deref().unwrap_or("null");
+    let mut block = format!(
+        "> **Deviation journal (plan-executor enforced — do not remove):**\n\
+         >\n\
+         > If you discover a mismatch between this task and the codebase, or you intentionally skip/substitute/scope-change part of the task, write a validated journal entry.\n\
+         >\n\
+         > Constants for this task:\n\
+         > - journal_path: `{}`\n\
+         > - job_id: `{}`\n\
+         > - phase: `{}`\n\
+         > - wave_id: `{}`\n\
+         > - task_id: `{}`\n\
+         > - agent_index: `{}`\n\
+         >\n\
+         > Protocol:\n\
+         > 1. Create one JSON object matching `plan-executor validate --schema=deviation-journal-entry`.\n\
+         > 2. Validate it with `plan-executor validate --schema=deviation-journal-entry -`.\n\
+         > 3. Append it as one line to `journal_path` only after validation passes.\n\
+         > 4. Do not ask the user. Do not use the journal to justify incomplete work. If a required task cannot be completed, fail explicitly.\n",
+        ctx.journal_path.display(),
+        ctx.job_id,
+        ctx.phase,
+        wave_id,
+        task_id,
+        ctx.agent_index,
+    );
+    if let Some(digest) = &ctx.prior_digest {
+        if !digest.trim().is_empty() {
+            block.push_str(">\n> Prior deviation digest for context:\n");
+            for line in digest.lines() {
+                block.push_str("> ");
+                block.push_str(line);
+                block.push('\n');
+            }
+        }
+    }
+    block.push_str("\n---\n\n");
+    block
+}
+
+fn ensure_deviation_block_in_prompt(path: &Path, ctx: &DeviationContext) {
+    let Ok(original) = std::fs::read_to_string(path) else { return; };
+    if original.contains(DEVIATION_MARKER) {
+        return;
+    }
+    let block = deviation_block(ctx);
+    if let Err(err) = std::fs::write(path, format!("{block}{original}")) {
+        tracing::warn!(path = %path.display(), error = %err, "failed to prepend deviation journal block");
+    }
+}
 
 /// Subprocess-hygiene block prepended to every non-bash sub-agent
 /// prompt at dispatch time. Wrapped in a Markdown blockquote and
@@ -340,6 +411,9 @@ async fn dispatch_agent(
     // forgot to emit it. Bash handoffs are shell scripts — injecting
     // markdown into them would break execution, so we skip bash here.
     if !is_bash {
+        if let Some(ctx) = &handoff.deviation_context {
+            ensure_deviation_block_in_prompt(&handoff.prompt_file, ctx);
+        }
         ensure_hygiene_in_prompt(&handoff.prompt_file);
     }
 

@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parloa.dev/plan-executor/deviation_journal.schema.json",
+  "title": "Deviation journal file representation",
+  "description": "Array representation used by the CLI after reading deviations.jsonl line-by-line.",
+  "type": "array",
+  "maxItems": 512,
+  "items": { "$ref": "https://parloa.dev/plan-executor/deviation_journal_entry.schema.json" }
+}

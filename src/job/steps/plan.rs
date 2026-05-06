@@ -1171,6 +1171,35 @@ enum DispatchOutcome {
     Outcome(AttemptOutcome),
 }
 
+/// Builds the [`crate::handoff::DeviationContext`] for a helper-dispatched
+/// reviewer or validator handoff. Extracts `job_id` from the daemon hooks
+/// when present, falling back to `"foreground"` for one-shot runs.
+///
+/// Called once per handoff entry inside [`dispatch_handoffs_and_resume`] so
+/// every reviewer / validator in the batch receives identical constants.
+fn build_deviation_context_for_helper_handoff(
+    ctx: &StepContext,
+    kind: HelperLoopKind,
+    index: usize,
+    prior_digest: Option<String>,
+) -> crate::handoff::DeviationContext {
+    let journal_path = crate::deviation_journal::journal_path(&ctx.workdir);
+    let job_id = ctx
+        .daemon_hooks
+        .as_ref()
+        .map(|hooks| hooks.job_id.clone())
+        .unwrap_or_else(|| "foreground".to_string());
+    crate::handoff::DeviationContext {
+        journal_path,
+        job_id,
+        phase: kind.display_kind().to_string(),
+        wave_id: None,
+        task_id: None,
+        agent_index: index,
+        prior_digest,
+    }
+}
+
 /// Parses the `state_updates.handoffs` payload, dispatches the listed
 /// sub-agents via `handoff::dispatch_all`, persists the collected outputs as
 /// a sidecar JSON file the next helper invocation reads, and returns control
@@ -1231,6 +1260,29 @@ async fn dispatch_handoffs_and_resume(
     // Step 2 — translate to the dispatcher's `Handoff` type. Reject paths
     // outside the workdir to mirror the existing fix-wave findings-path
     // canonicalize check.
+
+    // Read the deviation journal once for all handoffs in this batch so
+    // every reviewer / validator gets the same prior-digest snapshot.
+    let journal_path = crate::deviation_journal::journal_path(&ctx.workdir);
+    let prior_digest = if journal_path.is_file() {
+        let (entries, warnings) = crate::deviation_journal::read_valid_entries(&journal_path)
+            .unwrap_or_else(|err| {
+                tracing::warn!(error = %err, "failed to read deviation journal for helper handoff context");
+                (Vec::new(), Vec::new())
+            });
+        for warning in &warnings {
+            tracing::warn!(
+                line = warning.line,
+                message = %warning.message,
+                "skipping malformed deviation journal line in helper handoff context",
+            );
+        }
+        let rendered = crate::deviation_journal::digest(&entries, crate::deviation_journal::DigestScope::All);
+        (!rendered.trim().is_empty()).then_some(rendered)
+    } else {
+        None
+    };
+
     let canonical_workdir = match std::fs::canonicalize(&ctx.workdir) {
         Ok(p) => p,
         Err(e) => {
@@ -1278,6 +1330,12 @@ async fn dispatch_handoffs_and_resume(
             agent_type,
             prompt_file: canonical_prompt,
             can_fail: entry.can_fail.unwrap_or(false),
+            deviation_context: Some(build_deviation_context_for_helper_handoff(
+                ctx,
+                kind,
+                entry.index,
+                prior_digest.clone(),
+            )),
         });
     }
 
@@ -1504,6 +1562,8 @@ async fn dispatch_fix_wave(
         Ok(m) => m,
         Err(outcome) => return FixWaveOutcome::Outcome(outcome),
     };
+    // Fix waves re-enter scheduler::run_wave_execution, so every fix-agent gets
+    // the same deviation-journal write/read prompt injection as implementation waves.
     let scheduler_outcome =
         scheduler::run_wave_execution(ctx, &scoped, &execution_root).await;
     if !matches!(scheduler_outcome, AttemptOutcome::Success) {
@@ -1824,6 +1884,26 @@ fn build_review_team_input(
     } else {
         String::new()
     };
+    let deviation_journal_path = crate::deviation_journal::journal_path(&ctx.workdir);
+    let deviation_digest = if deviation_journal_path.is_file() {
+        let (entries, warnings) =
+            crate::deviation_journal::read_valid_entries(&deviation_journal_path).unwrap_or_else(
+                |err| {
+                    tracing::warn!(error = %err, "failed to read deviation journal for review input");
+                    (Vec::new(), Vec::new())
+                },
+            );
+        for warning in warnings {
+            tracing::warn!(
+                line = warning.line,
+                message = %warning.message,
+                "skipping malformed deviation journal line in review input"
+            );
+        }
+        crate::deviation_journal::digest(&entries, crate::deviation_journal::DigestScope::All)
+    } else {
+        String::new()
+    };
     Ok(ReviewTeamInput {
         plan_context: manifest.plan.path.clone(),
         execution_outputs: format!(
@@ -1840,6 +1920,8 @@ fn build_review_team_input(
         execution_root: ctx.workdir.clone(),
         attempt: iteration,
         prior_handoff_outputs_path: prior_outputs,
+        deviation_journal_path: deviation_journal_path.is_file().then_some(deviation_journal_path),
+        deviation_digest,
     })
 }
 
@@ -1868,6 +1950,26 @@ fn build_validator_input(
     } else {
         String::new()
     };
+    let deviation_journal_path = crate::deviation_journal::journal_path(&ctx.workdir);
+    let deviation_digest = if deviation_journal_path.is_file() {
+        let (entries, warnings) =
+            crate::deviation_journal::read_valid_entries(&deviation_journal_path).unwrap_or_else(
+                |err| {
+                    tracing::warn!(error = %err, "failed to read deviation journal for validator input");
+                    (Vec::new(), Vec::new())
+                },
+            );
+        for warning in warnings {
+            tracing::warn!(
+                line = warning.line,
+                message = %warning.message,
+                "skipping malformed deviation journal line in validator input"
+            );
+        }
+        crate::deviation_journal::digest(&entries, crate::deviation_journal::DigestScope::All)
+    } else {
+        String::new()
+    };
     Ok(ValidatorInput {
         plan_path: PathBuf::from(&manifest.plan.path),
         execution_root: ctx.workdir.clone(),
@@ -1886,6 +1988,8 @@ fn build_validator_input(
         prior_validation_notes: json!({}),
         prior_helper_outcomes: json!({}),
         prior_handoff_outputs_path: prior_outputs,
+        deviation_journal_path: deviation_journal_path.is_file().then_some(deviation_journal_path),
+        deviation_digest,
     })
 }
 
@@ -4088,6 +4192,25 @@ fn write_local_summary(
     body.push('\n');
     body.push_str(&render_execution_counts(counts));
 
+    let journal_path = crate::deviation_journal::journal_path(&ctx.workdir);
+    if journal_path.is_file() {
+        match crate::deviation_journal::read_valid_entries(&journal_path) {
+            Ok((entries, warnings)) => {
+                for warning in warnings {
+                    tracing::warn!(line = warning.line, message = %warning.message, "skipping malformed deviation journal line in final summary");
+                }
+                let deviation_summary = crate::deviation_journal::notable_summary(&entries);
+                if !deviation_summary.trim().is_empty() {
+                    body.push_str("\n");
+                    body.push_str(&deviation_summary);
+                }
+            }
+            Err(err) => tracing::warn!(error = %err, "failed to read deviation journal for final summary"),
+        }
+    }
+
+    crate::deviation_journal::archive_to_job(&ctx.job_dir, &ctx.workdir);
+
     let path = ctx.job_dir.join(SUMMARY_FILE);
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -4685,6 +4808,66 @@ mod preflight_tests {
             read_status(&manifest),
             "EXECUTING",
             "status must remain EXECUTING when summary fails",
+        );
+    }
+
+    #[test]
+    fn build_deviation_context_for_helper_handoff_sets_phase_from_kind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = StepContext {
+            job_dir: dir.path().join("job"),
+            step_seq: 1,
+            attempt_n: 1,
+            workdir: dir.path().to_path_buf(),
+            daemon_hooks: None,
+        };
+
+        let dc = build_deviation_context_for_helper_handoff(&ctx, HelperLoopKind::CodeReview, 2, None);
+
+        assert_eq!(
+            dc,
+            crate::handoff::DeviationContext {
+                journal_path: crate::deviation_journal::journal_path(&ctx.workdir),
+                job_id: "foreground".to_string(),
+                phase: "review".to_string(),
+                wave_id: None,
+                task_id: None,
+                agent_index: 2,
+                prior_digest: None,
+            }
+        );
+    }
+
+    #[test]
+    fn build_deviation_context_for_helper_handoff_propagates_prior_digest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = StepContext {
+            job_dir: dir.path().join("job"),
+            step_seq: 1,
+            attempt_n: 1,
+            workdir: dir.path().to_path_buf(),
+            daemon_hooks: None,
+        };
+
+        let digest = "- wave 1: agent 0 skipped X".to_string();
+        let dc = build_deviation_context_for_helper_handoff(
+            &ctx,
+            HelperLoopKind::Validation,
+            0,
+            Some(digest.clone()),
+        );
+
+        assert_eq!(
+            dc,
+            crate::handoff::DeviationContext {
+                journal_path: crate::deviation_journal::journal_path(&ctx.workdir),
+                job_id: "foreground".to_string(),
+                phase: "validation".to_string(),
+                wave_id: None,
+                task_id: None,
+                agent_index: 0,
+                prior_digest: Some(digest),
+            }
         );
     }
 }
