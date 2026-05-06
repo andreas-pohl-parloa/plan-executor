@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.68.1] - 2026-05-06
+
+### Testing
+
+- **deviation-journal:** Foreground handoff prompt injection (#74) ([936621e](https://github.com/andreas-pohl-parloa/plan-executor/commit/936621e4c491245478c12fe6b0be7f1ccedb6d4b))
 ## [0.68.0] - 2026-05-06
 
 ### Features
