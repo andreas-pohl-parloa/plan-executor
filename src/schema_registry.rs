@@ -22,7 +22,7 @@
 //! helper-output:pr-finalize
 //! ```
 
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 // ---------------------------------------------------------------------------
 // Embedded schema texts — single source of truth.
@@ -30,6 +30,9 @@ use std::sync::OnceLock;
 
 const TASKS_SCHEMA: &str = include_str!("schemas/tasks.schema.json");
 const HANDOFFS_SCHEMA: &str = include_str!("schemas/handoffs.schema.json");
+const DEVIATION_JOURNAL_ENTRY_SCHEMA: &str =
+    include_str!("schemas/deviation_journal_entry.schema.json");
+const DEVIATION_JOURNAL_SCHEMA: &str = include_str!("schemas/deviation_journal.schema.json");
 const RUN_REVIEWER_TEAM_OUTPUT_SCHEMA: &str =
     include_str!("schemas/helpers/run_reviewer_team/output.schema.json");
 const REVIEW_EXECUTION_OUTPUT_OUTPUT_SCHEMA: &str =
@@ -45,6 +48,8 @@ const PR_FINALIZE_OUTPUT_SCHEMA: &str =
 pub enum SchemaId {
     Tasks,
     Handoffs,
+    DeviationJournalEntry,
+    DeviationJournal,
     HelperOutput(HelperOutputKind),
 }
 
@@ -68,6 +73,8 @@ impl SchemaId {
         match self {
             Self::Tasks => "tasks",
             Self::Handoffs => "handoffs",
+            Self::DeviationJournalEntry => "deviation-journal-entry",
+            Self::DeviationJournal => "deviation-journal",
             Self::HelperOutput(k) => match k {
                 HelperOutputKind::RunReviewerTeam => "helper-output:run-reviewer-team",
                 HelperOutputKind::ReviewExecutionOutput => "helper-output:review-execution-output",
@@ -100,6 +107,8 @@ impl SchemaId {
         match self {
             Self::Tasks => TASKS_SCHEMA,
             Self::Handoffs => HANDOFFS_SCHEMA,
+            Self::DeviationJournalEntry => DEVIATION_JOURNAL_ENTRY_SCHEMA,
+            Self::DeviationJournal => DEVIATION_JOURNAL_SCHEMA,
             Self::HelperOutput(HelperOutputKind::RunReviewerTeam) => RUN_REVIEWER_TEAM_OUTPUT_SCHEMA,
             Self::HelperOutput(HelperOutputKind::ReviewExecutionOutput) => {
                 REVIEW_EXECUTION_OUTPUT_OUTPUT_SCHEMA
@@ -118,6 +127,8 @@ impl SchemaId {
 pub const ALL_IDS: &[SchemaId] = &[
     SchemaId::Tasks,
     SchemaId::Handoffs,
+    SchemaId::DeviationJournalEntry,
+    SchemaId::DeviationJournal,
     SchemaId::HelperOutput(HelperOutputKind::RunReviewerTeam),
     SchemaId::HelperOutput(HelperOutputKind::ReviewExecutionOutput),
     SchemaId::HelperOutput(HelperOutputKind::ValidateExecutionPlan),
@@ -133,6 +144,8 @@ pub const ALL_IDS: &[SchemaId] = &[
 pub fn compiled(id: SchemaId) -> Result<&'static jsonschema::Validator, String> {
     static TASKS: OnceLock<jsonschema::Validator> = OnceLock::new();
     static HANDOFFS: OnceLock<jsonschema::Validator> = OnceLock::new();
+    static DEVIATION_JOURNAL_ENTRY: OnceLock<jsonschema::Validator> = OnceLock::new();
+    static DEVIATION_JOURNAL: OnceLock<jsonschema::Validator> = OnceLock::new();
     static RUN_REVIEWER_TEAM: OnceLock<jsonschema::Validator> = OnceLock::new();
     static REVIEW_EXECUTION_OUTPUT: OnceLock<jsonschema::Validator> = OnceLock::new();
     static VALIDATE_EXECUTION_PLAN: OnceLock<jsonschema::Validator> = OnceLock::new();
@@ -141,6 +154,8 @@ pub fn compiled(id: SchemaId) -> Result<&'static jsonschema::Validator, String> 
     let cell: &OnceLock<jsonschema::Validator> = match id {
         SchemaId::Tasks => &TASKS,
         SchemaId::Handoffs => &HANDOFFS,
+        SchemaId::DeviationJournalEntry => &DEVIATION_JOURNAL_ENTRY,
+        SchemaId::DeviationJournal => &DEVIATION_JOURNAL,
         SchemaId::HelperOutput(HelperOutputKind::RunReviewerTeam) => &RUN_REVIEWER_TEAM,
         SchemaId::HelperOutput(HelperOutputKind::ReviewExecutionOutput) => &REVIEW_EXECUTION_OUTPUT,
         SchemaId::HelperOutput(HelperOutputKind::ValidateExecutionPlan) => &VALIDATE_EXECUTION_PLAN,
@@ -153,8 +168,35 @@ pub fn compiled(id: SchemaId) -> Result<&'static jsonschema::Validator, String> 
     let raw = id.embedded_text();
     let json: serde_json::Value = serde_json::from_str(raw)
         .map_err(|e| format!("embedded schema {} is not valid JSON: {e}", id.as_str()))?;
-    let validator = jsonschema::validator_for(&json)
-        .map_err(|e| format!("embedded schema {} failed to compile: {e}", id.as_str()))?;
+    let validator = if id == SchemaId::DeviationJournal {
+        // The journal schema has a $ref to the entry schema URI; register the
+        // entry schema in a local in-memory registry so no network call is made.
+        static ENTRY_REGISTRY: LazyLock<Result<jsonschema::Registry<'static>, String>> =
+            LazyLock::new(|| {
+                let entry_json: serde_json::Value = serde_json::from_str(
+                    DEVIATION_JOURNAL_ENTRY_SCHEMA,
+                )
+                .map_err(|e| {
+                    format!("embedded schema deviation-journal-entry is not valid JSON: {e}")
+                })?;
+                jsonschema::Registry::new()
+                    .add(
+                        "https://parloa.dev/plan-executor/deviation_journal_entry.schema.json",
+                        entry_json,
+                    )
+                    .map_err(|e| format!("failed to add entry schema to registry: {e}"))?
+                    .prepare()
+                    .map_err(|e| format!("failed to prepare entry schema registry: {e}"))
+            });
+        let entry_registry = ENTRY_REGISTRY.as_ref().map_err(|e| e.clone())?;
+        jsonschema::options()
+            .with_registry(entry_registry)
+            .build(&json)
+            .map_err(|e| format!("embedded schema {} failed to compile: {e}", id.as_str()))?
+    } else {
+        jsonschema::validator_for(&json)
+            .map_err(|e| format!("embedded schema {} failed to compile: {e}", id.as_str()))?
+    };
     Ok(cell.get_or_init(|| validator))
 }
 
@@ -178,6 +220,8 @@ mod tests {
         assert!(err.contains("tasks"), "{err}");
         assert!(err.contains("handoffs"), "{err}");
         assert!(err.contains("helper-output:run-reviewer-team"), "{err}");
+        assert!(err.contains("deviation-journal-entry"), "{err}");
+        assert!(err.contains("deviation-journal"), "{err}");
     }
 
     #[test]
