@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.66.2] - 2026-05-06
+
+### Bug Fixes
+
+- **dispatch:** Disallow AskUserQuestion + ExitPlanMode in Claude wave sub-agents (#70) ([db74482](https://github.com/andreas-pohl-parloa/plan-executor/commit/db74482b38693dcac570ef832768476370a7cfb6))
 ## [0.66.1] - 2026-05-06
 
 ### Bug Fixes
