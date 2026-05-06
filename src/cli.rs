@@ -467,6 +467,8 @@ fn run_validate(
 
     if schema_id == "tasks" {
         run_validate_tasks_manifest(path);
+    } else if schema_id == "deviation-journal" {
+        run_validate_deviation_journal(path);
     } else {
         run_validate_against_schema(path, schema_id);
     }
@@ -519,6 +521,32 @@ fn run_validate_tasks_manifest(tasks_json: &Path) {
         eprintln!("ERROR: {}: {}", e.category, e.message);
     }
     std::process::exit(1);
+}
+
+/// Validates every line of a JSONL deviation journal file.
+///
+/// Stdin is not accepted; use `--schema=deviation-journal-entry -` for
+/// per-entry stdin validation.
+fn run_validate_deviation_journal(path: &Path) {
+    if path == Path::new("-") {
+        eprintln!("ERROR: `--schema=deviation-journal` requires an on-disk JSONL file; use `--schema=deviation-journal-entry -` for stdin");
+        std::process::exit(1);
+    }
+    match crate::deviation_journal::validate_journal_file(path) {
+        Ok(entries) => {
+            println!("VALID: {} (schema: deviation-journal, entries: {})", path.display(), entries.len());
+        }
+        Err(warnings) => {
+            for warning in &warnings {
+                if warning.line == 0 {
+                    eprintln!("ERROR: {}", warning.message);
+                } else {
+                    eprintln!("ERROR: line {}: {}", warning.line, warning.message);
+                }
+            }
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Generic mode: validate `path` (or stdin when `path == "-"`) against the

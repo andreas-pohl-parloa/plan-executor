@@ -114,6 +114,54 @@ pub fn validate_entry_bytes(bytes: &[u8]) -> Result<DeviationJournalEntry, Journ
     Ok(entry)
 }
 
+/// Reads a JSONL journal file and returns valid entries plus any per-line warnings.
+///
+/// Lines that fail validation are recorded as [`JournalWarning`]s instead of
+/// aborting the read, giving callers a complete picture of the file's health.
+///
+/// # Errors
+///
+/// Returns [`JournalError::JournalTooLarge`] when the file exceeds
+/// [`MAX_JOURNAL_BYTES`], or [`JournalError::Read`] on I/O failure.
+pub fn read_valid_entries(path: &Path) -> Result<(Vec<DeviationJournalEntry>, Vec<JournalWarning>), JournalError> {
+    let metadata = std::fs::metadata(path).map_err(JournalError::Read)?;
+    if metadata.len() > MAX_JOURNAL_BYTES {
+        return Err(JournalError::JournalTooLarge);
+    }
+    let raw = std::fs::read_to_string(path).map_err(JournalError::Read)?;
+    let mut entries = Vec::new();
+    let mut warnings = Vec::new();
+    for (idx, line) in raw.lines().enumerate() {
+        let line_no = idx + 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match validate_entry_bytes(line.as_bytes()) {
+            Ok(entry) => entries.push(entry),
+            Err(e) => warnings.push(JournalWarning {
+                line: line_no,
+                message: e.to_string(),
+            }),
+        }
+    }
+    Ok((entries, warnings))
+}
+
+/// Validates a JSONL journal file, returning all valid entries or a list of warnings.
+///
+/// # Errors
+///
+/// Returns `Err(Vec<JournalWarning>)` when any line fails validation or an
+/// I/O or size error occurs. An I/O or size error is reported as a single
+/// warning with `line == 0`.
+pub fn validate_journal_file(path: &Path) -> Result<Vec<DeviationJournalEntry>, Vec<JournalWarning>> {
+    match read_valid_entries(path) {
+        Ok((entries, warnings)) if warnings.is_empty() => Ok(entries),
+        Ok((_entries, warnings)) => Err(warnings),
+        Err(e) => Err(vec![JournalWarning { line: 0, message: e.to_string() }]),
+    }
+}
+
 pub fn validate_entry_semantics(entry: &DeviationJournalEntry) -> Result<(), JournalError> {
     if entry.version != ENTRY_VERSION {
         return Err(JournalError::Semantic(format!(
@@ -277,5 +325,25 @@ mod tests {
             validate_entry_bytes(&bytes),
             Err(JournalError::EntryTooLarge)
         ));
+    }
+
+    #[test]
+    fn jsonl_reader_reports_malformed_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deviations.jsonl");
+        std::fs::write(&path, "not-json\n").unwrap();
+        let err = validate_journal_file(&path).unwrap_err();
+        assert_eq!(err[0].line, 1);
+        assert!(err[0].message.contains("valid JSON"), "{}", err[0].message);
+    }
+
+    #[test]
+    fn jsonl_reader_accepts_valid_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deviations.jsonl");
+        let entry = serde_json::to_string(&valid_entry(DeviationCategory::Discovery)).unwrap();
+        std::fs::write(&path, format!("{entry}\n")).unwrap();
+        let entries = validate_journal_file(&path).unwrap();
+        assert_eq!(entries.len(), 1);
     }
 }
