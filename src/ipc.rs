@@ -32,6 +32,11 @@ pub enum TuiRequest {
         remote_repo: String,
         pr_number: u64,
     },
+    /// Continue a previously-failed plan job from the step it failed
+    /// on. Distinct from `ResumeJob` (which un-pauses a paused job);
+    /// this one re-enters the pipeline for a Failed job and skips
+    /// already-Succeeded steps.
+    ContinueJob { job_id: String },
 }
 
 /// Live process-group info for a locally running job. Empty for remote jobs.
