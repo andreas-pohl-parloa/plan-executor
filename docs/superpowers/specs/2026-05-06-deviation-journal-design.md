@@ -109,16 +109,6 @@ The `deviation-journal` schema validates a JSONL file:
 
 Semantic cross-checks against the manifest may be added later, but the first version should avoid needing the manifest path for per-agent validation.
 
-## Executor coverage
-
-Prompt injection lives in `handoff::dispatch_agent`. Every code path that funnels through the Rust scheduler inherits the deviation-journal protocol automatically:
-
-- `plan-executor execute <tasks.json>` (default daemon mode)
-- `plan-executor execute --foreground <tasks.json>` (in-session/foreground)
-- `plan-executor execute --remote <tasks.json>` (GHA runner; foreground binary on the runner)
-
-Out of scope for this design: in-session Claude orchestrators that dispatch sub-agents through the Agent tool instead of the binary (e.g. `superpowers:subagent-driven-development`, hypothetical `plan-executor:execute-plan` skill). Those would need a parallel implementation that injects the same block into the per-task prompt files they construct and that reads/digests the journal between waves. They are intentionally not included in this work.
-
 ## Prompt injection
 
 The daemon injects a deviation-journal block into non-bash sub-agent prompts at dispatch time, next to the existing hygiene preamble. Compile-plan does not write this block into task files.
