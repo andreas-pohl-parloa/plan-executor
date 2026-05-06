@@ -179,7 +179,7 @@ const HYGIENE_MARKER: &str = "Subprocess hygiene (MANDATORY";
 /// non-bash sub-agent prompts. Must match the opening of the block
 /// emitted by `deviation_block` so `ensure_deviation_block_in_prompt`
 /// is idempotent.
-const DEVIATION_MARKER: &str = "Deviation journal (plan-executor enforced";
+pub const DEVIATION_MARKER: &str = "Deviation journal (plan-executor enforced";
 
 fn deviation_block(ctx: &DeviationContext) -> String {
     let wave_id = ctx.wave_id.map(|x| x.to_string()).unwrap_or_else(|| "null".into());
@@ -223,7 +223,7 @@ fn deviation_block(ctx: &DeviationContext) -> String {
     block
 }
 
-fn ensure_deviation_block_in_prompt(path: &Path, ctx: &DeviationContext) {
+pub fn ensure_deviation_block_in_prompt(path: &Path, ctx: &DeviationContext) {
     let Ok(original) = std::fs::read_to_string(path) else { return; };
     if original.contains(DEVIATION_MARKER) {
         return;
