@@ -179,4 +179,48 @@ mod tests {
         assert!(err.contains("handoffs"), "{err}");
         assert!(err.contains("helper-output:run-reviewer-team"), "{err}");
     }
+
+    #[test]
+    fn validate_execution_plan_triage_accepts_missing_validation_report_path() {
+        let schema = compiled(SchemaId::HelperOutput(
+            HelperOutputKind::ValidateExecutionPlan,
+        ))
+        .expect("schema compiles");
+        let envelope = serde_json::json!({
+            "status": "fix_required",
+            "next_step": "address_gaps",
+            "notes": "two gaps remain",
+            "state_updates": {
+                "gaps": [
+                    {
+                        "goal": "endpoint exists",
+                        "missing_evidence": "no /api/apply route in server.ts"
+                    }
+                ]
+            }
+        });
+        assert!(
+            schema.is_valid(&envelope),
+            "triage envelope without validation_report_path must validate; errors: {:?}",
+            schema.iter_errors(&envelope).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn validate_execution_plan_triage_still_requires_gaps() {
+        let schema = compiled(SchemaId::HelperOutput(
+            HelperOutputKind::ValidateExecutionPlan,
+        ))
+        .expect("schema compiles");
+        let envelope = serde_json::json!({
+            "status": "fix_required",
+            "next_step": "address_gaps",
+            "notes": "missing gaps",
+            "state_updates": {}
+        });
+        assert!(
+            !schema.is_valid(&envelope),
+            "triage envelope without gaps must be rejected"
+        );
+    }
 }
