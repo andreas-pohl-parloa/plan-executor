@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://parloa.dev/plan-executor/skills/validate-execution-plan-non-interactive/output.schema.json",
   "title": "validate-execution-plan-non-interactive output",
-  "description": "Two shapes: dispatch (status=waiting_for_handoffs, state_updates carries the validator/validation-fix handoff list) and triage (status in success/fix_required/blocked/abort, state_updates carries validation_report_path + gaps). The orchestrator dispatches the handoffs from dispatch mode and re-invokes the skill in triage mode with the captured outputs.",
+  "description": "Two shapes: dispatch (status=waiting_for_handoffs, state_updates carries the validator/validation-fix handoff list) and triage (status in success/fix_required/blocked/abort, state_updates carries gaps and an optional validation_report_path). The orchestrator dispatches the handoffs from dispatch mode and re-invokes the skill in triage mode with the captured outputs. validation_report_path is encouraged but not required; the orchestrator only uses it for a containment check when supplied.",
   "type": "object",
   "additionalProperties": false,
   "required": ["status", "next_step", "notes", "state_updates"],
@@ -81,7 +81,7 @@
           "state_updates": {
             "type": "object",
             "additionalProperties": true,
-            "required": ["validation_report_path", "gaps"],
+            "required": ["gaps"],
             "properties": {
               "validation_report_path": {
                 "type": "string",
