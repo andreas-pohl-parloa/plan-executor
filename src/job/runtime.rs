@@ -160,6 +160,29 @@ pub async fn run_pipeline_with_resume(
     let mut all_ok = true;
     let hooks = observer.daemon_hooks();
 
+    // Step-status persister. Re-reads `job.json` (so we don't blow away
+    // any field not on `Job.steps`), updates the matching seq's status,
+    // writes back. Best-effort: a write error logs but does not abort
+    // the pipeline. This is what lets `plan-executor resume` know which
+    // steps already succeeded and can be skipped on re-entry.
+    let job_id_for_status = observer.job_id().to_string();
+    let persist_step_status =
+        |seq: u32, status: crate::job::types::StepStatus| {
+            let Some(dir) = dir_for_metrics.as_ref() else { return; };
+            let Ok(mut job) = dir.read_job() else { return; };
+            if let Some(s) = job.steps.iter_mut().find(|s| s.seq == seq) {
+                s.status = status;
+            }
+            if let Err(e) = dir.write_job_metadata(&job) {
+                tracing::warn!(
+                    job = %job_id_for_status,
+                    seq,
+                    error = %e,
+                    "persist step status failed; resume may not skip this step",
+                );
+            }
+        };
+
     let (resume_from_seq, succeeded_seqs): (u32, &[u32]) = match &mode {
         ResumeMode::FreshRun => (1, &[]),
         ResumeMode::Resume {
@@ -208,6 +231,7 @@ pub async fn run_pipeline_with_resume(
 
         observer.on_step_start(seq, step.name());
         observer.touch_activity();
+        persist_step_status(seq, crate::job::types::StepStatus::Running);
 
         metrics.record_step();
         let policy = step.recovery_policy();
@@ -234,6 +258,27 @@ pub async fn run_pipeline_with_resume(
         persist_metrics(&metrics);
 
         let ok = matches!(outcome, AttemptOutcome::Success | AttemptOutcome::Pending);
+
+        // Persist the step's terminal status so `plan-executor resume`
+        // can read which steps already succeeded. A failed run leaves
+        // the failed step + all later steps at their pre-run status
+        // (Pending → Running for the failed step, Pending for the
+        // rest). On resume, those pending steps re-run; the previously
+        // Succeeded ones are skipped.
+        let terminal_status = if ok {
+            crate::job::types::StepStatus::Succeeded
+        } else {
+            crate::job::types::StepStatus::Failed {
+                reason: render_outcome(&outcome),
+                recoverable: matches!(
+                    outcome,
+                    AttemptOutcome::TransientInfra { .. }
+                        | AttemptOutcome::ProtocolViolation { .. }
+                ),
+            }
+        };
+        persist_step_status(seq, terminal_status);
+
         if !ok {
             tracing::error!(
                 step = step.name(),
