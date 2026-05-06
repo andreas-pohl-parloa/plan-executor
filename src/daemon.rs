@@ -1662,7 +1662,233 @@ async fn handle_tui_request(
         TuiRequest::Subscribe => {
             // Already subscribed via broadcast channel; no-op
         }
+        TuiRequest::ContinueJob { job_id } => {
+            trigger_resume(state, &job_id).await;
+        }
     }
+}
+
+/// Daemon-side handler for `plan-executor resume <id>`. Reads the
+/// persisted job, asserts it is in a resumable state, finds the
+/// resume seq (first non-Succeeded step), flips Failed→Running, and
+/// kicks off the resume pipeline so the existing job_dir,
+/// display.log, and broadcast surface are all reused.
+async fn trigger_resume(state: &Arc<Mutex<DaemonState>>, job_id: &str) {
+    use crate::job::storage::JobStore;
+    use crate::job::types::{JobId, JobKind, JobState, StepStatus};
+
+    let store = match JobStore::new() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(job = %job_id, "trigger_resume: open job store failed: {e}");
+            return;
+        }
+    };
+    let dir = match store.open(&JobId(job_id.to_string())) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(job = %job_id, "trigger_resume: open job dir failed: {e}");
+            return;
+        }
+    };
+    let mut job = match dir.read_job() {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::error!(job = %job_id, "trigger_resume: read job.json failed: {e}");
+            return;
+        }
+    };
+    if !matches!(job.state, JobState::Failed { .. }) {
+        let st = state.lock().await;
+        let _ = st.event_tx.send(DaemonEvent::Error {
+            message: format!(
+                "job {job_id} is in state {:?}; resume requires a `failed` job",
+                job.state
+            ),
+        });
+        return;
+    }
+    let manifest_path = match &job.kind {
+        JobKind::Plan { manifest_path } => manifest_path.clone(),
+        _ => {
+            let st = state.lock().await;
+            let _ = st.event_tx.send(DaemonEvent::Error {
+                message: format!("job {job_id} is not a plan job; only `plan` jobs support resume"),
+            });
+            return;
+        }
+    };
+
+    let succeeded_seqs: Vec<u32> = job
+        .steps
+        .iter()
+        .filter(|s| matches!(s.status, StepStatus::Succeeded))
+        .map(|s| s.seq)
+        .collect();
+    let resume_from_seq = job
+        .steps
+        .iter()
+        .find(|s| !matches!(s.status, StepStatus::Succeeded))
+        .map(|s| s.seq)
+        .unwrap_or(1);
+
+    job.state = JobState::Running;
+    if let Err(e) = dir.write_job_metadata(&job) {
+        tracing::warn!(job = %job_id, error = %e, "resume: Failed→Running flip failed");
+    }
+
+    let plan_path = match crate::cli::read_manifest_plan_block(&manifest_path) {
+        Ok((p, _, _)) => p,
+        Err(e) => {
+            tracing::error!(job = %job_id, "resume: read_manifest_plan_block: {e}");
+            return;
+        }
+    };
+    let execution_root = crate::cli::find_repo_root(&plan_path)
+        .unwrap_or_else(|| plan_path.parent().unwrap_or(&plan_path).to_path_buf());
+
+    spawn_resume_scheduler_job(
+        state,
+        plan_path,
+        manifest_path,
+        execution_root,
+        job_id.to_string(),
+        resume_from_seq,
+        succeeded_seqs,
+    )
+    .await;
+}
+
+/// Resume counterpart of [`spawn_rust_scheduler_job`]. Reuses the same
+/// `JobMetadata` row and `display.log` so the resume appends rather
+/// than starts a new ledger.
+async fn spawn_resume_scheduler_job(
+    state: &Arc<Mutex<DaemonState>>,
+    plan: PathBuf,
+    manifest_path: PathBuf,
+    execution_root: PathBuf,
+    job_id: String,
+    resume_from_seq: u32,
+    succeeded_seqs: Vec<u32>,
+) {
+    use crate::job::registry;
+    use crate::job::runtime;
+    use crate::job::storage::JobStore;
+    use crate::job::types::JobId;
+
+    let pipeline_override: Option<Vec<String>> = crate::scheduler::load_manifest(&manifest_path)
+        .ok()
+        .and_then(|m| m.plan.pipeline.map(|p| p.steps));
+    let runtime_steps =
+        registry::steps_for_plan_filtered(&manifest_path, pipeline_override.as_deref());
+
+    // Restore daemon-side accounting so the resumed run shows up in
+    // running_jobs / history (so `jobs` lists it as running again,
+    // watchdog tracks it, KillJob targets it). Reuse the original
+    // job id; flip status to Running and stamp a fresh started_at.
+    let mut metadata = JobMetadata::new(plan.clone());
+    metadata.id = job_id.clone();
+    metadata.status = JobStatus::Running;
+    {
+        let mut st = state.lock().await;
+        st.running_jobs.insert(job_id.clone(), metadata);
+        st.history.retain(|j| j.id != job_id);
+        st.job_started_at_monotonic.insert(job_id.clone(), Instant::now());
+        st.job_last_activity.insert(job_id.clone(), Instant::now());
+        let event = st.snapshot_state();
+        let _ = st.event_tx.send(event);
+    }
+
+    // Spawn the pipeline in a background task so the IPC handler
+    // returns promptly. Mirrors spawn_rust_scheduler_job's shape.
+    let state_clone = Arc::clone(state);
+    let manifest_path_clone = manifest_path.clone();
+    let job_id_clone = job_id.clone();
+    tokio::spawn(async move {
+        let event_tx = { state_clone.lock().await.event_tx.clone() };
+        let hooks = Arc::new(SchedulerHooks::new_daemon(
+            job_id_clone.clone(),
+            Arc::clone(&state_clone),
+            event_tx,
+        ));
+        let observer: Arc<dyn runtime::PipelineObserver> = Arc::new(DaemonObserver {
+            job_id: job_id_clone.clone(),
+            state: Arc::clone(&state_clone),
+            hooks: Arc::clone(&hooks),
+        });
+
+        let store = match JobStore::new() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "resume: open job store failed");
+                return;
+            }
+        };
+        let dir = match store.open(&JobId(job_id_clone.clone())) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!(error = %e, "resume: open job dir failed");
+                return;
+            }
+        };
+        let job_dir_path = dir.path().to_path_buf();
+
+        let run = runtime::run_pipeline_with_resume(
+            runtime_steps,
+            job_dir_path,
+            execution_root,
+            observer,
+            runtime::ResumeMode::Resume {
+                resume_from_seq,
+                succeeded_seqs,
+            },
+        )
+        .await;
+        let pipeline_ok = run.success;
+
+        if !pipeline_ok {
+            if let Err(e) =
+                crate::job::steps::plan::set_manifest_status(&manifest_path_clone, "FAILED")
+            {
+                tracing::warn!(
+                    job = %job_id_clone,
+                    manifest = %manifest_path_clone.display(),
+                    error = %e,
+                    "resume: flip plan.status to FAILED failed",
+                );
+            }
+        }
+        if let Ok(mut job) = dir.read_job() {
+            job.state = if pipeline_ok {
+                crate::job::types::JobState::Succeeded
+            } else {
+                crate::job::types::JobState::Failed {
+                    reason: "pipeline aborted on resume".to_string(),
+                    recoverable: false,
+                }
+            };
+            let _ = dir.write_job_metadata(&job);
+        }
+
+        let mut st = state_clone.lock().await;
+        if let Some(mut job) = st.running_jobs.remove(&job_id_clone) {
+            job.status = if pipeline_ok {
+                JobStatus::Success
+            } else {
+                JobStatus::Failed
+            };
+            job.finished_at = Some(chrono::Utc::now());
+            let _ = job.save();
+            st.history.insert(0, job.clone());
+            st.job_last_activity.remove(&job_id_clone);
+            st.job_started_at_monotonic.remove(&job_id_clone);
+            st.sub_agent_dispatch_counter.remove(&job_id_clone);
+            let _ = st.event_tx.send(DaemonEvent::JobUpdated { job });
+        }
+    });
+
+    let _ = job_id;
+    let _ = manifest_path;
 }
 
 #[cfg(test)]

@@ -106,6 +106,44 @@ pub async fn run_pipeline(
     workdir: PathBuf,
     observer: Arc<dyn PipelineObserver>,
 ) -> PipelineRun {
+    run_pipeline_with_resume(steps, job_dir, workdir, observer, ResumeMode::FreshRun).await
+}
+
+/// Resume policy for [`run_pipeline_with_resume`]. The fresh-run variant
+/// is what `execute` paths use; the resume variant is for
+/// `plan-executor resume <job-id>` and skips already-Succeeded steps
+/// while still re-running preflight (idempotent and required to set
+/// `ctx.workdir` to the worktree path).
+#[derive(Debug, Clone)]
+pub enum ResumeMode {
+    /// Run every step in sequence (the `execute` semantics). Equivalent
+    /// to `Resume { resume_from_seq: 1, succeeded_seqs: [] }` but
+    /// avoids the empty-set lookup overhead.
+    FreshRun,
+    /// Skip every Succeeded step before `resume_from_seq`. The
+    /// preflight step (always seq=1) is the exception: it always runs
+    /// because it sets `ctx.workdir` to the worktree path the resumed
+    /// steps need to inherit. Other Succeeded steps before
+    /// `resume_from_seq` are skipped — their work is already done and
+    /// re-running them (notably wave_execution) would re-dispatch all
+    /// sub-agents. Steps with seq >= `resume_from_seq` always run.
+    Resume {
+        resume_from_seq: u32,
+        succeeded_seqs: Vec<u32>,
+    },
+}
+
+/// Like [`run_pipeline`] but accepts a [`ResumeMode`]. When `mode` is
+/// [`ResumeMode::Resume`], steps before `resume_from_seq` are skipped
+/// unless they are preflight (seq=1, which always re-runs to recover
+/// `ctx.workdir`); steps from `resume_from_seq` onward run normally.
+pub async fn run_pipeline_with_resume(
+    steps: Vec<Box<dyn Step>>,
+    job_dir: PathBuf,
+    workdir: PathBuf,
+    observer: Arc<dyn PipelineObserver>,
+    mode: ResumeMode,
+) -> PipelineRun {
     let job_id_owned = JobId(observer.job_id().to_string());
     let mut metrics = JobMetrics::new(job_id_owned.clone());
     let store_for_metrics = JobStore::new().ok();
@@ -122,6 +160,14 @@ pub async fn run_pipeline(
     let mut all_ok = true;
     let hooks = observer.daemon_hooks();
 
+    let (resume_from_seq, succeeded_seqs): (u32, &[u32]) = match &mode {
+        ResumeMode::FreshRun => (1, &[]),
+        ResumeMode::Resume {
+            resume_from_seq,
+            succeeded_seqs,
+        } => (*resume_from_seq, succeeded_seqs.as_slice()),
+    };
+
     for (idx, step) in steps.iter().enumerate() {
         let seq = u32::try_from(idx + 1).unwrap_or(u32::MAX);
 
@@ -129,6 +175,27 @@ pub async fn run_pipeline(
             tracing::info!(job = %observer.job_id(), seq, "pipeline aborted: job killed");
             all_ok = false;
             break;
+        }
+
+        // Resume path: skip Succeeded steps before the resume point
+        // EXCEPT preflight (seq=1, always re-run to set ctx.workdir).
+        let is_skippable_resume = seq < resume_from_seq
+            && seq != 1
+            && succeeded_seqs.contains(&seq);
+        if is_skippable_resume {
+            tracing::info!(
+                job = %observer.job_id(),
+                seq,
+                step = step.name(),
+                "resume: skipping previously-succeeded step",
+            );
+            if let Some(hooks) = hooks.as_ref() {
+                hooks.announce_step_line(format!(
+                    "⏺ [plan-executor] step {seq:03} {name}: skipped (resume — already succeeded)",
+                    name = step.name(),
+                ));
+            }
+            continue;
         }
 
         let mut ctx = StepContext {

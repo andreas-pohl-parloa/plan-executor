@@ -51,6 +51,21 @@ pub enum Commands {
     Pause { job_id: String },
     /// Resume a paused job
     Unpause { job_id: String },
+    /// Continue a previously-failed plan job from the step it failed on.
+    ///
+    /// Re-runs preflight (idempotent — finds the existing worktree),
+    /// skips other already-succeeded steps, and resumes from the
+    /// failed step. Use this when a fix-loop hit `SemanticMistake` and
+    /// you want to restart code review / validation without redoing
+    /// `wave_execution` + `integration_testing` (which would re-
+    /// dispatch every sub-agent).
+    Resume {
+        /// Job ID prefix (from `plan-executor jobs`)
+        job_id: String,
+        /// Run in foreground instead of submitting to the daemon
+        #[arg(short = 'f', long)]
+        foreground: bool,
+    },
     /// Show output of a job; use -f to follow a running job
     Output {
         /// Job ID prefix (from `plan-executor jobs`)
@@ -1094,6 +1109,9 @@ pub fn run() {
         let level = match &cli.command {
             Commands::Execute {
                 foreground: true, ..
+            }
+            | Commands::Resume {
+                foreground: true, ..
             } => "plan_executor=warn",
             _ => "plan_executor=info",
         };
@@ -1121,6 +1139,16 @@ pub fn run() {
         }
         Commands::Status => rt.block_on(show_status()),
         Commands::Output { job_id, follow } => rt.block_on(output_job(job_id, follow)),
+        Commands::Resume {
+            job_id,
+            foreground,
+        } => {
+            if foreground {
+                rt.block_on(resume_foreground(job_id, config))
+            } else {
+                rt.block_on(resume_via_daemon(job_id))
+            }
+        }
         Commands::Stop
         | Commands::Jobs { .. }
         | Commands::Ensure
@@ -1502,6 +1530,251 @@ async fn execute_foreground(manifest_arg: String, config: crate::config::Config)
     Ok(())
 }
 
+/// First 8 chars of a job id — same shape `plan-executor jobs` uses
+/// in its ID column. Local to the resume helpers; the job-cli module
+/// has a sibling for its own use.
+fn resume_short_id(id: &str) -> String {
+    id.get(..id.len().min(8)).unwrap_or(id).to_string()
+}
+
+/// Foreground entry for `plan-executor resume <id> --foreground`. Loads
+/// the persisted job, finds the resume seq (first non-Succeeded step),
+/// re-runs the pipeline with skip-mask logic.
+async fn resume_foreground(
+    job_id_prefix: String,
+    _config: crate::config::Config,
+) -> Result<()> {
+    use crate::job::registry;
+    use crate::job::storage::JobStore;
+    use crate::job::types::{JobKind, JobState, StepStatus};
+
+    let store = JobStore::new().context("opening job store")?;
+    let (full_id, mut job, dir) = load_resumable_job(&store, &job_id_prefix)?;
+    let manifest_path = match &job.kind {
+        JobKind::Plan { manifest_path } => manifest_path.clone(),
+        _ => anyhow::bail!(
+            "job {} is not a plan job; only `plan` jobs support resume",
+            resume_short_id(&full_id.0)
+        ),
+    };
+
+    // Compute the resume point: first non-Succeeded step seq.
+    let succeeded_seqs: Vec<u32> = job
+        .steps
+        .iter()
+        .filter(|s| matches!(s.status, StepStatus::Succeeded))
+        .map(|s| s.seq)
+        .collect();
+    let resume_from_seq = job
+        .steps
+        .iter()
+        .find(|s| !matches!(s.status, StepStatus::Succeeded))
+        .map(|s| s.seq)
+        .unwrap_or(1);
+
+    if resume_from_seq == 1 && succeeded_seqs.is_empty() {
+        anyhow::bail!(
+            "job {} has no Succeeded steps to skip; use `plan-executor execute` instead",
+            resume_short_id(&full_id.0)
+        );
+    }
+
+    eprintln!(
+        "\x1b[33m⏺ [plan-executor]\x1b[0m resume {short}: skipping {} succeeded step(s); resuming at step {resume_from_seq}",
+        succeeded_seqs.len(),
+        short = resume_short_id(&full_id.0),
+    );
+
+    // Flip Failed → Running before re-entering the pipeline so post-mortem
+    // reads see "running" mid-resume rather than the stale Failed state.
+    job.state = JobState::Running;
+    if let Err(e) = dir.write_job_metadata(&job) {
+        tracing::warn!(error = %e, "resume: write job state Failed→Running failed");
+    }
+
+    // Re-derive the execution root from the manifest's plan path. Same
+    // logic as `execute_foreground` so the workdir handed into the
+    // pipeline matches the original run; preflight will then redirect
+    // to the worktree.
+    let (resolved_path, _status, _execution_mode) = read_manifest_plan_block(&manifest_path)?;
+    let execution_root = find_repo_root(&resolved_path).unwrap_or_else(|| {
+        resolved_path
+            .parent()
+            .unwrap_or(&resolved_path)
+            .to_path_buf()
+    });
+
+    let pipeline_override: Option<Vec<String>> = crate::scheduler::load_manifest(&manifest_path)
+        .ok()
+        .and_then(|m| m.plan.pipeline.map(|p| p.steps));
+    let runtime_steps =
+        registry::steps_for_plan_filtered(&manifest_path, pipeline_override.as_deref());
+
+    let success = run_rust_scheduler_pipeline_with_resume(
+        runtime_steps,
+        full_id.0.clone(),
+        dir.path().to_path_buf(),
+        execution_root,
+        resume_from_seq,
+        succeeded_seqs,
+    )
+    .await;
+
+    // Persist terminal state. SummaryStep handles the manifest's
+    // plan.status COMPLETED transition on success; mirror execute's
+    // failure flip otherwise.
+    job.state = if success {
+        JobState::Succeeded
+    } else {
+        JobState::Failed {
+            reason: "pipeline aborted on resume".to_string(),
+            recoverable: false,
+        }
+    };
+    if let Err(e) = dir.write_job_metadata(&job) {
+        tracing::warn!(error = %e, "resume: write terminal job state failed");
+    }
+
+    if !success {
+        if let Err(e) =
+            crate::job::steps::plan::set_manifest_status(&manifest_path, "FAILED")
+        {
+            tracing::warn!(
+                manifest = %manifest_path.display(),
+                error = %e,
+                "resume: flip plan.status to FAILED failed",
+            );
+        }
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Submits a resume request to the running daemon. Falls back to the
+/// foreground path when the daemon is not reachable.
+async fn resume_via_daemon(job_id_prefix: String) -> Result<()> {
+    use crate::ipc::{DaemonEvent, TuiRequest};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    if !crate::ipc::socket_path().exists() {
+        anyhow::bail!(
+            "daemon not running. Start with `plan-executor daemon`, or pass `--foreground` to run \
+             this resume in the current process."
+        );
+    }
+
+    let stream = UnixStream::connect(crate::ipc::socket_path()).await?;
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half).lines();
+
+    // Resolve prefix → full id via the daemon's GetState snapshot. Mirrors
+    // `output_job` so the resolution path is shared / consistent.
+    let gs = serde_json::to_string(&TuiRequest::GetState)?;
+    write_half.write_all(format!("{}\n", gs).as_bytes()).await?;
+    let state_line = reader.next_line().await?.unwrap_or_default();
+    let full_id = if let Ok(DaemonEvent::State {
+        history,
+        running_jobs,
+        ..
+    }) = serde_json::from_str::<DaemonEvent>(&state_line)
+    {
+        let m = running_jobs
+            .iter()
+            .find(|j| j.id.starts_with(&job_id_prefix))
+            .or_else(|| history.iter().find(|j| j.id.starts_with(&job_id_prefix)));
+        match m {
+            Some(j) => j.id.clone(),
+            None => anyhow::bail!("no job matching '{}'", job_id_prefix),
+        }
+    } else {
+        anyhow::bail!("unexpected response from daemon");
+    };
+
+    let req = serde_json::to_string(&TuiRequest::ContinueJob {
+        job_id: full_id.clone(),
+    })?;
+    write_half.write_all(format!("{}\n", req).as_bytes()).await?;
+    eprintln!(
+        "\x1b[33m⏺ [plan-executor]\x1b[0m submitted resume for job {} to daemon",
+        resume_short_id(&full_id),
+    );
+    Ok(())
+}
+
+/// Loads a job by prefix and asserts it is in a resumable state.
+/// Returns the full id, parsed `Job`, and the matching `JobDir` so
+/// the caller can mutate state + re-enter the pipeline.
+fn load_resumable_job(
+    store: &crate::job::storage::JobStore,
+    prefix: &str,
+) -> Result<(
+    crate::job::types::JobId,
+    crate::job::types::Job,
+    crate::job::storage::JobDir,
+)> {
+    use crate::job::types::JobState;
+    let full_id = resolve_job_id_prefix(store, prefix)?;
+    let dir = store
+        .open(&full_id)
+        .with_context(|| format!("opening job dir for {}", resume_short_id(&full_id.0)))?;
+    let job = dir
+        .read_job()
+        .with_context(|| format!("reading job.json for {}", resume_short_id(&full_id.0)))?;
+    match &job.state {
+        JobState::Failed { .. } => Ok((full_id, job, dir)),
+        other => anyhow::bail!(
+            "job {} is in state {:?}; resume requires a `failed` job",
+            resume_short_id(&full_id.0),
+            other
+        ),
+    }
+}
+
+/// Walks the job store for a single id matching `prefix`. Errors when
+/// none match or multiple match (ambiguous prefix).
+fn resolve_job_id_prefix(
+    store: &crate::job::storage::JobStore,
+    prefix: &str,
+) -> Result<crate::job::types::JobId> {
+    use crate::job::types::JobId;
+    let entries = store.list_all().context("listing job store")?;
+    let mut matches: Vec<JobId> = entries
+        .iter()
+        .filter_map(|e| match e {
+            crate::job::storage::JobStoreEntry::New { summary, .. } => {
+                if summary.id.0.starts_with(prefix) {
+                    Some(summary.id.clone())
+                } else {
+                    None
+                }
+            }
+            crate::job::storage::JobStoreEntry::Legacy { id, .. } => {
+                if id.starts_with(prefix) {
+                    Some(JobId(id.clone()))
+                } else {
+                    None
+                }
+            }
+        })
+        .collect();
+    matches.sort_by(|a, b| a.0.cmp(&b.0));
+    matches.dedup_by(|a, b| a.0 == b.0);
+    match matches.len() {
+        0 => anyhow::bail!("no job matching '{}'", prefix),
+        1 => Ok(matches.into_iter().next().expect("len == 1")),
+        _ => anyhow::bail!(
+            "prefix '{}' is ambiguous: matches {}",
+            prefix,
+            matches
+                .iter()
+                .map(|j| resume_short_id(&j.0))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 /// Foreground / GHA-runner entry into the shared
 /// [`crate::job::runtime::run_pipeline`] engine. Routes display lines
 /// to stderr (the daemon path uses the broadcast bus instead) but
@@ -1520,6 +1793,36 @@ pub(crate) async fn run_rust_scheduler_pipeline(
     let observer: std::sync::Arc<dyn runtime::PipelineObserver> =
         std::sync::Arc::new(ForegroundObserver { job_id, hooks });
     let run = runtime::run_pipeline(steps, job_dir, workdir, observer).await;
+    run.success
+}
+
+/// Foreground entry for `plan-executor resume <id> --foreground`. Re-
+/// runs preflight (idempotent — relocates the existing worktree),
+/// skips other already-Succeeded steps, and resumes from the step
+/// that previously failed.
+pub(crate) async fn run_rust_scheduler_pipeline_with_resume(
+    steps: Vec<Box<dyn crate::job::step::Step>>,
+    job_id: String,
+    job_dir: PathBuf,
+    workdir: PathBuf,
+    resume_from_seq: u32,
+    succeeded_seqs: Vec<u32>,
+) -> bool {
+    use crate::job::runtime;
+    let hooks = std::sync::Arc::new(crate::daemon::SchedulerHooks::new_stderr(job_id.clone()));
+    let observer: std::sync::Arc<dyn runtime::PipelineObserver> =
+        std::sync::Arc::new(ForegroundObserver { job_id, hooks });
+    let run = runtime::run_pipeline_with_resume(
+        steps,
+        job_dir,
+        workdir,
+        observer,
+        runtime::ResumeMode::Resume {
+            resume_from_seq,
+            succeeded_seqs,
+        },
+    )
+    .await;
     run.success
 }
 
@@ -1594,7 +1897,7 @@ impl crate::job::runtime::PipelineObserver for ForegroundObserver {
 }
 
 /// Walk up from a path to find the closest directory containing `.git`.
-fn find_repo_root(path: &std::path::Path) -> Option<std::path::PathBuf> {
+pub(crate) fn find_repo_root(path: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut dir = if path.is_file() {
         path.parent()?.to_path_buf()
     } else {
