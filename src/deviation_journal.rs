@@ -104,6 +104,14 @@ pub fn journal_path(execution_root: &Path) -> PathBuf {
         .join("deviations.jsonl")
 }
 
+/// Returns a human-readable digest of prior deviations relevant to `wave`.
+///
+/// This is a temporary stub. Task 5 replaces it with the real digest
+/// implementation that reads the journal and filters by wave/task context.
+pub fn digest_for_wave(_execution_root: &Path, _wave: &crate::scheduler::Wave) -> Option<String> {
+    None
+}
+
 pub fn validate_entry_bytes(bytes: &[u8]) -> Result<DeviationJournalEntry, JournalError> {
     if bytes.len() > MAX_ENTRY_BYTES {
         return Err(JournalError::EntryTooLarge);

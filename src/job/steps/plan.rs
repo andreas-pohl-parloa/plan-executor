@@ -1278,6 +1278,7 @@ async fn dispatch_handoffs_and_resume(
             agent_type,
             prompt_file: canonical_prompt,
             can_fail: entry.can_fail.unwrap_or(false),
+            deviation_context: None,
         });
     }
 

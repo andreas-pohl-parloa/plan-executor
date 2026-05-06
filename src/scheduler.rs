@@ -456,7 +456,8 @@ pub async fn run_wave_execution(
             };
         };
 
-        let handoffs = match build_handoffs(wave, manifest, &manifest_dir) {
+        let prior_digest = crate::deviation_journal::digest_for_wave(&ctx.workdir, wave);
+        let handoffs = match build_handoffs(wave, manifest, &manifest_dir, ctx, prior_digest) {
             Ok(h) => h,
             Err(e) => {
                 return AttemptOutcome::ProtocolViolation {
@@ -714,7 +715,14 @@ fn build_handoffs(
     wave: &Wave,
     manifest: &Manifest,
     manifest_dir: &Path,
+    ctx: &StepContext,
+    prior_digest: Option<String>,
 ) -> Result<Vec<Handoff>, SchedulerError> {
+    let job_id = ctx
+        .daemon_hooks
+        .as_ref()
+        .map(|hooks| hooks.job_id.clone())
+        .unwrap_or_else(|| "foreground".to_string());
     wave.task_ids
         .iter()
         .enumerate()
@@ -755,11 +763,21 @@ fn build_handoffs(
                     )));
                 }
             }
+            let deviation_context = Some(handoff::DeviationContext {
+                journal_path: crate::deviation_journal::journal_path(&ctx.workdir),
+                job_id: job_id.clone(),
+                phase: "wave_execution".to_string(),
+                wave_id: Some(wave.id),
+                task_id: Some(tid.clone()),
+                agent_index: idx + 1,
+                prior_digest: prior_digest.clone(),
+            });
             Ok(Handoff {
                 index: idx + 1,
                 agent_type,
                 prompt_file,
                 can_fail: task.can_fail,
+                deviation_context,
             })
         })
         .collect()
@@ -994,7 +1012,14 @@ mod tests {
             ],
         );
         let dir = Path::new("/tmp/manifest-dir");
-        let handoffs = build_handoffs(&m.waves[0], &m, dir).unwrap();
+        let ctx = StepContext {
+            job_dir: std::path::PathBuf::from("/tmp/job-dir"),
+            step_seq: 1,
+            attempt_n: 1,
+            workdir: std::path::PathBuf::from("/tmp/workdir"),
+            daemon_hooks: None,
+        };
+        let handoffs = build_handoffs(&m.waves[0], &m, dir, &ctx, None).unwrap();
         assert_eq!(handoffs.len(), 2);
         assert_eq!(handoffs[0].index, 1);
         assert_eq!(handoffs[1].index, 2);
@@ -1004,6 +1029,8 @@ mod tests {
         assert!(matches!(handoffs[1].agent_type, AgentType::Codex));
         assert!(!handoffs[0].can_fail);
         assert!(handoffs[1].can_fail);
+        assert!(handoffs[0].deviation_context.is_some());
+        assert_eq!(handoffs[0].deviation_context.as_ref().unwrap().task_id.as_deref(), Some("t1"));
     }
 
     #[test]
