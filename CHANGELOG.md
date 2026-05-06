@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.67.2] - 2026-05-06
+
+### Documentation
+
+- **deviation-journal:** Clarify executor coverage; plan foreground integration test ([1d9b201](https://github.com/andreas-pohl-parloa/plan-executor/commit/1d9b2010c010fcacf0b1eaffd2aa02a22855cabf))
 ## [0.67.1] - 2026-05-06
 
 ### Bug Fixes
