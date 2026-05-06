@@ -11,6 +11,7 @@ pub mod cli;
 pub mod compile;
 pub mod config;
 pub mod daemon;
+pub mod deviation_journal;
 pub mod finding;
 pub mod handoff;
 pub mod helper;
