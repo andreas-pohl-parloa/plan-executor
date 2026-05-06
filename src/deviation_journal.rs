@@ -99,14 +99,17 @@ pub enum JournalError {
 }
 
 pub fn journal_path(execution_root: &Path) -> PathBuf {
-    execution_root.join(".plan-executor").join("deviations.jsonl")
+    execution_root
+        .join(".plan-executor")
+        .join("deviations.jsonl")
 }
 
 pub fn validate_entry_bytes(bytes: &[u8]) -> Result<DeviationJournalEntry, JournalError> {
     if bytes.len() > MAX_ENTRY_BYTES {
         return Err(JournalError::EntryTooLarge);
     }
-    let entry: DeviationJournalEntry = serde_json::from_slice(bytes).map_err(JournalError::InvalidJson)?;
+    let entry: DeviationJournalEntry =
+        serde_json::from_slice(bytes).map_err(JournalError::InvalidJson)?;
     validate_entry_semantics(&entry)?;
     Ok(entry)
 }
@@ -128,7 +131,9 @@ pub fn validate_entry_semantics(entry: &DeviationJournalEntry) -> Result<(), Jou
         return Err(JournalError::Semantic("claim must be non-empty".into()));
     }
     if entry.plan_anchor.trim().is_empty() {
-        return Err(JournalError::Semantic("plan_anchor must be non-empty".into()));
+        return Err(JournalError::Semantic(
+            "plan_anchor must be non-empty".into(),
+        ));
     }
     if entry.impact.trim().is_empty() {
         return Err(JournalError::Semantic("impact must be non-empty".into()));
@@ -152,19 +157,37 @@ pub fn validate_entry_semantics(entry: &DeviationJournalEntry) -> Result<(), Jou
         }
         match evidence.kind {
             EvidenceKind::FileLine => {
-                if evidence.path.as_deref().unwrap_or_default().trim().is_empty() {
+                if evidence
+                    .path
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+                {
                     return Err(JournalError::Semantic(format!(
                         "evidence[{idx}] file_line requires path"
                     )));
                 }
-                if evidence.lines.as_deref().unwrap_or_default().trim().is_empty() {
+                if evidence
+                    .lines
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+                {
                     return Err(JournalError::Semantic(format!(
                         "evidence[{idx}] file_line requires lines"
                     )));
                 }
             }
             EvidenceKind::CommandLog | EvidenceKind::TestResult => {
-                if evidence.path.as_deref().unwrap_or_default().trim().is_empty() {
+                if evidence
+                    .path
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+                {
                     return Err(JournalError::Semantic(format!(
                         "evidence[{idx}] {:?} requires path",
                         evidence.kind
@@ -172,7 +195,13 @@ pub fn validate_entry_semantics(entry: &DeviationJournalEntry) -> Result<(), Jou
                 }
             }
             EvidenceKind::Commit => {
-                if evidence.commit.as_deref().unwrap_or_default().trim().is_empty() {
+                if evidence
+                    .commit
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+                {
                     return Err(JournalError::Semantic(format!(
                         "evidence[{idx}] commit requires commit"
                     )));
