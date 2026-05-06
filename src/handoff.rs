@@ -13,7 +13,7 @@ pub enum AgentType {
     Bash,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeviationContext {
     pub journal_path: PathBuf,
     pub job_id: String,
