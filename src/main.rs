@@ -2,6 +2,7 @@ mod cli;
 mod compile;
 mod config;
 mod daemon;
+mod deviation_journal;
 mod finding;
 mod handoff;
 mod helper;
