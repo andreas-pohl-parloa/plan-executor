@@ -4192,6 +4192,25 @@ fn write_local_summary(
     body.push('\n');
     body.push_str(&render_execution_counts(counts));
 
+    let journal_path = crate::deviation_journal::journal_path(&ctx.workdir);
+    if journal_path.is_file() {
+        match crate::deviation_journal::read_valid_entries(&journal_path) {
+            Ok((entries, warnings)) => {
+                for warning in warnings {
+                    tracing::warn!(line = warning.line, message = %warning.message, "skipping malformed deviation journal line in final summary");
+                }
+                let deviation_summary = crate::deviation_journal::notable_summary(&entries);
+                if !deviation_summary.trim().is_empty() {
+                    body.push_str("\n");
+                    body.push_str(&deviation_summary);
+                }
+            }
+            Err(err) => tracing::warn!(error = %err, "failed to read deviation journal for final summary"),
+        }
+    }
+
+    crate::deviation_journal::archive_to_job(&ctx.job_dir, &ctx.workdir);
+
     let path = ctx.job_dir.join(SUMMARY_FILE);
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {

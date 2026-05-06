@@ -224,6 +224,85 @@ pub fn archive_to_job(job_dir: &Path, execution_root: &Path) {
     }
 }
 
+/// Renders a markdown summary section listing only notable deviations.
+///
+/// "Notable" means [`DeviationCategory::Skip`], [`DeviationCategory::Substitute`],
+/// [`DeviationCategory::ScopeChange`], or [`DeviationCategory::Blocker`].
+/// [`DeviationCategory::Discovery`] entries are omitted.
+///
+/// Returns an empty string when there are no notable entries.
+///
+/// # Examples
+///
+/// ```
+/// use plan_executor::deviation_journal::{notable_summary, DeviationJournalEntry,
+///     DeviationCategory, DeviationSeverity, DeviationEvidence, EvidenceKind, ENTRY_VERSION};
+///
+/// let entry = DeviationJournalEntry {
+///     version: ENTRY_VERSION,
+///     job_id: "j".into(), phase: "p".into(), wave_id: None, task_id: Some("5".into()),
+///     agent_index: None, category: DeviationCategory::Skip,
+///     severity: DeviationSeverity::Warning,
+///     claim: "already done".into(), plan_anchor: "Task 5".into(),
+///     evidence: vec![DeviationEvidence {
+///         kind: EvidenceKind::FileLine,
+///         path: Some("src/lib.rs".into()),
+///         lines: Some("1-10".into()),
+///         command: None, commit: None,
+///         summary: "impl present".into(),
+///     }],
+///     impact: "no-op".into(), recommended_followup: None,
+///     created_at: "2026-05-06T00:00:00Z".into(),
+/// };
+/// let out = notable_summary(&[entry]);
+/// assert!(out.contains("## Plan deviations"));
+/// ```
+pub fn notable_summary(entries: &[DeviationJournalEntry]) -> String {
+    let notable: Vec<&DeviationJournalEntry> = entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.category,
+                DeviationCategory::Skip
+                    | DeviationCategory::Substitute
+                    | DeviationCategory::ScopeChange
+                    | DeviationCategory::Blocker
+            )
+        })
+        .collect();
+    if notable.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("## Plan deviations\n\n");
+    for entry in notable {
+        let task = entry.task_id.as_deref().unwrap_or("repo-wide");
+        out.push_str(&format!(
+            "- Task {task}: {:?} / {:?} — {}\n",
+            entry.category,
+            entry.severity,
+            entry.claim
+        ));
+        if let Some(first) = entry.evidence.first() {
+            match first.kind {
+                EvidenceKind::FileLine => out.push_str(&format!(
+                    "  Evidence: {}:{}\n",
+                    first.path.as_deref().unwrap_or("<missing-path>"),
+                    first.lines.as_deref().unwrap_or("?")
+                )),
+                EvidenceKind::CommandLog | EvidenceKind::TestResult => out.push_str(&format!(
+                    "  Evidence: {}\n",
+                    first.path.as_deref().unwrap_or("<missing-path>")
+                )),
+                EvidenceKind::Commit => out.push_str(&format!(
+                    "  Evidence: commit {}\n",
+                    first.commit.as_deref().unwrap_or("<missing-commit>")
+                )),
+            }
+        }
+    }
+    out
+}
+
 pub fn validate_entry_bytes(bytes: &[u8]) -> Result<DeviationJournalEntry, JournalError> {
     if bytes.len() > MAX_ENTRY_BYTES {
         return Err(JournalError::EntryTooLarge);
@@ -481,5 +560,19 @@ mod tests {
         let entry = valid_entry(DeviationCategory::Skip);
         let rendered = digest(&[entry], DigestScope::FileSpecific(Path::new("other/file.rs")));
         assert!(rendered.is_empty(), "{rendered}");
+    }
+
+    #[test]
+    fn notable_summary_omits_plain_discovery() {
+        let entry = valid_entry(DeviationCategory::Discovery);
+        assert!(notable_summary(&[entry]).is_empty());
+    }
+
+    #[test]
+    fn notable_summary_includes_skip() {
+        let entry = valid_entry(DeviationCategory::Skip);
+        let rendered = notable_summary(&[entry]);
+        assert!(rendered.contains("## Plan deviations"), "{rendered}");
+        assert!(rendered.contains("Task 18"), "{rendered}");
     }
 }
