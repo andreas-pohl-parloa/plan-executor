@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.67.0] - 2026-05-06
+
+### Features
+
+- **deviation-journal:** Add entry types and validation (#71) ([0cf508c](https://github.com/andreas-pohl-parloa/plan-executor/commit/0cf508ce268ff6ecdd0c93302ae5ee38c27f925e))
 ## [0.66.2] - 2026-05-06
 
 ### Bug Fixes
