@@ -72,6 +72,9 @@ fn inject_streaming_flags(agent_type: &AgentType, args: &mut Vec<String>) {
         AgentType::Claude => {
             let has_output_format = args.iter().any(|a| a == "--output-format");
             let has_verbose = args.iter().any(|a| a == "--verbose");
+            let has_disallowed_tools = args
+                .iter()
+                .any(|a| a == "--disallowed-tools" || a == "--disallowedTools");
             // Insert before any `-p`/`--prompt` so it doesn't get consumed
             // by the prompt flag as its value.
             let pos = args
@@ -87,6 +90,17 @@ fn inject_streaming_flags(agent_type: &AgentType, args: &mut Vec<String>) {
             }
             if !has_verbose {
                 args.insert(insert_at, "--verbose".to_string());
+                insert_at += 1;
+            }
+            // Daemon dispatch is non-interactive: there is no human in the
+            // loop to answer AskUserQuestion / ExitPlanMode prompts. Sub-
+            // agents that hit ambiguity must decide on their own (or fail
+            // explicitly), not block on a UI tool whose response will never
+            // arrive. Idempotent — respect any pre-set value from cmd.
+            if !has_disallowed_tools {
+                args.insert(insert_at, "--disallowed-tools".to_string());
+                insert_at += 1;
+                args.insert(insert_at, "AskUserQuestion ExitPlanMode".to_string());
             }
         }
         AgentType::Codex => {
@@ -597,6 +611,8 @@ mod tests {
                 "--output-format",
                 "stream-json",
                 "--verbose",
+                "--disallowed-tools",
+                "AskUserQuestion ExitPlanMode",
                 "-p",
             ]
         );
@@ -608,11 +624,37 @@ mod tests {
             "--output-format".to_string(),
             "stream-json".to_string(),
             "--verbose".to_string(),
+            "--disallowed-tools".to_string(),
+            "AskUserQuestion ExitPlanMode".to_string(),
             "-p".to_string(),
         ];
         let before = args.clone();
         inject_streaming_flags(&AgentType::Claude, &mut args);
         assert_eq!(args, before);
+    }
+
+    #[test]
+    fn inject_streaming_flags_claude_respects_existing_disallowed_tools() {
+        let mut args = vec![
+            "--disallowed-tools".to_string(),
+            "Bash".to_string(),
+            "-p".to_string(),
+        ];
+        inject_streaming_flags(&AgentType::Claude, &mut args);
+        // Pre-set value wins; we don't append/overwrite. Streaming flags
+        // are inserted at the position of `-p`, ahead of the existing
+        // `--disallowed-tools Bash` pair which had been there from the start.
+        assert_eq!(
+            args,
+            vec![
+                "--disallowed-tools",
+                "Bash",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "-p",
+            ]
+        );
     }
 
     #[test]
