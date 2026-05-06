@@ -1825,6 +1825,26 @@ fn build_review_team_input(
     } else {
         String::new()
     };
+    let deviation_journal_path = crate::deviation_journal::journal_path(&ctx.workdir);
+    let deviation_digest = if deviation_journal_path.is_file() {
+        let (entries, warnings) =
+            crate::deviation_journal::read_valid_entries(&deviation_journal_path).unwrap_or_else(
+                |err| {
+                    tracing::warn!(error = %err, "failed to read deviation journal for review input");
+                    (Vec::new(), Vec::new())
+                },
+            );
+        for warning in warnings {
+            tracing::warn!(
+                line = warning.line,
+                message = %warning.message,
+                "skipping malformed deviation journal line in review input"
+            );
+        }
+        crate::deviation_journal::digest(&entries, crate::deviation_journal::DigestScope::All)
+    } else {
+        String::new()
+    };
     Ok(ReviewTeamInput {
         plan_context: manifest.plan.path.clone(),
         execution_outputs: format!(
@@ -1841,6 +1861,8 @@ fn build_review_team_input(
         execution_root: ctx.workdir.clone(),
         attempt: iteration,
         prior_handoff_outputs_path: prior_outputs,
+        deviation_journal_path: deviation_journal_path.is_file().then_some(deviation_journal_path),
+        deviation_digest,
     })
 }
 
@@ -1869,6 +1891,26 @@ fn build_validator_input(
     } else {
         String::new()
     };
+    let deviation_journal_path = crate::deviation_journal::journal_path(&ctx.workdir);
+    let deviation_digest = if deviation_journal_path.is_file() {
+        let (entries, warnings) =
+            crate::deviation_journal::read_valid_entries(&deviation_journal_path).unwrap_or_else(
+                |err| {
+                    tracing::warn!(error = %err, "failed to read deviation journal for validator input");
+                    (Vec::new(), Vec::new())
+                },
+            );
+        for warning in warnings {
+            tracing::warn!(
+                line = warning.line,
+                message = %warning.message,
+                "skipping malformed deviation journal line in validator input"
+            );
+        }
+        crate::deviation_journal::digest(&entries, crate::deviation_journal::DigestScope::All)
+    } else {
+        String::new()
+    };
     Ok(ValidatorInput {
         plan_path: PathBuf::from(&manifest.plan.path),
         execution_root: ctx.workdir.clone(),
@@ -1887,6 +1929,8 @@ fn build_validator_input(
         prior_validation_notes: json!({}),
         prior_helper_outcomes: json!({}),
         prior_handoff_outputs_path: prior_outputs,
+        deviation_journal_path: deviation_journal_path.is_file().then_some(deviation_journal_path),
+        deviation_digest,
     })
 }
 

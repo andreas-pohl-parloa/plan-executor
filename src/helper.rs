@@ -783,6 +783,23 @@ pub struct ReviewTeamInput {
     /// enter triage mode and parse the sidecar at the given path.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prior_handoff_outputs_path: String,
+    /// Absolute path to the deviation journal JSONL file, if one exists for
+    /// this plan run. Absent (`None`) when no journal has been created yet.
+    ///
+    /// Plugin contract (run-reviewer-team-non-interactive):
+    /// Use deviation entries as leads. Re-read evidence before accepting the
+    /// claim. Do not suppress a finding solely because a deviation exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deviation_journal_path: Option<PathBuf>,
+    /// Pre-rendered Markdown digest of all deviation journal entries for this
+    /// plan run. Empty string when the journal is absent or contains no valid
+    /// entries.
+    ///
+    /// Plugin contract (run-reviewer-team-non-interactive):
+    /// Use deviation entries as leads. Re-read evidence before accepting the
+    /// claim. Do not suppress a finding solely because a deviation exists.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub deviation_digest: String,
 }
 
 // ----- validate-execution-plan-non-interactive -----------------------------
@@ -822,6 +839,27 @@ pub struct ValidatorInput {
     /// `waiting_for_handoffs` envelope (triage mode).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prior_handoff_outputs_path: String,
+    /// Absolute path to the deviation journal JSONL file, if one exists for
+    /// this plan run. Absent (`None`) when no journal has been created yet.
+    ///
+    /// Plugin contract (validate-execution-plan-non-interactive):
+    /// Deviation journal entries are advisory. PASS only if the plan
+    /// requirement is implemented in code or the deviation's evidence still
+    /// verifies. If the evidence is stale, missing, or free-text only, treat
+    /// the requirement as unmet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deviation_journal_path: Option<PathBuf>,
+    /// Pre-rendered Markdown digest of all deviation journal entries for this
+    /// plan run. Empty string when the journal is absent or contains no valid
+    /// entries.
+    ///
+    /// Plugin contract (validate-execution-plan-non-interactive):
+    /// Deviation journal entries are advisory. PASS only if the plan
+    /// requirement is implemented in code or the deviation's evidence still
+    /// verifies. If the evidence is stale, missing, or free-text only, treat
+    /// the requirement as unmet.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub deviation_digest: String,
 }
 
 /// One row of the validator helper's `state_updates.gaps[*]` payload. The
@@ -897,5 +935,105 @@ mod tests {
         let stdout = "{a} {b} text {c}";
         let blocks: Vec<&str> = balanced_object_blocks(stdout).collect();
         assert_eq!(blocks, vec!["{a}", "{b}", "{c}"]);
+    }
+
+    #[test]
+    fn review_team_input_serializes_deviation_fields_when_present() {
+        let input = ReviewTeamInput {
+            plan_context: "plan.md".into(),
+            execution_outputs: "output".into(),
+            changed_files: vec![],
+            language: "rust".into(),
+            recipe_list: vec![],
+            prior_review_context: serde_json::json!({}),
+            execution_root: PathBuf::from("/tmp/work"),
+            deviation_journal_path: Some(PathBuf::from(
+                "/tmp/work/.plan-executor/deviations.jsonl",
+            )),
+            deviation_digest: "- Task 1 / discovery / info".into(),
+            attempt: 1,
+            prior_handoff_outputs_path: String::new(),
+        };
+        let value = serde_json::to_value(input).unwrap();
+        assert!(value.get("deviation_journal_path").is_some());
+        assert_eq!(
+            value.get("deviation_digest").unwrap(),
+            "- Task 1 / discovery / info"
+        );
+    }
+
+    #[test]
+    fn review_team_input_omits_deviation_fields_when_empty() {
+        let input = ReviewTeamInput {
+            plan_context: "plan.md".into(),
+            execution_outputs: "output".into(),
+            changed_files: vec![],
+            language: "rust".into(),
+            recipe_list: vec![],
+            prior_review_context: serde_json::json!({}),
+            execution_root: PathBuf::from("/tmp/work"),
+            deviation_journal_path: None,
+            deviation_digest: String::new(),
+            attempt: 1,
+            prior_handoff_outputs_path: String::new(),
+        };
+        let value = serde_json::to_value(input).unwrap();
+        assert!(value.get("deviation_journal_path").is_none());
+        assert!(value.get("deviation_digest").is_none());
+    }
+
+    #[test]
+    fn validator_input_serializes_deviation_fields_when_present() {
+        let input = ValidatorInput {
+            plan_path: PathBuf::from("/tmp/work/plan.md"),
+            execution_root: PathBuf::from("/tmp/work"),
+            changed_files: vec![],
+            language: "rust".into(),
+            recipe_list: vec![],
+            skip_code_review: false,
+            state_file_path: PathBuf::from("/tmp/work/.tmp-state.json"),
+            execution_state: serde_json::json!({}),
+            validation_state: serde_json::json!({}),
+            validation_state_path: None,
+            current_validation_attempt: 1,
+            prior_validation_notes: serde_json::json!({}),
+            prior_helper_outcomes: serde_json::json!({}),
+            deviation_journal_path: Some(PathBuf::from(
+                "/tmp/work/.plan-executor/deviations.jsonl",
+            )),
+            deviation_digest: "- Task 1 / discovery / info".into(),
+            prior_handoff_outputs_path: String::new(),
+        };
+        let value = serde_json::to_value(input).unwrap();
+        assert!(value.get("deviation_journal_path").is_some());
+        assert_eq!(
+            value.get("deviation_digest").unwrap(),
+            "- Task 1 / discovery / info"
+        );
+    }
+
+    #[test]
+    fn validator_input_omits_deviation_fields_when_empty() {
+        let input = ValidatorInput {
+            plan_path: PathBuf::from("/tmp/work/plan.md"),
+            execution_root: PathBuf::from("/tmp/work"),
+            changed_files: vec![],
+            language: "rust".into(),
+            recipe_list: vec![],
+            skip_code_review: false,
+            state_file_path: PathBuf::from("/tmp/work/.tmp-state.json"),
+            execution_state: serde_json::json!({}),
+            validation_state: serde_json::json!({}),
+            validation_state_path: None,
+            current_validation_attempt: 1,
+            prior_validation_notes: serde_json::json!({}),
+            prior_helper_outcomes: serde_json::json!({}),
+            deviation_journal_path: None,
+            deviation_digest: String::new(),
+            prior_handoff_outputs_path: String::new(),
+        };
+        let value = serde_json::to_value(input).unwrap();
+        assert!(value.get("deviation_journal_path").is_none());
+        assert!(value.get("deviation_digest").is_none());
     }
 }
