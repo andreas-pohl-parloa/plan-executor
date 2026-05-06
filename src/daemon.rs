@@ -1719,16 +1719,26 @@ async fn trigger_resume(state: &Arc<Mutex<DaemonState>>, job_id: &str) {
         }
     };
 
-    let succeeded_seqs: Vec<u32> = job
+    let mut succeeded_seqs: Vec<u32> = job
         .steps
         .iter()
         .filter(|s| matches!(s.status, StepStatus::Succeeded))
         .map(|s| s.seq)
         .collect();
+    if succeeded_seqs.is_empty() {
+        // Job.steps was never written to in older runtime versions —
+        // every entry stays at `Pending`. Derive succeeded steps from
+        // display.log so an old failed job can still be resumed.
+        succeeded_seqs = derive_succeeded_seqs_from_display_log(&dir);
+    }
+    let succeeded_set: std::collections::HashSet<u32> =
+        succeeded_seqs.iter().copied().collect();
     let resume_from_seq = job
         .steps
         .iter()
-        .find(|s| !matches!(s.status, StepStatus::Succeeded))
+        .find(|s| {
+            !matches!(s.status, StepStatus::Succeeded) && !succeeded_set.contains(&s.seq)
+        })
         .map(|s| s.seq)
         .unwrap_or(1);
 
@@ -1889,6 +1899,58 @@ async fn spawn_resume_scheduler_job(
 
     let _ = job_id;
     let _ = manifest_path;
+}
+
+/// Reads the job's `display.log` and extracts step seqs that have a
+/// `success` line. Used as a fallback for jobs whose `Job.steps[].status`
+/// is uniformly `Pending` because they failed under a runtime that
+/// did not yet persist step status. Without this fallback, the
+/// daemon's resume path would always restart at step 1 for those
+/// older jobs.
+fn derive_succeeded_seqs_from_display_log(dir: &crate::job::storage::JobDir) -> Vec<u32> {
+    let log = dir.path().join("display.log");
+    let Ok(content) = std::fs::read_to_string(&log) else {
+        return Vec::new();
+    };
+    let mut seen: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    for raw in content.lines() {
+        let stripped = strip_ansi_chrome(raw);
+        let Some(rest) = stripped.strip_prefix("step ") else { continue; };
+        let Some((seq_str, after)) = rest.split_once(' ') else { continue; };
+        let Ok(seq) = seq_str.parse::<u32>() else { continue; };
+        if !after.contains(") success") {
+            continue;
+        }
+        seen.insert(seq);
+    }
+    seen.into_iter().collect()
+}
+
+/// Strips ANSI escapes and the `⏺ [plan-executor] ` chrome from a
+/// display-log line so the step parser sees `step N (name) status`.
+fn strip_ansi_chrome(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for d in chars.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    let trimmed = out
+        .trim_start()
+        .strip_prefix("⏺")
+        .unwrap_or(&out)
+        .trim_start();
+    trimmed
+        .strip_prefix("[plan-executor]")
+        .map(|r| r.trim_start().to_string())
+        .unwrap_or_else(|| trimmed.to_string())
 }
 
 #[cfg(test)]

@@ -1537,6 +1537,85 @@ fn resume_short_id(id: &str) -> String {
     id.get(..id.len().min(8)).unwrap_or(id).to_string()
 }
 
+/// Reads the job's `display.log` and extracts step seqs that have a
+/// `success` line. Used as a fallback for jobs that failed under a
+/// runtime which did not persist `Job.steps[].status` (so the
+/// in-job-json status is `Pending` for every step despite earlier
+/// steps having succeeded).
+///
+/// The display-line format is `step <seq> (<name>) success` (or
+/// other terminal statuses like `semantic_mistake`, `failed`, etc.).
+/// We only count `success`; anything else is treated as not-succeeded.
+fn succeeded_seqs_from_display_log(dir: &crate::job::storage::JobDir) -> Vec<u32> {
+    let log = dir.path().join("display.log");
+    let Ok(content) = std::fs::read_to_string(&log) else {
+        return Vec::new();
+    };
+    let mut seen: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    for raw in content.lines() {
+        // Format: `⏺ [plan-executor] step <N> (<name>) <status>` (with
+        // optional ANSI escape prefix). Strip ANSI + bullet chrome,
+        // then look for `step <N> (<name>) success` exactly.
+        let stripped = strip_ansi_and_bullet(raw);
+        let Some(rest) = stripped.strip_prefix("step ") else { continue; };
+        let Some((seq_str, after)) = rest.split_once(' ') else { continue; };
+        let Ok(seq) = seq_str.parse::<u32>() else { continue; };
+        if !after.contains(") success") {
+            continue;
+        }
+        seen.insert(seq);
+    }
+    seen.into_iter().collect()
+}
+
+/// Strips ANSI CSI escapes and a leading `⏺ [plan-executor] ` chrome
+/// from a display-log line so the parser sees `step N (name) status`
+/// directly. Mirrors `crate::job::cli::strip_bullet_prefix` but local
+/// here to avoid a cross-module pub change for one helper.
+fn strip_ansi_and_bullet(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for d in chars.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    let trimmed = out
+        .trim_start()
+        .strip_prefix("⏺")
+        .unwrap_or(&out)
+        .trim_start();
+    trimmed
+        .strip_prefix("[plan-executor]")
+        .map(|r| r.trim_start().to_string())
+        .unwrap_or_else(|| trimmed.to_string())
+}
+
+/// Computes the first step seq that hasn't succeeded. Reads the
+/// persisted `Job.steps[].status` first; on a tie (no Succeeded
+/// rows) falls back to `succeeded_seqs` (which the caller may have
+/// derived from display.log) to find the next step.
+fn first_non_succeeded_seq(
+    job: &crate::job::types::Job,
+    succeeded_seqs: &[u32],
+) -> u32 {
+    let succeeded: std::collections::HashSet<u32> = succeeded_seqs.iter().copied().collect();
+    job.steps
+        .iter()
+        .find(|s| {
+            !matches!(s.status, crate::job::types::StepStatus::Succeeded)
+                && !succeeded.contains(&s.seq)
+        })
+        .map(|s| s.seq)
+        .unwrap_or(1)
+}
+
 /// Foreground entry for `plan-executor resume <id> --foreground`. Loads
 /// the persisted job, finds the resume seq (first non-Succeeded step),
 /// re-runs the pipeline with skip-mask logic.
@@ -1559,18 +1638,28 @@ async fn resume_foreground(
     };
 
     // Compute the resume point: first non-Succeeded step seq.
-    let succeeded_seqs: Vec<u32> = job
+    // Prefer the persisted `Job.steps[].status` (written by the
+    // runtime as of the fix-step-status PR). Fall back to parsing
+    // display.log when steps are all `Pending` — the case for jobs
+    // that failed under the prior runtime which never persisted
+    // status. Without this fallback, resuming an old failed job
+    // would always start from step 1.
+    let mut succeeded_seqs: Vec<u32> = job
         .steps
         .iter()
         .filter(|s| matches!(s.status, StepStatus::Succeeded))
         .map(|s| s.seq)
         .collect();
-    let resume_from_seq = job
-        .steps
-        .iter()
-        .find(|s| !matches!(s.status, StepStatus::Succeeded))
-        .map(|s| s.seq)
-        .unwrap_or(1);
+    if succeeded_seqs.is_empty() {
+        succeeded_seqs = succeeded_seqs_from_display_log(&dir);
+        if !succeeded_seqs.is_empty() {
+            eprintln!(
+                "\x1b[33m⏺ [plan-executor]\x1b[0m resume: derived succeeded steps from display.log \
+                 (job.json predates step-status persistence): {succeeded_seqs:?}",
+            );
+        }
+    }
+    let resume_from_seq = first_non_succeeded_seq(&job, &succeeded_seqs);
 
     if resume_from_seq == 1 && succeeded_seqs.is_empty() {
         anyhow::bail!(
