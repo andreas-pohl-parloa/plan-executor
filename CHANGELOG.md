@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.68.0] - 2026-05-06
+
+### Features
+
+- **deviation-journal:** Schemas, dispatch injection, helper digest, summary (#73) ([1272a61](https://github.com/andreas-pohl-parloa/plan-executor/commit/1272a61563a5e6c309483f2ca01873101ce86a58))
 ## [0.67.3] - 2026-05-06
 
 ### Documentation
