@@ -104,12 +104,124 @@ pub fn journal_path(execution_root: &Path) -> PathBuf {
         .join("deviations.jsonl")
 }
 
-/// Returns a human-readable digest of prior deviations relevant to `wave`.
+/// Returns a formatted, severity-sorted digest of the entries matching `scope`.
 ///
-/// This is a temporary stub. Task 5 replaces it with the real digest
-/// implementation that reads the journal and filters by wave/task context.
-pub fn digest_for_wave(_execution_root: &Path, _wave: &crate::scheduler::Wave) -> Option<String> {
-    None
+/// Entries are sorted by severity (Critical → Warning → Info). Output is
+/// capped at [`MAX_DIGEST_BYTES`] bytes and [`MAX_DIGEST_LINES`] lines;
+/// a truncation marker is appended when either limit is reached.
+///
+/// # Examples
+///
+/// ```
+/// use plan_executor::deviation_journal::{digest, DigestScope, DeviationJournalEntry,
+///     DeviationCategory, DeviationSeverity, DeviationEvidence, EvidenceKind, ENTRY_VERSION};
+/// use std::path::Path;
+///
+/// let entry = DeviationJournalEntry {
+///     version: ENTRY_VERSION,
+///     job_id: "j".into(), phase: "p".into(), wave_id: None, task_id: None,
+///     agent_index: None, category: DeviationCategory::Discovery,
+///     severity: DeviationSeverity::Info,
+///     claim: "c".into(), plan_anchor: "a".into(), evidence: vec![],
+///     impact: "i".into(), recommended_followup: None,
+///     created_at: "2026-05-06T00:00:00Z".into(),
+/// };
+/// let out = digest(&[entry], DigestScope::All);
+/// assert!(out.contains("Impact:"));
+/// ```
+pub fn digest(entries: &[DeviationJournalEntry], scope: DigestScope<'_>) -> String {
+    let mut selected: Vec<&DeviationJournalEntry> = entries
+        .iter()
+        .filter(|entry| match scope {
+            DigestScope::All => true,
+            DigestScope::ChangedFiles(files) => entry.evidence.iter().any(|e| {
+                e.path.as_ref().is_some_and(|p| files.iter().any(|f| f == Path::new(p)))
+            }),
+            DigestScope::TaskDependencyContext(task_ids) => entry
+                .task_id
+                .as_ref()
+                .is_some_and(|tid| task_ids.iter().any(|x| x == tid)),
+            DigestScope::FileSpecific(path) => entry.evidence.iter().any(|e| {
+                e.path.as_ref().is_some_and(|p| Path::new(p) == path)
+            }),
+        })
+        .collect();
+
+    selected.sort_by_key(|entry| match entry.severity {
+        DeviationSeverity::Critical => 0,
+        DeviationSeverity::Warning => 1,
+        DeviationSeverity::Info => 2,
+    });
+
+    let mut out = String::new();
+    for entry in selected {
+        let task = entry.task_id.as_deref().unwrap_or("repo-wide");
+        out.push_str(&format!(
+            "- Task {task} / {:?} / {:?}:\n  Claim: {}\n",
+            entry.category,
+            entry.severity,
+            entry.claim
+        ));
+        for evidence in &entry.evidence {
+            match evidence.kind {
+                EvidenceKind::FileLine => out.push_str(&format!(
+                    "  Evidence: {}:{} — {}\n",
+                    evidence.path.as_deref().unwrap_or("<missing-path>"),
+                    evidence.lines.as_deref().unwrap_or("?"),
+                    evidence.summary
+                )),
+                EvidenceKind::CommandLog | EvidenceKind::TestResult => out.push_str(&format!(
+                    "  Evidence: {} — {}\n",
+                    evidence.path.as_deref().unwrap_or("<missing-path>"),
+                    evidence.summary
+                )),
+                EvidenceKind::Commit => out.push_str(&format!(
+                    "  Evidence: commit {} — {}\n",
+                    evidence.commit.as_deref().unwrap_or("<missing-commit>"),
+                    evidence.summary
+                )),
+            }
+        }
+        out.push_str(&format!("  Impact: {}\n", entry.impact));
+        if out.len() >= MAX_DIGEST_BYTES || out.lines().count() >= MAX_DIGEST_LINES {
+            out.push_str("[deviation digest truncated]\n");
+            break;
+        }
+    }
+    out
+}
+
+/// Returns a human-readable digest of all prior deviations for `wave`.
+///
+/// Reads the journal at `execution_root`, renders all entries with
+/// [`DigestScope::All`], and returns `None` when the journal is absent or
+/// produces an empty digest.
+pub fn digest_for_wave(execution_root: &Path, _wave: &crate::scheduler::Wave) -> Option<String> {
+    let path = journal_path(execution_root);
+    if !path.is_file() {
+        return None;
+    }
+    let (entries, warnings) = read_valid_entries(&path).ok()?;
+    for warning in warnings {
+        tracing::warn!(line = warning.line, message = %warning.message, "skipping malformed deviation journal line");
+    }
+    let rendered = digest(&entries, DigestScope::All);
+    if rendered.trim().is_empty() { None } else { Some(rendered) }
+}
+
+/// Copies the deviation journal into the job artifact directory.
+///
+/// Best-effort: a failed copy logs a warning but does not block the caller.
+/// The destination file is always named `deviations.jsonl`.
+pub fn archive_to_job(job_dir: &Path, execution_root: &Path) {
+    let src = journal_path(execution_root);
+    if !src.is_file() {
+        return;
+    }
+    let dst = job_dir.join("deviations.jsonl");
+    if let Err(err) = std::fs::copy(&src, &dst) {
+        tracing::warn!(src = %src.display(), dst = %dst.display(), error = %err, "failed to archive deviation journal");
+    }
 }
 
 pub fn validate_entry_bytes(bytes: &[u8]) -> Result<DeviationJournalEntry, JournalError> {
@@ -353,5 +465,21 @@ mod tests {
         std::fs::write(&path, format!("{entry}\n")).unwrap();
         let entries = validate_journal_file(&path).unwrap();
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn digest_renders_evidence_and_impact() {
+        let entry = valid_entry(DeviationCategory::Skip);
+        let rendered = digest(&[entry], DigestScope::All);
+        assert!(rendered.contains("Task 18"), "{rendered}");
+        assert!(rendered.contains("plugins/foo/SKILL.md:31-59"), "{rendered}");
+        assert!(rendered.contains("Impact:"), "{rendered}");
+    }
+
+    #[test]
+    fn digest_file_scope_filters_unrelated_entries() {
+        let entry = valid_entry(DeviationCategory::Skip);
+        let rendered = digest(&[entry], DigestScope::FileSpecific(Path::new("other/file.rs")));
+        assert!(rendered.is_empty(), "{rendered}");
     }
 }

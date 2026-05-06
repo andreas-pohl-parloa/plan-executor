@@ -524,6 +524,7 @@ pub async fn run_wave_execution(
     }
 
     let _ = write_step_summary(ctx, &wave_outcomes, true);
+    crate::deviation_journal::archive_to_job(&ctx.job_dir, &ctx.workdir);
     AttemptOutcome::Success
 }
 
