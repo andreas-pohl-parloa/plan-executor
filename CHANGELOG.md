@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.68.2] - 2026-05-06
+
+### Bug Fixes
+
+- **stream-json-view:** Bump submodule to v0.6.0 ([93bf886](https://github.com/andreas-pohl-parloa/plan-executor/commit/93bf8861de98cab1f8eaa47901a3f01a7eb8d9f9))
 ## [0.68.1] - 2026-05-06
 
 ### Testing
