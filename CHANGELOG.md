@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.65.1] - 2026-05-06
+
+### Bug Fixes
+
+- **jobs:** PROGRESS column respects terminal job state ([0c6cf83](https://github.com/andreas-pohl-parloa/plan-executor/commit/0c6cf835c1f3e008eaebd7464aca4924b5ba2728))
 ## [0.65.0] - 2026-05-05
 
 ### Features
