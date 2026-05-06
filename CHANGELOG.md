@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.67.1] - 2026-05-06
+
+### Bug Fixes
+
+- **validation:** Make validation_report_path optional in helper triage output (#72) ([513294d](https://github.com/andreas-pohl-parloa/plan-executor/commit/513294d7ac68bd1af9c94a9b3731a038532eb862))
 ## [0.67.0] - 2026-05-06
 
 ### Features
