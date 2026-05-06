@@ -85,7 +85,8 @@ fn cmd_list() -> Result<()> {
                     .unwrap_or_else(|| path.display().to_string());
                 let total_steps = job_opt.as_ref().map(|j| j.steps.len() as u32);
                 let total_waves = job_opt.as_ref().and_then(plan_total_waves);
-                let progress = progress_label(&summary.id.0, total_steps, total_waves);
+                let live_label = progress_label(&summary.id.0, total_steps, total_waves);
+                let progress = render_progress_for_state(&summary.state, &live_label);
                 println!(
                     "{:<10} {:<14} {:<11} {:<21} {:<42} {}",
                     short_id(&summary.id.0),
@@ -103,7 +104,8 @@ fn cmd_list() -> Result<()> {
             }
             JobStoreEntry::Legacy { id, path } => {
                 let (kind, state, created, title) = legacy_summary(&path);
-                let progress = progress_label(&id, None, None);
+                let live_label = progress_label(&id, None, None);
+                let progress = render_progress_for_legacy_state(&state, &live_label);
                 println!(
                     "{:<10} {:<14} {:<11} {:<21} {:<42} {}",
                     short_id(&id),
@@ -122,6 +124,66 @@ fn cmd_list() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Renders the PROGRESS column for a job at the given state. Running
+/// jobs show the live label as-is. Terminal-state jobs (Succeeded /
+/// Failed) prefix the label with the state outcome so the operator
+/// can tell at a glance "this failed at step 4/8 in code_review"
+/// vs. "this is currently in code_review". Pending jobs and freshly
+/// suspended jobs whose log is empty show a state-only string.
+fn render_progress_for_state(state: &JobState, live_label: &str) -> String {
+    let dash = live_label == "-";
+    match state {
+        JobState::Running => live_label.to_string(),
+        JobState::Pending => "pending".to_string(),
+        JobState::Suspended { .. } => {
+            if dash {
+                "suspended".to_string()
+            } else {
+                format!("suspended @ {live_label}")
+            }
+        }
+        JobState::Succeeded => {
+            if dash {
+                "done".to_string()
+            } else {
+                format!("done @ {live_label}")
+            }
+        }
+        JobState::Failed { .. } => {
+            if dash {
+                "failed".to_string()
+            } else {
+                format!("failed @ {live_label}")
+            }
+        }
+    }
+}
+
+/// Same shape as [`render_progress_for_state`] but takes the legacy
+/// flat-string state label (`legacy_summary` returns `String`, not
+/// the typed enum). Mirrors the cases the new format supports.
+fn render_progress_for_legacy_state(state: &str, live_label: &str) -> String {
+    let dash = live_label == "-";
+    match state {
+        "running" => live_label.to_string(),
+        "pending" => "pending".to_string(),
+        "suspended" => {
+            if dash { "suspended".to_string() } else { format!("suspended @ {live_label}") }
+        }
+        "succeeded" => {
+            if dash { "done".to_string() } else { format!("done @ {live_label}") }
+        }
+        "failed" => {
+            if dash { "failed".to_string() } else { format!("failed @ {live_label}") }
+        }
+        other => {
+            // Unknown legacy label → render as-is so we stay forward-
+            // compatible with state strings the parser hasn't seen.
+            if dash { other.to_string() } else { format!("{other} @ {live_label}") }
+        }
+    }
 }
 
 /// Reads the plan job's compiled `tasks.json` and returns its wave count, so
