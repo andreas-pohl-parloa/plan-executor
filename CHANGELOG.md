@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.67.3] - 2026-05-06
+
+### Documentation
+
+- **deviation-journal:** Foreground coverage spec + companion plan ([e163e5a](https://github.com/andreas-pohl-parloa/plan-executor/commit/e163e5aaf6128fedf0e14a951497b043d07df5fe))
 ## [0.67.2] - 2026-05-06
 
 ### Documentation
