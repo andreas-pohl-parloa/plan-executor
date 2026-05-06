@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.66.0] - 2026-05-06
+
+### Features
+
+- **resume:** Continue a failed plan job from the step it failed on ([4f468c5](https://github.com/andreas-pohl-parloa/plan-executor/commit/4f468c58d9202b8074e463ebaeff8e90ca5a7d70))
 ## [0.65.1] - 2026-05-06
 
 ### Bug Fixes
