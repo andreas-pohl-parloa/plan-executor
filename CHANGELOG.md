@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.66.1] - 2026-05-06
+
+### Bug Fixes
+
+- **resume:** Persist Job.steps[].status + display.log fallback ([75f8134](https://github.com/andreas-pohl-parloa/plan-executor/commit/75f8134331835d4d706ab077f25d3e8498702228))
 ## [0.66.0] - 2026-05-06
 
 ### Features
